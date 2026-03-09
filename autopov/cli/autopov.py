@@ -343,24 +343,58 @@ Failed: {result['failed']}
         """
         console.print(Panel(summary_text, title="Scan Summary"))
         
-        # Findings table
+        # Findings table - Show all findings with their status
         if result.get("findings"):
-            table = Table(title="Confirmed Vulnerabilities")
-            table.add_column("CWE", style="cyan")
-            table.add_column("File", style="green")
-            table.add_column("Line", style="yellow")
-            table.add_column("Confidence", style="magenta")
-            
-            for finding in result["findings"]:
-                if finding.get("final_status") == "confirmed":
+            # First show confirmed vulnerabilities
+            confirmed_findings = [f for f in result["findings"] if f.get("final_status") == "confirmed"]
+            if confirmed_findings:
+                table = Table(title="Confirmed Vulnerabilities")
+                table.add_column("CWE", style="cyan")
+                table.add_column("File", style="green")
+                table.add_column("Line", style="yellow")
+                table.add_column("Confidence", style="magenta")
+                
+                for finding in confirmed_findings:
                     table.add_row(
                         finding.get("cwe_type", "N/A"),
                         finding.get("filepath", "N/A"),
                         str(finding.get("line_number", "N/A")),
                         f"{finding.get('confidence', 0):.2f}"
                     )
+                
+                console.print(table)
             
-            console.print(table)
+            # Show findings with errors or issues
+            error_findings = [f for f in result["findings"] if f.get("final_status") != "confirmed" and f.get("llm_verdict") == "ERROR"]
+            if error_findings:
+                console.print("\n[yellow]Findings with Investigation Errors:[/yellow]")
+                error_table = Table()
+                error_table.add_column("CWE", style="cyan")
+                error_table.add_column("File", style="green")
+                error_table.add_column("Line", style="yellow")
+                error_table.add_column("Error", style="red")
+                
+                for finding in error_findings:
+                    error_msg = finding.get("llm_explanation", "Unknown error")[:50] + "..."
+                    error_table.add_row(
+                        finding.get("cwe_type", "N/A"),
+                        finding.get("filepath", "N/A"),
+                        str(finding.get("line_number", "N/A")),
+                        error_msg
+                    )
+                
+                console.print(error_table)
+            
+            # Show pending/skipped findings
+            pending_findings = [f for f in result["findings"] if f.get("final_status") == "pending" and f.get("llm_verdict") != "ERROR"]
+            if pending_findings:
+                console.print(f"\n[dim]Pending/Skipped Findings: {len(pending_findings)}[/dim]")
+                for finding in pending_findings[:5]:  # Show first 5
+                    verdict = finding.get("llm_verdict", "UNKNOWN")
+                    confidence = finding.get("confidence", 0)
+                    console.print(f"  [dim]• {finding.get('cwe_type')} at {finding.get('filepath')}:{finding.get('line_number')} - Verdict: {verdict} ({confidence:.2f})[/dim]")
+                if len(pending_findings) > 5:
+                    console.print(f"  [dim]... and {len(pending_findings) - 5} more[/dim]")
     
     elif output == "pdf":
         # Download PDF report

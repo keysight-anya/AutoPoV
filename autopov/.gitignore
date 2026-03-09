@@ -4,6 +4,14 @@ __pycache__/
 *$py.class
 *.so
 .Python
+<<<<<<< HEAD
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+=======
 build/
 develop-eggs/
 dist/
@@ -27,12 +35,22 @@ ENV/
 .venv/
 
 # IDEs
+>>>>>>> 4b37390 (Initial commit of AutoPoV agentic pipeline for keysight-anya)
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
+<<<<<<< HEAD
+# AutoPoV specific
+.qoder/
+test-db/
+*.log
+results/
+data/
+/tmp/
+=======
 # Environment variables
 .env
 .env.local
@@ -54,11 +72,17 @@ temp/
 # Logs
 *.log
 logs/
+>>>>>>> 4b37390 (Initial commit of AutoPoV agentic pipeline for keysight-anya)
 
 # OS
 .DS_Store
 Thumbs.db
 
+<<<<<<< HEAD
+# Keep structure
+!autopov/
+!autopov/**/
+=======
 # Frontend
 frontend/node_modules/
 frontend/dist/
@@ -72,3 +96,4 @@ htmlcov/
 # ChromaDB
 chroma/
 .chroma/
+>>>>>>> 4b37390 (Initial commit of AutoPoV agentic pipeline for keysight-anya)
