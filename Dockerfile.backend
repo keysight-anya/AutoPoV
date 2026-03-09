@@ -1,0 +1,34 @@
+# AutoPoV Backend Dockerfile
+FROM python:3.12-slim
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    || (apt-get update && apt-get install -y git curl && rm -rf /var/lib/apt/lists/*)
+
+# Copy requirements first for better caching
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir --default-timeout=1000  -r requirements.txt
+
+# Copy the application code
+COPY . .
+
+# Create necessary directories
+RUN mkdir -p data results/povs results/runs
+
+# Expose the backend port
+EXPOSE 8000
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV MODEL_MODE=online
+
+# Start the backend
+CMD ["python", "-m", "app.main"]

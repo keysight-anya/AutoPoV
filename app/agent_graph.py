@@ -129,11 +129,12 @@ class AgentGraph:
         workflow.add_edge("run_in_docker", "log_confirmed")
         
         # After logging, check if there are more findings to process
+        # Loop back to investigate to process the next finding
         workflow.add_conditional_edges(
             "log_confirmed",
             self._has_more_findings,
             {
-                "generate_pov": "generate_pov",  # Process next finding
+                "investigate": "investigate",  # Process next finding
                 "end": END  # All findings processed
             }
         )
@@ -142,7 +143,7 @@ class AgentGraph:
             "log_skip",
             self._has_more_findings,
             {
-                "generate_pov": "generate_pov",  # Process next finding
+                "investigate": "investigate",  # Process next finding
                 "end": END  # All findings processed
             }
         )
@@ -151,7 +152,7 @@ class AgentGraph:
             "log_failure",
             self._has_more_findings,
             {
-                "generate_pov": "generate_pov",  # Process next finding
+                "investigate": "investigate",  # Process next finding
                 "end": END  # All findings processed
             }
         )
@@ -427,40 +428,46 @@ class AgentGraph:
         return findings
     
     def _node_investigate(self, state: ScanState) -> ScanState:
-        """Investigate findings with LLM"""
-        self._log(state, "Investigating findings with LLM...")
+        """Investigate ONE finding with LLM (at current_finding_idx)"""
         state["status"] = ScanStatus.INVESTIGATING
         
+        idx = state.get("current_finding_idx", 0)
+        if idx >= len(state["findings"]):
+            return state
+        
+        finding = state["findings"][idx]
+        
+        # Skip if already investigated
+        if finding.get("llm_verdict"):
+            return state
+        
+        self._log(state, f"Investigating {finding['cwe_type']} at {finding['filepath']}:{finding['line_number']}")
+        
         investigator = get_investigator()
-        updated_findings = []
         
-        for i, finding in enumerate(state["findings"]):
-            self._log(state, f"  Investigating {finding['cwe_type']} at {finding['filepath']}:{finding['line_number']}")
-            
-            result = investigator.investigate(
-                scan_id=state["scan_id"],
-                codebase_path=state["codebase_path"],
-                cwe_type=finding["cwe_type"],
-                filepath=finding["filepath"],
-                line_number=finding["line_number"],
-                alert_message=finding.get("alert_message", "")
-            )
-            
-            finding["llm_verdict"] = result.get("verdict", "UNKNOWN")
-            finding["llm_explanation"] = result.get("explanation", "")
-            finding["confidence"] = result.get("confidence", 0.0)
-            finding["inference_time_s"] = result.get("inference_time_s", 0.0)
-            finding["code_chunk"] = result.get("vulnerable_code", "")
-            
-            # Estimate cost (simplified)
-            finding["cost_usd"] = self._estimate_cost(finding["inference_time_s"])
-            state["total_cost_usd"] += finding["cost_usd"]
-            
-            updated_findings.append(finding)
-            
-            self._log(state, f"    Verdict: {finding['llm_verdict']} (confidence: {finding['confidence']:.2f})")
+        result = investigator.investigate(
+            scan_id=state["scan_id"],
+            codebase_path=state["codebase_path"],
+            cwe_type=finding["cwe_type"],
+            filepath=finding["filepath"],
+            line_number=finding["line_number"],
+            alert_message=finding.get("alert_message", "")
+        )
         
-        state["findings"] = updated_findings
+        finding["llm_verdict"] = result.get("verdict", "UNKNOWN")
+        finding["llm_explanation"] = result.get("explanation", "")
+        finding["confidence"] = result.get("confidence", 0.0)
+        finding["inference_time_s"] = result.get("inference_time_s", 0.0)
+        finding["code_chunk"] = result.get("vulnerable_code", "")
+        
+        # Estimate cost (simplified)
+        finding["cost_usd"] = self._estimate_cost(finding["inference_time_s"])
+        state["total_cost_usd"] += finding["cost_usd"]
+        
+        state["findings"][idx] = finding
+        
+        self._log(state, f"  Verdict: {finding['llm_verdict']} (confidence: {finding['confidence']:.2f})")
+        
         return state
     
     def _node_generate_pov(self, state: ScanState) -> ScanState:
@@ -656,7 +663,7 @@ class AgentGraph:
         """Check if there are more findings to process after logging"""
         idx = state.get("current_finding_idx", 0)
         if idx < len(state["findings"]):
-            return "generate_pov"  # More findings to process
+            return "investigate"  # More findings to process
         else:
             # All findings processed, mark as completed
             state["status"] = ScanStatus.COMPLETED
