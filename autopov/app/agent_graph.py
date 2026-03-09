@@ -127,9 +127,34 @@ class AgentGraph:
         )
         
         workflow.add_edge("run_in_docker", "log_confirmed")
-        workflow.add_edge("log_skip", END)
-        workflow.add_edge("log_failure", END)
-        workflow.add_edge("log_confirmed", END)
+        
+        # After logging, check if there are more findings to process
+        workflow.add_conditional_edges(
+            "log_confirmed",
+            self._has_more_findings,
+            {
+                "generate_pov": "generate_pov",  # Process next finding
+                "end": END  # All findings processed
+            }
+        )
+        
+        workflow.add_conditional_edges(
+            "log_skip",
+            self._has_more_findings,
+            {
+                "generate_pov": "generate_pov",  # Process next finding
+                "end": END  # All findings processed
+            }
+        )
+        
+        workflow.add_conditional_edges(
+            "log_failure",
+            self._has_more_findings,
+            {
+                "generate_pov": "generate_pov",  # Process next finding
+                "end": END  # All findings processed
+            }
+        )
         
         return workflow.compile()
     
@@ -626,6 +651,17 @@ class AgentGraph:
             return "generate_pov"  # Retry generation
         else:
             return "log_failure"
+    
+    def _has_more_findings(self, state: ScanState) -> str:
+        """Check if there are more findings to process after logging"""
+        idx = state.get("current_finding_idx", 0)
+        if idx < len(state["findings"]):
+            return "generate_pov"  # More findings to process
+        else:
+            # All findings processed, mark as completed
+            state["status"] = ScanStatus.COMPLETED
+            state["end_time"] = datetime.utcnow().isoformat()
+            return "end"
     
     def _log(self, state: ScanState, message: str):
         """Add log message to state"""
