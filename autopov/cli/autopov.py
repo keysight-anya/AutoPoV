@@ -102,9 +102,35 @@ def get_supported_cwes(api_key: str) -> List[str]:
         return ["CWE-89", "CWE-119", "CWE-190", "CWE-416"]
 
 
+# Model provider mapping for OpenRouter
+MODEL_PROVIDERS = {
+    "1": ("OpenAI", "openai/gpt-5.4-pro"),
+    "2": ("Claude", "anthropic/claude-sonnet-4.6"),
+    "3": ("Gemini", "google/gemini-3.1-flash-lite-preview"),
+    "4": ("Grok", "x-ai/grok-4.1-fast")
+}
+
+
+def select_model() -> str:
+    """Display model selection menu and return selected model ID"""
+    console.print("\n[bold cyan]Select AI Model Provider:[/bold cyan]")
+    console.print("-" * 40)
+    for key, (name, model_id) in MODEL_PROVIDERS.items():
+        console.print(f"  [{key}] {name}")
+    console.print("-" * 40)
+    
+    while True:
+        choice = console.input("[bold]Enter choice (1-4): [/bold]").strip()
+        if choice in MODEL_PROVIDERS:
+            provider_name, model_id = MODEL_PROVIDERS[choice]
+            console.print(f"[green]✓ Selected: {provider_name} ({model_id})[/green]\n")
+            return model_id
+        console.print("[red]Invalid choice. Please enter 1, 2, 3, or 4.[/red]")
+
+
 @cli.command()
 @click.argument("source")
-@click.option("--model", "-m", default="openai/gpt-4o", help="Model to use")
+@click.option("--model", "-m", default=None, help="Model to use (overrides interactive selection)")
 @click.option("--cwe", "-c", multiple=True, default=None, help="CWEs to check (default: all supported)")
 @click.option("--output", "-o", type=click.Choice(["json", "table", "pdf"]), default="table", help="Output format")
 @click.option("--api-key", "-k", help="API key")
@@ -128,6 +154,10 @@ def scan(
     if not api_key:
         console.print("[red]Error: API key required. Set AUTOPOV_API_KEY or use --api-key[/red]")
         sys.exit(1)
+    
+    # Select model if not provided via --model
+    if model is None:
+        model = select_model()
     
     # Use provided CWEs or fetch all supported from backend
     if cwe:
