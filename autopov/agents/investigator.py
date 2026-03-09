@@ -59,13 +59,9 @@ class VulnerabilityInvestigator:
                 raise InvestigationError("OpenAI not available. Install langchain-openai")
             
             api_key = llm_config.get("api_key")
-            provider = llm_config.get("provider", "openrouter")
             
             if not api_key:
-                if provider == "openai":
-                    raise InvestigationError("OpenAI API key not configured. Set OPENAI_API_KEY environment variable.")
-                else:
-                    raise InvestigationError("OpenRouter API key not configured. Set OPENROUTER_API_KEY environment variable.")
+                raise InvestigationError("OpenRouter API key not configured. Set OPENROUTER_API_KEY environment variable.")
             
             callbacks = [self._tracer] if self._tracer else None
             

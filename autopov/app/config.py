@@ -27,11 +27,9 @@ class Settings(BaseSettings):
     ADMIN_API_KEY: str = Field(default="", env="ADMIN_API_KEY")
     WEBHOOK_SECRET: str = Field(default="", env="WEBHOOK_SECRET")
     
-    # LLM Configuration - Online (OpenRouter or Direct OpenAI)
+    # LLM Configuration - Online (OpenRouter)
     OPENROUTER_API_KEY: str = Field(default="", env="OPENROUTER_API_KEY")
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
-    OPENAI_API_KEY: str = Field(default="", env="OPENAI_API_KEY")
-    OPENAI_BASE_URL: str = Field(default="https://api.openai.com/v1", env="OPENAI_BASE_URL")
     
     # LLM Configuration - Offline (Ollama)
     OLLAMA_BASE_URL: str = Field(default="http://localhost:11434", env="OLLAMA_BASE_URL")
@@ -196,42 +194,15 @@ class Settings(BaseSettings):
     def get_llm_config(self) -> dict:
         """Get LLM configuration based on MODEL_MODE"""
         if self.MODEL_MODE == "online":
-            # Determine if using OpenAI directly or OpenRouter
-            # If MODEL_NAME starts with "openai/" and OPENAI_API_KEY is set, use direct OpenAI API
-            is_openai_model = self.MODEL_NAME.startswith("openai/")
-            has_openai_key = bool(self.OPENAI_API_KEY)
-            has_openrouter_key = bool(self.OPENROUTER_API_KEY)
-            
-            if is_openai_model and has_openai_key:
-                # Use direct OpenAI API
-                return {
-                    "mode": "online",
-                    "model": self.MODEL_NAME.replace("openai/", ""),  # Remove prefix for direct API
-                    "api_key": self.OPENAI_API_KEY,
-                    "base_url": self.OPENAI_BASE_URL,
-                    "embedding_model": self.EMBEDDING_MODEL_ONLINE,
-                    "provider": "openai"
-                }
-            elif has_openrouter_key:
-                # Use OpenRouter
-                return {
-                    "mode": "online",
-                    "model": self.MODEL_NAME,
-                    "api_key": self.OPENROUTER_API_KEY,
-                    "base_url": self.OPENROUTER_BASE_URL,
-                    "embedding_model": self.EMBEDDING_MODEL_ONLINE,
-                    "provider": "openrouter"
-                }
-            else:
-                # Default to OpenRouter config (will fail gracefully with error if no key)
-                return {
-                    "mode": "online",
-                    "model": self.MODEL_NAME,
-                    "api_key": self.OPENROUTER_API_KEY or self.OPENAI_API_KEY,
-                    "base_url": self.OPENROUTER_BASE_URL,
-                    "embedding_model": self.EMBEDDING_MODEL_ONLINE,
-                    "provider": "openrouter"
-                }
+            # Use OpenRouter for all online models
+            return {
+                "mode": "online",
+                "model": self.MODEL_NAME,
+                "api_key": self.OPENROUTER_API_KEY,
+                "base_url": self.OPENROUTER_BASE_URL,
+                "embedding_model": self.EMBEDDING_MODEL_ONLINE,
+                "provider": "openrouter"
+            }
         else:
             return {
                 "mode": "offline",
