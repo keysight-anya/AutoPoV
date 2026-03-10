@@ -246,17 +246,19 @@ def scan(
                 # Show new logs
                 if logs and len(logs) > last_logs_count:
                     for log in logs[last_logs_count:]:
+                        # Escape square brackets to prevent Rich markup errors
+                        safe_log = log.replace("[", "\\[").replace("]", "\\]")
                         # Color code different types of logs
                         if "found" in log.lower() or "detected" in log.lower():
-                            console.print(f"[green]✓ {log}[/green]")
+                            console.print(f"[green]✓ {safe_log}[/green]")
                         elif "error" in log.lower() or "failed" in log.lower():
-                            console.print(f"[red]✗ {log}[/red]")
+                            console.print(f"[red]✗ {safe_log}[/red]")
                         elif "warning" in log.lower():
-                            console.print(f"[yellow]⚠ {log}[/yellow]")
+                            console.print(f"[yellow]⚠ {safe_log}[/yellow]")
                         elif "ingesting" in log.lower() or "cloning" in log.lower():
-                            console.print(f"[blue]→ {log}[/blue]")
+                            console.print(f"[blue]→ {safe_log}[/blue]")
                         else:
-                            console.print(f"  {log}")
+                            console.print(f"  {safe_log}")
                     last_logs_count = len(logs)
                 
                 # Show new findings immediately

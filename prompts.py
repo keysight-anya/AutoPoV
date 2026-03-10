@@ -52,6 +52,7 @@ VULNERABILITY DETAILS:
 - Line: {line_number}
 - Vulnerable Code: {vulnerable_code}
 - Explanation: {explanation}
+- Target Language: {target_language}
 
 TARGET CODE:
 ```
@@ -59,22 +60,29 @@ TARGET CODE:
 ```
 
 TASK:
-Create a Python script that demonstrates this vulnerability by triggering it.
+Create a {pov_language} script that demonstrates this vulnerability by triggering it against the running application.
 
 REQUIREMENTS:
-1. Use only Python standard library (no external packages)
+1. Use only {pov_language} standard library (no external packages)
 2. The script must print "VULNERABILITY TRIGGERED" when successful
 3. Include error handling
 4. Add comments explaining each step
 5. Make the PoV as deterministic as possible
+6. Connect to the target at {{target_url}} (this will be provided at runtime)
 
 For specific CWEs:
-- CWE-119 (Buffer Overflow): Create input that exceeds buffer bounds
+- CWE-79 (XSS): Inject malicious JavaScript payloads
 - CWE-89 (SQL Injection): Craft malicious SQL input
-- CWE-416 (Use After Free): This may require C code; create a Python wrapper if needed
-- CWE-190 (Integer Overflow): Create values that cause integer wraparound
+- CWE-22 (Path Traversal): Use ../ sequences to access files
+- CWE-94 (Code Injection): Inject and execute arbitrary code
+- CWE-78 (Command Injection): Inject shell commands
+- CWE-798 (Hardcoded Credentials): Try default/known credentials
+- CWE-502 (Deserialization): Craft malicious serialized objects
+- CWE-352 (CSRF): Forge cross-site requests
+- CWE-601 (Open Redirect): Manipulate redirect URLs
+- CWE-312 (Cleartext Storage): Check for unencrypted sensitive data
 
-Respond with ONLY the Python script, no markdown formatting:
+Respond with ONLY the {pov_language} script, no markdown formatting:
 """
 
 
@@ -267,7 +275,9 @@ def format_pov_generation_prompt(
     line_number: int,
     vulnerable_code: str,
     explanation: str,
-    code_context: str
+    code_context: str,
+    target_language: str = "python",
+    pov_language: str = "python"
 ) -> str:
     """Format the PoV generation prompt"""
     return POV_GENERATION_PROMPT.format(
@@ -276,7 +286,9 @@ def format_pov_generation_prompt(
         line_number=line_number,
         vulnerable_code=vulnerable_code,
         explanation=explanation,
-        code_context=code_context
+        code_context=code_context,
+        target_language=target_language,
+        pov_language=pov_language
     )
 
 

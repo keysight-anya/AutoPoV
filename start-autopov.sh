@@ -42,7 +42,13 @@ fi
 
 # Step 1: Build and start Backend in Docker
 print_info "Step 1: Building and starting Backend in Docker..."
-docker-compose up --build -d backend
+
+# Clean up any old instances
+docker rm -f autopov-api 2>/dev/null
+
+# Launch the backend engine using the image we just verified
+print_info "Launching Backend Container..."
+docker run -d --name autopov-api -p 8000:8000 --env-file .env autopov-backend:latest
 
 # Step 2: Wait for backend to be ready
 print_info "Step 2: Waiting for backend to start..."

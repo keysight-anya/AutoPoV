@@ -7,6 +7,7 @@ import os
 import json
 import csv
 import uuid
+import threading
 from typing import Dict, Any, List, Optional, Callable
 from datetime import datetime
 from dataclasses import dataclass, asdict
@@ -35,16 +36,38 @@ class ScanResult:
     start_time: str
     end_time: Optional[str]
     findings: List[Dict[str, Any]]
+    logs: List[str] = None
+    
+    def __post_init__(self):
+        if self.logs is None:
+            self.logs = []
 
 
 class ScanManager:
     """Manages vulnerability scans"""
     
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls):
+        """Singleton pattern to ensure single instance across threads"""
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
+    
     def __init__(self):
+        if self._initialized:
+            return
+        
+        self._initialized = True
         self._active_scans: Dict[str, Dict[str, Any]] = {}
         self._scan_callbacks: Dict[str, List[Callable]] = {}
         self._executor = ThreadPoolExecutor(max_workers=3)
         self._runs_dir = settings.RUNS_DIR
+        self._scan_locks: Dict[str, threading.Lock] = {}
         os.makedirs(self._runs_dir, exist_ok=True)
     
     def create_scan(
@@ -80,6 +103,9 @@ class ScanManager:
             "progress": 0,
             "result": None
         }
+        
+        # Create a lock for this scan to ensure thread-safe log updates
+        self._scan_locks[scan_id] = threading.Lock()
         
         return scan_id
     
@@ -124,6 +150,10 @@ class ScanManager:
         scan_info = self._active_scans[scan_id]
         
         try:
+            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Starting vulnerability scan...")
+            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Model: {scan_info['model_name']}")
+            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] CWEs to check: {', '.join(scan_info['cwes'])}")
+            
             # Get agent graph
             agent = get_agent_graph()
             
@@ -134,6 +164,15 @@ class ScanManager:
                 cwes=scan_info["cwes"],
                 scan_id=scan_id
             )
+            
+            # Sync logs from agent graph state to scan_info (in case any were missed)
+            if final_state.get("logs"):
+                existing_logs = set(scan_info["logs"])
+                for log in final_state["logs"]:
+                    if log not in existing_logs:
+                        scan_info["logs"].append(log)
+            
+            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Scan completed with status: {final_state['status']}")
             
             # Process results
             confirmed = sum(1 for f in final_state["findings"] if f["final_status"] == "confirmed")
@@ -159,7 +198,8 @@ class ScanManager:
                 duration_s=duration,
                 start_time=final_state["start_time"],
                 end_time=final_state["end_time"],
-                findings=[dict(f) for f in final_state["findings"]]
+                findings=[dict(f) for f in final_state["findings"]],
+                logs=scan_info.get("logs", [])
             )
             
             # Save result
@@ -241,6 +281,32 @@ class ScanManager:
     def get_scan(self, scan_id: str) -> Optional[Dict[str, Any]]:
         """Get scan information"""
         return self._active_scans.get(scan_id)
+    
+    def append_log(self, scan_id: str, message: str) -> bool:
+        """
+        Thread-safe method to append a log message to a scan
+        
+        Args:
+            scan_id: Scan ID
+            message: Log message to append
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            scan_info = self._active_scans.get(scan_id)
+            if scan_info:
+                # Use the scan-specific lock if available
+                lock = self._scan_locks.get(scan_id)
+                if lock:
+                    with lock:
+                        scan_info["logs"].append(message)
+                else:
+                    scan_info["logs"].append(message)
+                return True
+        except Exception:
+            pass
+        return False
     
     def get_scan_result(self, scan_id: str) -> Optional[ScanResult]:
         """Get scan result from file"""
