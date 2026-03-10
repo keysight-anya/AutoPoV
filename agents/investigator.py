@@ -47,12 +47,16 @@ class VulnerabilityInvestigator:
                 project_name=settings.LANGCHAIN_PROJECT
             )
     
-    def _get_llm(self):
+    def _get_llm(self, model_name: Optional[str] = None):
         """Get LLM instance based on configuration"""
-        if self._llm is not None:
+        # Always create new instance if model_name is specified
+        if model_name is None and self._llm is not None:
             return self._llm
         
         llm_config = settings.get_llm_config()
+        
+        # Use provided model_name or fall back to config
+        actual_model = model_name or llm_config["model"]
         
         if llm_config["mode"] == "online":
             if not OPENAI_AVAILABLE:
@@ -65,27 +69,38 @@ class VulnerabilityInvestigator:
             
             callbacks = [self._tracer] if self._tracer else None
             
-            self._llm = ChatOpenAI(
-                model=llm_config["model"],
+            llm = ChatOpenAI(
+                model=actual_model,
                 api_key=api_key,
                 base_url=llm_config["base_url"],
                 temperature=0.1,
                 callbacks=callbacks
             )
+            
+            # Store model info for cost tracking
+            llm._autopov_model_name = actual_model
+            
+            if model_name is None:
+                self._llm = llm
+            return llm
         else:
             if not OLLAMA_AVAILABLE:
                 raise InvestigationError("Ollama not available. Install langchain-ollama")
             
             callbacks = [self._tracer] if self._tracer else None
             
-            self._llm = ChatOllama(
-                model=llm_config["model"],
+            llm = ChatOllama(
+                model=actual_model,
                 base_url=llm_config["base_url"],
                 temperature=0.1,
                 callbacks=callbacks
             )
-        
-        return self._llm
+            
+            llm._autopov_model_name = actual_model
+            
+            if model_name is None:
+                self._llm = llm
+            return llm
     
     def _run_joern_analysis(
         self,
@@ -259,7 +274,8 @@ class VulnerabilityInvestigator:
         cwe_type: str,
         filepath: str,
         line_number: int,
-        alert_message: str
+        alert_message: str,
+        model_name: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Investigate a potential vulnerability
@@ -271,6 +287,7 @@ class VulnerabilityInvestigator:
             filepath: File path
             line_number: Line number
             alert_message: Original alert message
+            model_name: Optional model name to use (overrides default)
         
         Returns:
             Investigation result dictionary
@@ -303,8 +320,8 @@ class VulnerabilityInvestigator:
                 joern_context=joern_context
             )
             
-            # Call LLM
-            llm = self._get_llm()
+            # Call LLM with specified model
+            llm = self._get_llm(model_name)
             messages = [
                 SystemMessage(content="You are a security expert analyzing code for vulnerabilities."),
                 HumanMessage(content=prompt)
@@ -312,6 +329,54 @@ class VulnerabilityInvestigator:
             
             response = llm.invoke(messages)
             response_text = response.content
+            
+            # Get actual token usage and cost from response
+            actual_cost = 0.0
+            token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            
+            # Debug: Print response structure to understand what we get
+            # print(f"[DEBUG] Response type: {type(response)}")
+            # print(f"[DEBUG] Response attrs: {dir(response)}")
+            
+            # Try multiple ways to extract token usage from LangChain/OpenRouter response
+            try:
+                # Method 1: Check for usage_metadata (newer LangChain versions)
+                if hasattr(response, 'usage_metadata') and response.usage_metadata:
+                    um = response.usage_metadata
+                    token_usage = {
+                        "prompt_tokens": um.get('input_tokens', 0) or um.get('prompt_tokens', 0),
+                        "completion_tokens": um.get('output_tokens', 0) or um.get('completion_tokens', 0),
+                        "total_tokens": um.get('total_tokens', 0)
+                    }
+                # Method 2: Check for response_metadata (older LangChain versions)
+                elif hasattr(response, 'response_metadata') and response.response_metadata:
+                    rm = response.response_metadata
+                    # Try to get usage from response_metadata
+                    if 'token_usage' in rm:
+                        usage = rm['token_usage']
+                        token_usage = {
+                            "prompt_tokens": usage.get('prompt_tokens', 0),
+                            "completion_tokens": usage.get('completion_tokens', 0),
+                            "total_tokens": usage.get('total_tokens', 0)
+                        }
+                    elif 'usage' in rm:
+                        usage = rm['usage']
+                        token_usage = {
+                            "prompt_tokens": usage.get('prompt_tokens', 0) or usage.get('input_tokens', 0),
+                            "completion_tokens": usage.get('completion_tokens', 0) or usage.get('output_tokens', 0),
+                            "total_tokens": usage.get('total_tokens', 0)
+                        }
+                
+                # Calculate cost if we have token usage
+                if token_usage["total_tokens"] > 0:
+                    actual_cost = self._calculate_actual_cost(
+                        model_name or llm._autopov_model_name,
+                        token_usage["prompt_tokens"],
+                        token_usage["completion_tokens"]
+                    )
+                    print(f"[CostTracking] Model: {model_name or llm._autopov_model_name}, Tokens: {token_usage}, Cost: ${actual_cost:.6f}")
+            except Exception as e:
+                print(f"[CostTracking] Error extracting token usage: {e}")
             
             # Parse JSON response
             try:
@@ -344,6 +409,9 @@ class VulnerabilityInvestigator:
             result["timestamp"] = end_time.isoformat()
             result["filepath"] = filepath
             result["line_number"] = line_number
+            result["model_used"] = model_name or llm._autopov_model_name
+            result["cost_usd"] = actual_cost
+            result["token_usage"] = token_usage
             
             return result
             
@@ -364,6 +432,45 @@ class VulnerabilityInvestigator:
                 "filepath": filepath,
                 "line_number": line_number
             }
+    
+    def _calculate_actual_cost(self, model_name: str, prompt_tokens: int, completion_tokens: int) -> float:
+        """
+        Calculate actual cost based on OpenRouter pricing
+        Prices per 1M tokens (as of March 2025)
+        """
+        # OpenRouter pricing per 1M tokens (input/output)
+        pricing = {
+            # OpenAI models
+            "openai/gpt-4o": (2.50, 10.00),
+            "openai/gpt-4o-mini": (0.15, 0.60),
+            "openai/gpt-4-turbo": (10.00, 30.00),
+            
+            # Anthropic models
+            "anthropic/claude-3.5-sonnet": (3.00, 15.00),
+            "anthropic/claude-3-opus": (15.00, 75.00),
+            "anthropic/claude-3-haiku": (0.25, 1.25),
+            
+            # Google models
+            "google/gemini-2.0-flash-001": (0.10, 0.40),
+            
+            # Meta models
+            "meta-llama/llama-3.3-70b-instruct": (0.70, 1.50),
+            
+            # DeepSeek
+            "deepseek/deepseek-chat": (0.50, 2.00),
+            
+            # Qwen
+            "qwen/qwen-2.5-72b-instruct": (0.50, 1.50),
+        }
+        
+        # Get pricing for model (default to GPT-4o if unknown)
+        input_price, output_price = pricing.get(model_name, (2.50, 10.00))
+        
+        # Calculate cost (prices are per 1M tokens)
+        input_cost = (prompt_tokens / 1_000_000) * input_price
+        output_cost = (completion_tokens / 1_000_000) * output_price
+        
+        return round(input_cost + output_cost, 6)
     
     def batch_investigate(
         self,

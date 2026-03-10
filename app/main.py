@@ -203,18 +203,19 @@ async def scan_git(
     
     def run_scan():
         import traceback
-        scan_info = get_scan_manager().get_scan(scan_id)
+        scan_manager = get_scan_manager()
+        scan_info = scan_manager.get_scan(scan_id)
         
         try:
             # Step 1: Check repository accessibility
             if scan_info:
                 scan_info["status"] = "checking"
-                scan_info["logs"].append(f"Checking repository: {request.url}")
+                scan_manager.append_log(scan_id, f"Checking repository: {request.url}")
             
             is_accessible, message, repo_info = get_git_handler().check_repo_accessibility(request.url, request.branch)
             
             if scan_info:
-                scan_info["logs"].append(message)
+                scan_manager.append_log(scan_id, message)
             
             if not is_accessible:
                 if scan_info:
@@ -226,9 +227,9 @@ async def scan_git(
             # Step 2: Clone repository
             if scan_info:
                 scan_info["status"] = "cloning"
-                scan_info["logs"].append(f"Cloning repository: {request.url}")
+                scan_manager.append_log(scan_id, f"Cloning repository: {request.url}")
                 if repo_info.get("size_mb"):
-                    scan_info["logs"].append(f"Repository size: {repo_info['size_mb']:.1f} MB")
+                    scan_manager.append_log(scan_id, f"Repository size: {repo_info['size_mb']:.1f} MB")
             
             path, provider = get_git_handler().clone_repository(
                 url=request.url,
@@ -239,17 +240,24 @@ async def scan_git(
             # Update scan with path
             if scan_info:
                 scan_info["codebase_path"] = path
-                scan_info["logs"].append(f"Repository cloned to: {path}")
+                scan_manager.append_log(scan_id, f"Repository cloned to: {path}")
+                scan_manager.append_log(scan_id, "Starting vulnerability scan...")
             
-            # Run scan synchronously in background
-            asyncio.run(get_scan_manager().run_scan_async(scan_id))
+            # Run scan synchronously in background using asyncio.run in a new event loop
+            # Create a new event loop for this thread
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(scan_manager.run_scan_async(scan_id))
+            finally:
+                loop.close()
             
         except Exception as e:
             error_msg = f"{str(e)}\n{traceback.format_exc()}"
             if scan_info:
                 scan_info["status"] = "failed"
                 scan_info["error"] = str(e)
-                scan_info["logs"].append(f"ERROR: {str(e)}")
+                scan_manager.append_log(scan_id, f"ERROR: {str(e)}")
             print(f"Scan {scan_id} failed: {error_msg}")
     
     background_tasks.add_task(run_scan)
@@ -375,7 +383,7 @@ async def get_scan_status(
                 scan_id=scan_id,
                 status=result.status,
                 progress=100,
-                logs=[],
+                logs=result.logs if hasattr(result, 'logs') else [],
                 result=result.__dict__
             )
         raise HTTPException(status_code=404, detail="Scan not found")

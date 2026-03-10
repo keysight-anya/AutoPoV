@@ -6,12 +6,21 @@ function ModelSelector({ value, onChange }) {
   
   const onlineModels = [
     { value: 'openai/gpt-4o', label: 'GPT-4o', provider: 'OpenAI' },
-    { value: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet', provider: 'Anthropic' }
+    { value: 'openai/gpt-4o-mini', label: 'GPT-4o Mini', provider: 'OpenAI' },
+    { value: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet', provider: 'Anthropic' },
+    { value: 'anthropic/claude-3-opus', label: 'Claude 3 Opus', provider: 'Anthropic' },
+    { value: 'anthropic/claude-3-haiku', label: 'Claude 3 Haiku', provider: 'Anthropic' },
+    { value: 'google/gemini-2.0-flash-001', label: 'Gemini 2.0 Flash', provider: 'Google' },
+    { value: 'meta-llama/llama-3.3-70b-instruct', label: 'Llama 3.3 70B', provider: 'Meta' },
+    { value: 'deepseek/deepseek-chat', label: 'DeepSeek V3', provider: 'DeepSeek' },
+    { value: 'qwen/qwen-2.5-72b-instruct', label: 'Qwen 2.5 72B', provider: 'Alibaba' }
   ]
   
   const offlineModels = [
     { value: 'llama3:70b', label: 'Llama 3 70B', provider: 'Ollama' },
-    { value: 'mixtral:8x7b', label: 'Mixtral 8x7B', provider: 'Ollama' }
+    { value: 'mixtral:8x7b', label: 'Mixtral 8x7B', provider: 'Ollama' },
+    { value: 'codellama:70b', label: 'CodeLlama 70B', provider: 'Ollama' },
+    { value: 'qwen2.5-coder:32b', label: 'Qwen 2.5 Coder 32B', provider: 'Ollama' }
   ]
 
   const models = mode === 'online' ? onlineModels : offlineModels

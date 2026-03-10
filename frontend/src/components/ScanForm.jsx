@@ -11,15 +11,32 @@ function ScanForm({ onSubmit, isLoading }) {
     language: 'python',
     filename: '',
     model: 'openai/gpt-4o',
-    cwes: ['CWE-89', 'CWE-119', 'CWE-190', 'CWE-416']
+    cwes: ['CWE-89', 'CWE-79', 'CWE-94', 'CWE-78', 'CWE-22', 'CWE-798', 'CWE-502', 'CWE-352', 'CWE-601', 'CWE-312']
   })
   const [selectedFile, setSelectedFile] = useState(null)
 
+  // OWASP Top 10 2021 + high-impact web vulnerabilities (matching CLI)
   const cweOptions = [
     { value: 'CWE-89', label: 'CWE-89: SQL Injection' },
-    { value: 'CWE-119', label: 'CWE-119: Buffer Overflow' },
-    { value: 'CWE-190', label: 'CWE-190: Integer Overflow' },
-    { value: 'CWE-416', label: 'CWE-416: Use After Free' }
+    { value: 'CWE-79', label: 'CWE-79: Cross-site Scripting (XSS)' },
+    { value: 'CWE-20', label: 'CWE-20: Improper Input Validation' },
+    { value: 'CWE-200', label: 'CWE-200: Information Exposure' },
+    { value: 'CWE-22', label: 'CWE-22: Path Traversal' },
+    { value: 'CWE-352', label: 'CWE-352: CSRF' },
+    { value: 'CWE-502', label: 'CWE-502: Deserialization' },
+    { value: 'CWE-287', label: 'CWE-287: Authentication' },
+    { value: 'CWE-798', label: 'CWE-798: Hardcoded Credentials' },
+    { value: 'CWE-306', label: 'CWE-306: Missing Authentication' },
+    { value: 'CWE-94', label: 'CWE-94: Code Injection' },
+    { value: 'CWE-78', label: 'CWE-78: Command Injection' },
+    { value: 'CWE-601', label: 'CWE-601: URL Redirection' },
+    { value: 'CWE-312', label: 'CWE-312: Cleartext Storage' },
+    { value: 'CWE-327', label: 'CWE-327: Broken Crypto' },
+    { value: 'CWE-918', label: 'CWE-918: SSRF' },
+    { value: 'CWE-434', label: 'CWE-434: Unrestricted Upload' },
+    { value: 'CWE-611', label: 'CWE-611: XXE' },
+    { value: 'CWE-400', label: 'CWE-400: Resource Exhaustion' },
+    { value: 'CWE-384', label: 'CWE-384: Session Fixation' }
   ]
 
   const handleSubmit = (e) => {
@@ -181,11 +198,11 @@ function ScanForm({ onSubmit, isLoading }) {
         {/* CWE Selection */}
         <div>
           <label className="block text-sm font-medium text-gray-400 mb-3">
-            CWEs to Check
+            CWEs to Check ({formData.cwes.length} selected)
           </label>
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-2 md:grid-cols-3 gap-3 max-h-64 overflow-y-auto p-2 bg-gray-800/50 rounded-lg">
             {cweOptions.map(cwe => (
-              <label key={cwe.value} className="flex items-center space-x-2 cursor-pointer">
+              <label key={cwe.value} className="flex items-center space-x-2 cursor-pointer hover:bg-gray-800 p-1 rounded">
                 <input
                   type="checkbox"
                   checked={formData.cwes.includes(cwe.value)}
@@ -196,6 +213,9 @@ function ScanForm({ onSubmit, isLoading }) {
               </label>
             ))}
           </div>
+          <p className="mt-2 text-xs text-gray-500">
+            Select the vulnerability types to scan for. Default selection covers OWASP Top 10.
+          </p>
         </div>
 
         {/* Submit Button */}
