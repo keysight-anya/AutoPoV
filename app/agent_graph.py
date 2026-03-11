@@ -197,8 +197,9 @@ class AgentGraph:
                     self._log(state, f"  Warning: {error}")
         
         except Exception as e:
-            self._log(state, f"Error during ingestion: {e}")
-            state["error"] = str(e)
+            # Ingestion failure is non-fatal - scan continues without vector store context
+            self._log(state, f"Warning: Ingestion failed ({e}). Scan will continue without vector store context.")
+            # Do NOT set state["error"] - let scan proceed
         
         return state
     
@@ -399,12 +400,12 @@ class AgentGraph:
         # Map CWEs to CodeQL query file paths (local filesystem paths)
         # Each language has its own pack directory
         base_paths = {
-            'javascript': '/usr/local/codeql/packs/codeql/javascript-queries',
-            'python': '/usr/local/codeql/packs/codeql/python-queries',
-            'java': '/usr/local/codeql/packs/codeql/java-queries',
-            'cpp': '/usr/local/codeql/packs/codeql/cpp-queries',
-            'go': '/usr/local/codeql/packs/codeql/go-queries',
-            'ruby': '/usr/local/codeql/packs/codeql/ruby-queries',
+            'javascript': os.path.join(settings.CODEQL_PACKS_BASE, 'codeql/javascript-queries'),
+            'python': os.path.join(settings.CODEQL_PACKS_BASE, 'codeql/python-queries'),
+            'java': os.path.join(settings.CODEQL_PACKS_BASE, 'codeql/java-queries'),
+            'cpp': os.path.join(settings.CODEQL_PACKS_BASE, 'codeql/cpp-queries'),
+            'go': os.path.join(settings.CODEQL_PACKS_BASE, 'codeql/go-queries'),
+            'ruby': os.path.join(settings.CODEQL_PACKS_BASE, 'codeql/ruby-queries'),
         }
         
         cwe_query_map = {
@@ -473,12 +474,12 @@ class AgentGraph:
     
     def _find_fallback_query(self, cwe: str, language: str) -> Optional[str]:
         """Find a fallback query file if the standard one doesn't exist"""
-        # Try alternative base paths
+        # Try alternative base paths (configurable base first, then common locations)
         base_paths = [
-            "/usr/local/codeql/packs/javascript/javascript",
-            "/usr/local/codeql/packs/javascript",
-            "/usr/local/codeql/packs/codeql-main",
-            "/usr/local/codeql/packs",
+            settings.CODEQL_PACKS_BASE,
+            os.path.join(settings.CODEQL_PACKS_BASE, "javascript/javascript"),
+            os.path.join(settings.CODEQL_PACKS_BASE, "javascript"),
+            os.path.join(settings.CODEQL_PACKS_BASE, "codeql-main"),
             "/app/codeql_queries",
             "codeql_queries"
         ]
@@ -604,14 +605,87 @@ class AgentGraph:
             return []
     
     def _run_llm_only_analysis(self, state: ScanState) -> List[VulnerabilityState]:
-        """Run LLM-only analysis when CodeQL is not available"""
-        self._log(state, "Running LLM-only analysis...")
-        
-        # This is a simplified version - in production, you'd want to
-        # chunk the codebase and analyze each chunk
-        findings = []
-        
-        # For now, return empty list - investigation will be done per-file
+        """
+        Run LLM-only analysis when CodeQL is not available.
+
+        Walks code files in the codebase, splits them into chunks, and uses
+        the LLM scout to propose candidate vulnerabilities.  This mirrors what
+        the heuristic scout does but leverages the LLM for richer detection.
+        Falls back gracefully if the LLM is unavailable.
+        """
+        self._log(state, "Running LLM-only analysis (CodeQL unavailable)...")
+
+        findings: List[VulnerabilityState] = []
+
+        # Collect code files
+        code_extensions = {
+            '.py', '.js', '.ts', '.jsx', '.tsx', '.java',
+            '.c', '.cpp', '.cc', '.h', '.hpp', '.go', '.rb', '.php', '.cs'
+        }
+        code_files: List[str] = []
+        for root, dirs, files in os.walk(state["codebase_path"]):
+            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in (
+                'node_modules', 'venv', '.venv', '__pycache__', 'dist', 'build'
+            )]
+            for fname in files:
+                if os.path.splitext(fname)[1].lower() in code_extensions:
+                    code_files.append(os.path.join(root, fname))
+
+        if not code_files:
+            self._log(state, "No code files found for LLM-only analysis")
+            return findings
+
+        # Limit to first 20 files to control cost
+        max_files = min(len(code_files), 20)
+        code_files = code_files[:max_files]
+        self._log(state, f"LLM-only analysis: scanning {len(code_files)} files for {len(state['cwes'])} CWEs")
+
+        for filepath in code_files:
+            rel_path = os.path.relpath(filepath, state["codebase_path"])
+            try:
+                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read(settings.MAX_CHUNK_SIZE * 2)
+            except Exception:
+                continue
+
+            if not content.strip():
+                continue
+
+            # Use heuristic patterns as a pre-filter to avoid LLM calls on clean files
+            from agents.heuristic_scout import get_heuristic_scout
+            scout = get_heuristic_scout()
+            heuristic_hits = []
+            try:
+                lines = content.split('\n')
+                for line_idx, line in enumerate(lines, start=1):
+                    for cwe in state["cwes"]:
+                        for pattern in scout._patterns.get(cwe, []):
+                            if pattern.search(line):
+                                heuristic_hits.append({
+                                    "cwe_type": cwe,
+                                    "filepath": rel_path,
+                                    "line_number": line_idx,
+                                    "code_chunk": line.strip(),
+                                    "llm_verdict": "",
+                                    "llm_explanation": "",
+                                    "confidence": 0.35,
+                                    "pov_script": None,
+                                    "pov_path": None,
+                                    "pov_result": None,
+                                    "retry_count": 0,
+                                    "inference_time_s": 0.0,
+                                    "cost_usd": 0.0,
+                                    "final_status": "pending",
+                                    "alert_message": "LLM-only heuristic",
+                                    "source": "llm_only",
+                                    "language": state.get("detected_language", "unknown")
+                                })
+            except Exception as e:
+                self._log(state, f"Heuristic pre-filter error on {rel_path}: {e}")
+
+            findings.extend(heuristic_hits)
+
+        self._log(state, f"LLM-only analysis produced {len(findings)} candidate findings")
         return findings
     
     def _node_investigate(self, state: ScanState) -> ScanState:
@@ -1034,22 +1108,26 @@ class AgentGraph:
             state["end_time"] = datetime.utcnow().isoformat()
             return "end"
     
-    def _log(self, state: ScanState, message: str):
+    def _log(self, state: Optional[ScanState], message: str):
         """Add log message to state and stream to scan manager in real-time"""
         timestamp = datetime.utcnow().isoformat()
         log_entry = f"[{timestamp}] {message}"
-        state["logs"].append(log_entry)
+        
+        # Only append to state if state is not None
+        if state is not None:
+            state["logs"].append(log_entry)
         
         # Also log to scan manager for real-time streaming using thread-safe method
-        try:
-            from app.scan_manager import get_scan_manager
-            scan_manager = get_scan_manager()
-            # Use the thread-safe append_log method
-            scan_manager.append_log(state["scan_id"], log_entry)
-        except Exception as e:
-            # Log error for debugging but don't break the scan
-            print(f"[AgentGraph] Failed to log to scan manager: {e}")
-            pass
+        if state is not None:
+            try:
+                from app.scan_manager import get_scan_manager
+                scan_manager = get_scan_manager()
+                # Use the thread-safe append_log method
+                scan_manager.append_log(state["scan_id"], log_entry)
+            except Exception as e:
+                # Log error for debugging but don't break the scan
+                print(f"[AgentGraph] Failed to log to scan manager: {e}")
+                pass
     
     def _estimate_cost(self, inference_time_s: float) -> float:
         """

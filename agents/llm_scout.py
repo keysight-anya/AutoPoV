@@ -153,6 +153,7 @@ class LLMScout:
             if token_usage["total_tokens"] > 0:
                 from agents.investigator import get_investigator
                 inv = get_investigator()
+                llm_config = settings.get_llm_config()
                 cost_usd = inv._calculate_actual_cost(
                     model_name or llm_config["model"],
                     token_usage["prompt_tokens"],

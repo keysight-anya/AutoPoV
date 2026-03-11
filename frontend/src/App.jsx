@@ -7,6 +7,7 @@ import History from './pages/History'
 import Settings from './pages/Settings'
 import Docs from './pages/Docs'
 import Policy from './pages/Policy'
+import Metrics from './pages/Metrics'
 
 function App() {
   return (
@@ -21,6 +22,7 @@ function App() {
           <Route path="/settings" element={<Settings />} />
           <Route path="/docs" element={<Docs />} />
           <Route path="/policy" element={<Policy />} />
+          <Route path="/metrics" element={<Metrics />} />
         </Routes>
       </main>
     </div>

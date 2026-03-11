@@ -1,6 +1,6 @@
 import { Link, useLocation } from 'react-router-dom'
 import { useEffect, useState } from 'react'
-import { Shield, Home, History, Settings, FileText, BarChart } from 'lucide-react'
+import { Shield, Home, History, Settings, FileText, BarChart, Activity } from 'lucide-react'
 
 function NavBar() {
   const location = useLocation()
@@ -58,6 +58,10 @@ function NavBar() {
             <Link to="/policy" className={`flex items-center space-x-1 ${isActive('/policy')}`}>
               <BarChart className="w-4 h-4" />
               <span>Policy</span>
+            </Link>
+            <Link to="/metrics" className={`flex items-center space-x-1 ${isActive('/metrics')}`}>
+              <Activity className="w-4 h-4" />
+              <span>Metrics</span>
             </Link>
             <Link to="/docs" className={`flex items-center space-x-1 ${isActive('/docs')}`}>
               <FileText className="w-4 h-4" />

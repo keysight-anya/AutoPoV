@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { ArrowLeft, CheckCircle, XCircle } from 'lucide-react'
+import { ArrowLeft, CheckCircle, XCircle, StopCircle } from 'lucide-react'
 import LiveLog from '../components/LiveLog'
-import { getScanStatus, getScanLogs } from '../api/client'
+import { getScanStatus, getScanLogs, cancelScan } from '../api/client'
 
 function ScanProgress() {
   const { scanId } = useParams()
@@ -11,6 +11,7 @@ function ScanProgress() {
   const [status, setStatus] = useState('running')
   const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
+  const [cancelling, setCancelling] = useState(false)
 
   useEffect(() => {
     // Poll for status
@@ -77,12 +78,26 @@ function ScanProgress() {
     }
   }, [scanId, navigate])
 
+  const handleCancel = async () => {
+    if (cancelling) return
+    setCancelling(true)
+    try {
+      await cancelScan(scanId)
+      setStatus('cancelled')
+    } catch (err) {
+      setError(err.response?.data?.detail || err.message || 'Failed to cancel scan')
+      setCancelling(false)
+    }
+  }
+
   const getStatusIcon = () => {
     switch (status) {
       case 'completed':
         return <CheckCircle className="w-6 h-6 text-green-400" />
       case 'failed':
         return <XCircle className="w-6 h-6 text-red-400" />
+      case 'cancelled':
+        return <StopCircle className="w-6 h-6 text-yellow-400" />
       default:
         return (
           <div className="w-6 h-6 border-2 border-primary-500 border-t-transparent rounded-full animate-spin" />
@@ -93,17 +108,31 @@ function ScanProgress() {
   return (
     <div className="max-w-4xl mx-auto">
       {/* Header */}
-      <div className="flex items-center space-x-4 mb-6">
-        <button
-          onClick={() => navigate('/')}
-          className="p-2 hover:bg-gray-800 rounded-lg transition-colors"
-        >
-          <ArrowLeft className="w-5 h-5" />
-        </button>
-        <div>
-          <h1 className="text-2xl font-bold">Scan Progress</h1>
-          <p className="text-sm text-gray-400">ID: {scanId}</p>
+      <div className="flex items-center justify-between mb-6">
+        <div className="flex items-center space-x-4">
+          <button
+            onClick={() => navigate('/')}
+            className="p-2 hover:bg-gray-800 rounded-lg transition-colors"
+          >
+            <ArrowLeft className="w-5 h-5" />
+          </button>
+          <div>
+            <h1 className="text-2xl font-bold">Scan Progress</h1>
+            <p className="text-sm text-gray-400">ID: {scanId}</p>
+          </div>
         </div>
+
+        {/* Cancel button — only shown while scan is running */}
+        {status === 'running' && (
+          <button
+            onClick={handleCancel}
+            disabled={cancelling}
+            className="flex items-center space-x-2 px-4 py-2 bg-red-900/40 hover:bg-red-900/70 border border-red-700 text-red-300 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <StopCircle className="w-4 h-4" />
+            <span>{cancelling ? 'Cancelling...' : 'Cancel Scan'}</span>
+          </button>
+        )}
       </div>
 
       {/* Status */}
@@ -120,6 +149,9 @@ function ScanProgress() {
             )}
             {status === 'failed' && (
               <p className="text-sm text-red-400">Scan failed. Check logs for details.</p>
+            )}
+            {status === 'cancelled' && (
+              <p className="text-sm text-yellow-400">Scan was cancelled.</p>
             )}
           </div>
         </div>

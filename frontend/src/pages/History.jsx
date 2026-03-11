@@ -1,28 +1,43 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { History, ExternalLink, CheckCircle, XCircle, Clock } from 'lucide-react'
+import { History, ExternalLink, CheckCircle, XCircle, Clock, ChevronLeft, ChevronRight } from 'lucide-react'
 import { getHistory } from '../api/client'
+
+const PAGE_SIZE = 20
 
 function HistoryPage() {
   const navigate = useNavigate()
   const [scans, setScans] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
+  const [page, setPage] = useState(0)
+  const [hasMore, setHasMore] = useState(true)
+  const [total, setTotal] = useState(null)
+
+  const fetchHistory = useCallback(async (pageNum) => {
+    setLoading(true)
+    setError(null)
+    try {
+      const offset = pageNum * PAGE_SIZE
+      const response = await getHistory(PAGE_SIZE + 1, offset)
+      const rows = response.data.history || []
+      // Use one extra row to determine if there's a next page
+      setHasMore(rows.length > PAGE_SIZE)
+      setScans(rows.slice(0, PAGE_SIZE))
+      // Try to get total from header if available, otherwise approximate
+      if (response.data.total !== undefined) {
+        setTotal(response.data.total)
+      }
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setLoading(false)
+    }
+  }, [])
 
   useEffect(() => {
-    const fetchHistory = async () => {
-      try {
-        const response = await getHistory(100, 0)
-        setScans(response.data.history || [])
-      } catch (err) {
-        setError(err.message)
-      } finally {
-        setLoading(false)
-      }
-    }
-
-    fetchHistory()
-  }, [])
+    fetchHistory(page)
+  }, [page, fetchHistory])
 
   const getStatusIcon = (status) => {
     switch (status) {
@@ -60,6 +75,9 @@ function HistoryPage() {
       <div className="flex items-center space-x-3 mb-6">
         <History className="w-8 h-8 text-primary-500" />
         <h1 className="text-2xl font-bold">Scan History</h1>
+        {total !== null && (
+          <span className="text-sm text-gray-400">({total} total)</span>
+        )}
       </div>
 
       {/* Error */}
@@ -133,6 +151,34 @@ function HistoryPage() {
             )}
           </tbody>
         </table>
+      </div>
+
+      {/* Pagination Controls */}
+      <div className="flex items-center justify-between mt-4">
+        <span className="text-sm text-gray-400">
+          Page {page + 1}
+          {scans.length > 0 && (
+            <> &mdash; showing {page * PAGE_SIZE + 1}–{page * PAGE_SIZE + scans.length}</>
+          )}
+        </span>
+        <div className="flex items-center space-x-2">
+          <button
+            disabled={page === 0}
+            onClick={() => setPage(p => p - 1)}
+            className="flex items-center px-3 py-1.5 rounded border border-gray-700 text-sm text-gray-300 hover:bg-gray-800 disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            <ChevronLeft className="w-4 h-4 mr-1" />
+            Previous
+          </button>
+          <button
+            disabled={!hasMore}
+            onClick={() => setPage(p => p + 1)}
+            className="flex items-center px-3 py-1.5 rounded border border-gray-700 text-sm text-gray-300 hover:bg-gray-800 disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            Next
+            <ChevronRight className="w-4 h-4 ml-1" />
+          </button>
+        </div>
       </div>
     </div>
   )

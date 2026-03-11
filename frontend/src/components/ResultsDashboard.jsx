@@ -1,9 +1,128 @@
 import { useMemo, useState } from 'react'
 import { PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
-import { CheckCircle, XCircle, AlertCircle, DollarSign, Clock, FlaskConical, ChevronDown, ChevronUp } from 'lucide-react'
+import { CheckCircle, XCircle, AlertCircle, DollarSign, Clock, FlaskConical, ChevronDown, ChevronUp, X } from 'lucide-react'
+
+// ---- Inline detail table for a clicked stat card ----
+function StatDetailPanel({ title, findings, color, onClose }) {
+  const [sortKey, setSortKey] = useState('cwe_type')
+  const [sortDir, setSortDir] = useState('asc')
+  const [page, setPage] = useState(0)
+  const PAGE_SIZE = 15
+
+  const sorted = useMemo(() => {
+    return [...findings].sort((a, b) => {
+      const av = a[sortKey] ?? ''
+      const bv = b[sortKey] ?? ''
+      const cmp = String(av).localeCompare(String(bv), undefined, { numeric: true })
+      return sortDir === 'asc' ? cmp : -cmp
+    })
+  }, [findings, sortKey, sortDir])
+
+  const totalPages = Math.ceil(sorted.length / PAGE_SIZE)
+  const pageItems = sorted.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)
+
+  const toggle = (key) => {
+    if (sortKey === key) setSortDir(d => d === 'asc' ? 'desc' : 'asc')
+    else { setSortKey(key); setSortDir('asc') }
+  }
+
+  const SortIcon = ({ k }) => sortKey === k
+    ? (sortDir === 'asc' ? <ChevronUp className="w-3 h-3 inline ml-1" /> : <ChevronDown className="w-3 h-3 inline ml-1" />)
+    : null
+
+  const cols = [
+    { key: 'cwe_type',       label: 'CWE' },
+    { key: 'filepath',       label: 'File' },
+    { key: 'line_number',    label: 'Line' },
+    { key: 'confidence',     label: 'Confidence' },
+    { key: 'model_used',     label: 'Model' },
+    { key: 'final_status',   label: 'Status' },
+  ]
+
+  return (
+    <div className="mt-4 bg-gray-900 border border-gray-700 rounded-xl overflow-hidden">
+      <div className="flex items-center justify-between px-5 py-3 border-b border-gray-700">
+        <span className={`font-semibold text-sm ${color}`}>{title} — {findings.length} findings</span>
+        <button onClick={onClose} className="p-1 hover:bg-gray-700 rounded">
+          <X className="w-4 h-4 text-gray-400" />
+        </button>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="bg-gray-800 text-gray-400 uppercase tracking-wide">
+              {cols.map(c => (
+                <th
+                  key={c.key}
+                  onClick={() => toggle(c.key)}
+                  className="px-3 py-2 text-left cursor-pointer hover:text-gray-200 whitespace-nowrap select-none"
+                >
+                  {c.label}<SortIcon k={c.key} />
+                </th>
+              ))}
+              <th className="px-3 py-2 text-left">Explanation</th>
+            </tr>
+          </thead>
+          <tbody>
+            {pageItems.map((f, i) => (
+              <tr key={i} className={i % 2 === 0 ? 'bg-gray-900' : 'bg-gray-800/50'}>
+                <td className="px-3 py-2 font-mono text-yellow-300 whitespace-nowrap">{f.cwe_type || '-'}</td>
+                <td className="px-3 py-2 text-gray-300 max-w-xs">
+                  <span className="truncate block max-w-[200px]" title={f.filepath}>{f.filepath || '-'}</span>
+                </td>
+                <td className="px-3 py-2 text-gray-400 whitespace-nowrap">{f.line_number ?? '-'}</td>
+                <td className="px-3 py-2 whitespace-nowrap">
+                  <span className={parseFloat(f.confidence) >= 0.8 ? 'text-green-400' : parseFloat(f.confidence) >= 0.5 ? 'text-yellow-400' : 'text-red-400'}>
+                    {f.confidence != null ? `${(f.confidence * 100).toFixed(0)}%` : '-'}
+                  </span>
+                </td>
+                <td className="px-3 py-2 text-gray-400 max-w-[140px]">
+                  <span className="truncate block max-w-[140px]" title={f.model_used}>{f.model_used || '-'}</span>
+                </td>
+                <td className="px-3 py-2 whitespace-nowrap">
+                  <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${
+                    f.final_status === 'confirmed' ? 'bg-green-900/50 text-green-300' :
+                    f.final_status === 'skipped'   ? 'bg-yellow-900/50 text-yellow-300' :
+                    f.final_status === 'failed'    ? 'bg-red-900/50 text-red-300' :
+                                                     'bg-gray-700 text-gray-400'
+                  }`}>{f.final_status || 'pending'}</span>
+                </td>
+                <td className="px-3 py-2 text-gray-400 max-w-xs">
+                  <span className="line-clamp-2 block" title={f.llm_explanation}>
+                    {f.llm_explanation ? f.llm_explanation.slice(0, 120) + (f.llm_explanation.length > 120 ? '...' : '') : '-'}
+                  </span>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {totalPages > 1 && (
+        <div className="flex items-center justify-between px-5 py-3 border-t border-gray-700 text-xs text-gray-400">
+          <span>Page {page + 1} of {totalPages} ({findings.length} total)</span>
+          <div className="flex space-x-2">
+            <button
+              onClick={() => setPage(p => Math.max(0, p - 1))}
+              disabled={page === 0}
+              className="px-3 py-1 bg-gray-800 rounded disabled:opacity-40 hover:bg-gray-700"
+            >Prev</button>
+            <button
+              onClick={() => setPage(p => Math.min(totalPages - 1, p + 1))}
+              disabled={page === totalPages - 1}
+              className="px-3 py-1 bg-gray-800 rounded disabled:opacity-40 hover:bg-gray-700"
+            >Next</button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
 
 function ResultsDashboard({ result }) {
   const [showCostBreakdown, setShowCostBreakdown] = useState(false)
+  const [activeCard, setActiveCard] = useState(null)   // 'total' | 'confirmed' | 'pov' | 'fp' | 'failed'
+
+  const toggleCard = (key) => setActiveCard(prev => prev === key ? null : key)
   
   const metrics = useMemo(() => {
     if (!result) return null
@@ -13,8 +132,12 @@ function ResultsDashboard({ result }) {
     const fp = result.false_positives || 0
     const failed = result.failed || 0
 
-    const confirmedFindings = (result.findings || []).filter(f => f.final_status === 'confirmed')
-    const povTriggered = confirmedFindings.filter(f => f.pov_result?.vulnerability_triggered).length
+    const allFindings = result.findings || []
+    const confirmedFindings = allFindings.filter(f => f.final_status === 'confirmed')
+    const fpFindings        = allFindings.filter(f => f.final_status === 'skipped')
+    const failedFindings    = allFindings.filter(f => f.final_status === 'failed')
+    const povFindings       = confirmedFindings.filter(f => f.pov_result?.vulnerability_triggered)
+    const povTriggered      = povFindings.length
 
     return {
       total,
@@ -26,7 +149,13 @@ function ResultsDashboard({ result }) {
       povTriggered,
       povSuccessRate: confirmed > 0 ? (povTriggered / confirmed * 100).toFixed(1) : 0,
       cost: result.total_cost_usd || 0,
-      duration: result.duration_s || 0
+      duration: result.duration_s || 0,
+      // for detail panels
+      allFindings,
+      confirmedFindings,
+      fpFindings,
+      failedFindings,
+      povFindings,
     }
   }, [result])
 
@@ -84,32 +213,48 @@ function ResultsDashboard({ result }) {
 
   return (
     <div className="space-y-6">
-      {/* Summary Cards */}
+      {/* Summary Cards — all clickable */}
       <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
-        <div className="bg-gray-900 rounded-lg p-4 border border-gray-800">
+        {/* Total Findings */}
+        <button
+          onClick={() => toggleCard('total')}
+          className={`bg-gray-900 rounded-lg p-4 border text-left transition-all hover:border-gray-500 ${activeCard === 'total' ? 'border-gray-400 ring-1 ring-gray-400' : 'border-gray-800'}`}
+        >
           <div className="flex items-center space-x-2 text-gray-400 mb-2">
             <AlertCircle className="w-4 h-4" />
             <span className="text-sm">Total Findings</span>
+            <ChevronDown className={`w-3 h-3 ml-auto transition-transform ${activeCard === 'total' ? 'rotate-180' : ''}`} />
           </div>
           <p className="text-2xl font-bold">{metrics.total}</p>
-        </div>
+        </button>
 
-        <div className="bg-gray-900 rounded-lg p-4 border border-gray-800">
+        {/* Confirmed */}
+        <button
+          onClick={() => toggleCard('confirmed')}
+          className={`bg-gray-900 rounded-lg p-4 border text-left transition-all hover:border-green-600 ${activeCard === 'confirmed' ? 'border-green-500 ring-1 ring-green-500' : 'border-gray-800'}`}
+        >
           <div className="flex items-center space-x-2 text-green-400 mb-2">
             <CheckCircle className="w-4 h-4" />
             <span className="text-sm">Confirmed</span>
+            <ChevronDown className={`w-3 h-3 ml-auto transition-transform ${activeCard === 'confirmed' ? 'rotate-180' : ''}`} />
           </div>
           <p className="text-2xl font-bold text-green-400">{metrics.confirmed}</p>
-        </div>
+        </button>
 
-        <div className="bg-gray-900 rounded-lg p-4 border border-gray-800">
+        {/* PoV Proven */}
+        <button
+          onClick={() => toggleCard('pov')}
+          className={`bg-gray-900 rounded-lg p-4 border text-left transition-all hover:border-red-600 ${activeCard === 'pov' ? 'border-red-500 ring-1 ring-red-500' : 'border-gray-800'}`}
+        >
           <div className="flex items-center space-x-2 text-red-400 mb-2">
             <FlaskConical className="w-4 h-4" />
             <span className="text-sm">PoV Proven</span>
+            <ChevronDown className={`w-3 h-3 ml-auto transition-transform ${activeCard === 'pov' ? 'rotate-180' : ''}`} />
           </div>
           <p className="text-2xl font-bold text-red-300">{metrics.povTriggered}</p>
-        </div>
+        </button>
 
+        {/* Cost */}
         <div className="bg-gray-900 rounded-lg p-4 border border-gray-800">
           <div className="flex items-center space-x-2 text-gray-400 mb-2">
             <DollarSign className="w-4 h-4" />
@@ -118,6 +263,7 @@ function ResultsDashboard({ result }) {
           <p className="text-2xl font-bold">${metrics.cost.toFixed(4)}</p>
         </div>
 
+        {/* Duration */}
         <div className="bg-gray-900 rounded-lg p-4 border border-gray-800">
           <div className="flex items-center space-x-2 text-gray-400 mb-2">
             <Clock className="w-4 h-4" />
@@ -126,6 +272,32 @@ function ResultsDashboard({ result }) {
           <p className="text-2xl font-bold">{metrics.duration.toFixed(1)}s</p>
         </div>
       </div>
+
+      {/* Detail panel — renders below the cards row */}
+      {activeCard === 'total' && (
+        <StatDetailPanel
+          title="All Findings"
+          findings={metrics.allFindings}
+          color="text-gray-300"
+          onClose={() => setActiveCard(null)}
+        />
+      )}
+      {activeCard === 'confirmed' && (
+        <StatDetailPanel
+          title="Confirmed Vulnerabilities"
+          findings={metrics.confirmedFindings}
+          color="text-green-400"
+          onClose={() => setActiveCard(null)}
+        />
+      )}
+      {activeCard === 'pov' && (
+        <StatDetailPanel
+          title="PoV Proven"
+          findings={metrics.povFindings}
+          color="text-red-400"
+          onClose={() => setActiveCard(null)}
+        />
+      )}
 
       {/* Charts */}
       <div className="grid md:grid-cols-2 gap-6">

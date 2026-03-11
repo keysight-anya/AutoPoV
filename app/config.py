@@ -75,7 +75,7 @@ class Settings(BaseSettings):
     CHROMA_COLLECTION_NAME: str = "code_chunks"
     
     # Embeddings
-    EMBEDDING_MODEL_ONLINE: str = "text-embedding-3-small"
+    EMBEDDING_MODEL_ONLINE: str = "openai/text-embedding-3-small"  # Must be prefixed for OpenRouter
     EMBEDDING_MODEL_OFFLINE: str = "sentence-transformers/all-MiniLM-L6-v2"
     
     # LangSmith Tracing
@@ -85,10 +85,7 @@ class Settings(BaseSettings):
     
     # Code Analysis Tools
     CODEQL_CLI_PATH: str = Field(default="codeql", env="CODEQL_CLI_PATH")
-    CODEQL_SEARCH_PATH: str = Field(default="/usr/local/codeql/packs", env="CODEQL_SEARCH_PATH")
-    SEMGREP_ENABLED: bool = Field(default=True, env="SEMGREP_ENABLED")
-    SEMGREP_CONFIG: str = Field(default="p/owasp-top-ten", env="SEMGREP_CONFIG")
-    SEMGREP_LOCAL_CONFIG: str = Field(default="/app/semgrep-rules/owasp-min.yml", env="SEMGREP_LOCAL_CONFIG")
+    CODEQL_PACKS_BASE: str = Field(default="/usr/local/codeql/packs", env="CODEQL_PACKS_BASE")
     JOERN_CLI_PATH: str = Field(default="joern", env="JOERN_CLI_PATH")
     KAITAI_STRUCT_COMPILER_PATH: str = Field(default="kaitai-struct-compiler", env="KAITAI_STRUCT_COMPILER_PATH")
     
@@ -104,7 +101,6 @@ class Settings(BaseSettings):
     COST_TRACKING_ENABLED: bool = Field(default=True, env="COST_TRACKING_ENABLED")
     
     # Scanning Configuration
-    SCAN_MAX_WORKERS: int = Field(default=3, env="SCAN_MAX_WORKERS")
     MAX_CHUNK_SIZE: int = 4000
     CHUNK_OVERLAP: int = 200
     MAX_RETRIES: int = 2

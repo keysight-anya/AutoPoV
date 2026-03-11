@@ -9,8 +9,8 @@ import csv
 import uuid
 import threading
 import shutil
-from typing import Dict, Any, List, Optional, Callable
-from datetime import datetime
+from typing import Dict, Any, List, Optional, Callable, Tuple
+from datetime import datetime, timedelta
 from dataclasses import dataclass, asdict
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -127,7 +127,7 @@ class ScanManager:
         scan_info = self._active_scans[scan_id]
         scan_info["status"] = "running"
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             self._executor,
             self._run_replay_sync,
@@ -253,7 +253,7 @@ class ScanManager:
         scan_info["status"] = "running"
         
         # Run scan in thread pool
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             self._executor,
             self._run_scan_sync,
@@ -509,36 +509,147 @@ class ScanManager:
         # Cleanup vector store
         get_code_ingester().cleanup(scan_id)
     
+    def cleanup_old_results(self, max_age_days: int = 30, max_results: int = 500) -> Tuple[int, int]:
+        """
+        Clean up old scan result files to prevent unbounded disk growth.
+
+        Removes result JSON files that are either:
+          - Older than max_age_days days, OR
+          - Beyond the newest max_results entries (sorted by start_time desc)
+
+        Also rebuilds scan_history.csv from the surviving files.
+
+        Returns:
+            (files_removed, bytes_freed) tuple
+        """
+        json_files = []
+        for fname in os.listdir(self._runs_dir):
+            if not fname.endswith(".json") or fname == "scan_history.csv":
+                continue
+            fpath = os.path.join(self._runs_dir, fname)
+            try:
+                with open(fpath, "r") as f:
+                    data = json.load(f)
+                start_time_str = data.get("start_time", "")
+                start_dt = datetime.fromisoformat(start_time_str) if start_time_str else datetime.min
+            except Exception:
+                start_dt = datetime.min
+            json_files.append((start_dt, fpath))
+
+        # Sort newest-first
+        json_files.sort(key=lambda x: x[0], reverse=True)
+
+        cutoff = datetime.utcnow() - timedelta(days=max_age_days)
+        files_removed = 0
+        bytes_freed = 0
+
+        for idx, (start_dt, fpath) in enumerate(json_files):
+            should_remove = (start_dt < cutoff) or (idx >= max_results)
+            if should_remove:
+                try:
+                    size = os.path.getsize(fpath)
+                    os.remove(fpath)
+                    files_removed += 1
+                    bytes_freed += size
+                except Exception as e:
+                    print(f"[Cleanup] Could not remove {fpath}: {e}")
+
+        # Rebuild CSV from surviving JSON files
+        self._rebuild_scan_history_csv()
+
+        print(f"[Cleanup] Removed {files_removed} result files, freed {bytes_freed / 1024:.1f} KB")
+        return files_removed, bytes_freed
+
+    def _rebuild_scan_history_csv(self):
+        """Rebuild scan_history.csv from surviving JSON result files."""
+        csv_path = os.path.join(self._runs_dir, "scan_history.csv")
+        rows = []
+
+        for fname in os.listdir(self._runs_dir):
+            if not fname.endswith(".json") or fname == "scan_history.csv":
+                continue
+            fpath = os.path.join(self._runs_dir, fname)
+            try:
+                with open(fpath, "r") as f:
+                    data = json.load(f)
+                rows.append({
+                    "scan_id": data.get("scan_id", ""),
+                    "status": data.get("status", ""),
+                    "model_name": data.get("model_name", ""),
+                    "cwes": ",".join(data.get("cwes", [])),
+                    "total_findings": data.get("total_findings", 0),
+                    "confirmed_vulns": data.get("confirmed_vulns", 0),
+                    "false_positives": data.get("false_positives", 0),
+                    "failed": data.get("failed", 0),
+                    "total_cost_usd": data.get("total_cost_usd", 0),
+                    "duration_s": data.get("duration_s", 0),
+                    "start_time": data.get("start_time", ""),
+                    "end_time": data.get("end_time", ""),
+                })
+            except Exception:
+                continue
+
+        # Sort by start_time descending
+        rows.sort(key=lambda r: r.get("start_time", ""), reverse=True)
+
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                "scan_id", "status", "model_name", "cwes", "total_findings",
+                "confirmed_vulns", "false_positives", "failed", "total_cost_usd",
+                "duration_s", "start_time", "end_time"
+            ])
+            writer.writeheader()
+            writer.writerows(rows)
+
     def get_metrics(self) -> Dict[str, Any]:
         """Get overall metrics"""
         total_scans = 0
         completed_scans = 0
         failed_scans = 0
         total_confirmed = 0
+        total_false_positives = 0
+        total_findings = 0
         total_cost = 0.0
-        
+        total_duration = 0.0
+        duration_count = 0
+
         csv_path = os.path.join(self._runs_dir, "scan_history.csv")
-        
+
         if os.path.exists(csv_path):
             with open(csv_path, 'r') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
                     total_scans += 1
-                    
+
                     if row['status'] == 'completed':
                         completed_scans += 1
-                        total_confirmed += int(row.get('confirmed_vulns', 0))
-                        total_cost += float(row.get('total_cost_usd', 0))
+                        total_confirmed += int(row.get('confirmed_vulns', 0) or 0)
+                        total_false_positives += int(row.get('false_positives', 0) or 0)
+                        total_findings += int(row.get('total_findings', 0) or 0)
+                        total_cost += float(row.get('total_cost_usd', 0) or 0)
+                        dur = float(row.get('duration_s', 0) or 0)
+                        if dur > 0:
+                            total_duration += dur
+                            duration_count += 1
                     elif row['status'] == 'failed':
                         failed_scans += 1
-        
+
+        avg_duration = total_duration / duration_count if duration_count > 0 else 0.0
+        avg_cost = total_cost / completed_scans if completed_scans > 0 else 0.0
+
         return {
             "total_scans": total_scans,
             "completed_scans": completed_scans,
             "failed_scans": failed_scans,
+            "running_scans": len([s for s in self._active_scans.values() if s["status"] == "running"]),
             "active_scans": len([s for s in self._active_scans.values() if s["status"] == "running"]),
+            "total_findings": total_findings,
             "total_confirmed_vulnerabilities": total_confirmed,
-            "total_cost_usd": total_cost
+            "confirmed_vulns": total_confirmed,
+            "false_positives": total_false_positives,
+            "total_cost_usd": total_cost,
+            "avg_cost_usd": avg_cost,
+            "avg_duration_s": avg_duration,
         }
 
 
