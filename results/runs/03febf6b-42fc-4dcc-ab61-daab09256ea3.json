@@ -1,0 +1,28 @@
+{
+  "scan_id": "03febf6b-42fc-4dcc-ab61-daab09256ea3",
+  "status": "failed",
+  "codebase_path": "/tmp/autopov/03febf6b-42fc-4dcc-ab61-daab09256ea3/source",
+  "model_name": "openrouter/auto",
+  "cwes": [
+    "CWE-89",
+    "CWE-79",
+    "CWE-94",
+    "CWE-78",
+    "CWE-22",
+    "CWE-798",
+    "CWE-502",
+    "CWE-352",
+    "CWE-601",
+    "CWE-312"
+  ],
+  "total_findings": 0,
+  "confirmed_vulns": 0,
+  "false_positives": 0,
+  "failed": 0,
+  "total_cost_usd": 0.0,
+  "duration_s": 0.0,
+  "start_time": "2026-03-11T09:02:33.407205",
+  "end_time": "2026-03-11T09:03:29.412402",
+  "findings": [],
+  "logs": []
+}

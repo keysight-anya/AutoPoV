@@ -1,0 +1,99 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+<<<<<<< HEAD
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+=======
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+venv/
+env/
+ENV/
+.venv/
+
+# IDEs
+>>>>>>> 4b37390 (Initial commit of AutoPoV agentic pipeline for keysight-anya)
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+<<<<<<< HEAD
+# AutoPoV specific
+.qoder/
+test-db/
+*.log
+results/
+data/
+/tmp/
+=======
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# AutoPoV specific
+data/
+results/
+!data/.gitkeep
+!results/.gitkeep
+*.db
+*.sqlite3
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Logs
+*.log
+logs/
+>>>>>>> 4b37390 (Initial commit of AutoPoV agentic pipeline for keysight-anya)
+
+# OS
+.DS_Store
+Thumbs.db
+
+<<<<<<< HEAD
+# Keep structure
+!autopov/
+!autopov/**/
+=======
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env.local
+
+# Test coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# ChromaDB
+chroma/
+.chroma/
+>>>>>>> 4b37390 (Initial commit of AutoPoV agentic pipeline for keysight-anya)

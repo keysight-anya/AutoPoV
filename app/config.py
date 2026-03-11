@@ -6,8 +6,8 @@ Pydantic Settings for all environment variables and configuration
 import os
 import subprocess
 from typing import Optional, List
-from pydantic_settings import BaseSettings
-from pydantic import Field, validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator
 
 
 class Settings(BaseSettings):
@@ -37,6 +37,19 @@ class Settings(BaseSettings):
     # Model Selection
     MODEL_MODE: str = Field(default="online", env="MODEL_MODE")  # 'online' or 'offline'
     MODEL_NAME: str = Field(default="openai/gpt-4o", env="MODEL_NAME")
+
+    # Routing / Policy
+    ROUTING_MODE: str = Field(default="auto", env="ROUTING_MODE")  # auto|fixed|learning
+    AUTO_ROUTER_MODEL: str = Field(default="openrouter/auto", env="AUTO_ROUTER_MODEL")
+    LEARNING_DB_PATH: str = Field(default="./data/learning.db", env="LEARNING_DB_PATH")
+
+    # Scout Settings
+    SCOUT_ENABLED: bool = Field(default=True, env="SCOUT_ENABLED")
+    SCOUT_LLM_ENABLED: bool = Field(default=True, env="SCOUT_LLM_ENABLED")
+    SCOUT_MAX_FILES: int = Field(default=25, env="SCOUT_MAX_FILES")
+    SCOUT_MAX_CHARS_PER_FILE: int = Field(default=4000, env="SCOUT_MAX_CHARS_PER_FILE")
+    SCOUT_MAX_FINDINGS: int = Field(default=200, env="SCOUT_MAX_FINDINGS")
+    SCOUT_MAX_COST_USD: float = Field(default=0.10, env="SCOUT_MAX_COST_USD")
     
     # Available Models
     ONLINE_MODELS: List[str] = [
@@ -72,9 +85,12 @@ class Settings(BaseSettings):
     
     # Code Analysis Tools
     CODEQL_CLI_PATH: str = Field(default="codeql", env="CODEQL_CLI_PATH")
+    CODEQL_SEARCH_PATH: str = Field(default="/usr/local/codeql/packs", env="CODEQL_SEARCH_PATH")
+    SEMGREP_ENABLED: bool = Field(default=True, env="SEMGREP_ENABLED")
+    SEMGREP_CONFIG: str = Field(default="p/owasp-top-ten", env="SEMGREP_CONFIG")
+    SEMGREP_LOCAL_CONFIG: str = Field(default="/app/semgrep-rules/owasp-min.yml", env="SEMGREP_LOCAL_CONFIG")
     JOERN_CLI_PATH: str = Field(default="joern", env="JOERN_CLI_PATH")
     KAITAI_STRUCT_COMPILER_PATH: str = Field(default="kaitai-struct-compiler", env="KAITAI_STRUCT_COMPILER_PATH")
-    CODEQL_CLI_PATH: str = Field(default="codeql", env="CODEQL_CLI_PATH")
     
     # Docker Configuration
     DOCKER_ENABLED: bool = Field(default=True, env="DOCKER_ENABLED")
@@ -88,6 +104,7 @@ class Settings(BaseSettings):
     COST_TRACKING_ENABLED: bool = Field(default=True, env="COST_TRACKING_ENABLED")
     
     # Scanning Configuration
+    SCAN_MAX_WORKERS: int = Field(default=3, env="SCAN_MAX_WORKERS")
     MAX_CHUNK_SIZE: int = 4000
     CHUNK_OVERLAP: int = 200
     MAX_RETRIES: int = 2
@@ -126,16 +143,21 @@ class Settings(BaseSettings):
     POVS_DIR: str = "./results/povs"
     RUNS_DIR: str = "./results/runs"
     TEMP_DIR: str = "/tmp/autopov"
+    SNAPSHOT_DIR: str = Field(default="./results/snapshots", env="SNAPSHOT_DIR")
+    
+    # Snapshot Configuration
+    SAVE_CODEBASE_SNAPSHOT: bool = Field(default=False, env="SAVE_CODEBASE_SNAPSHOT")
     
     # Frontend
     FRONTEND_URL: str = Field(default="http://localhost:5173", env="FRONTEND_URL")
     
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        case_sensitive = True
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=True
+    )
     
-    @validator("MODEL_MODE")
+    @field_validator("MODEL_MODE")
     def validate_model_mode(cls, v):
         if v not in ["online", "offline"]:
             raise ValueError("MODEL_MODE must be 'online' or 'offline'")
@@ -220,7 +242,8 @@ class Settings(BaseSettings):
             self.POVS_DIR,
             self.RUNS_DIR,
             self.CHROMA_PERSIST_DIR,
-            self.TEMP_DIR
+            self.TEMP_DIR,
+            self.SNAPSHOT_DIR
         ]
         for d in dirs:
             os.makedirs(d, exist_ok=True)
@@ -231,3 +254,5 @@ settings = Settings()
 
 # Ensure directories on module load
 settings.ensure_directories()
+
+

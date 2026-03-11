@@ -60,7 +60,9 @@ TARGET CODE:
 ```
 
 TASK:
-Create a {pov_language} script that demonstrates this vulnerability by triggering it against the running application.
+Create a {pov_language} script that demonstrates this vulnerability by invoking the vulnerable code directly.
+The PoV will run in an isolated test harness where the target code has already been loaded and its functions
+are available in globals.
 
 REQUIREMENTS:
 1. Use only {pov_language} standard library (no external packages)
@@ -68,7 +70,9 @@ REQUIREMENTS:
 3. Include error handling
 4. Add comments explaining each step
 5. Make the PoV as deterministic as possible
-6. Connect to the target at {{target_url}} (this will be provided at runtime)
+6. Do NOT make network calls and do NOT reference target_url
+7. If you need the vulnerable snippet as text, use the variable `vulnerable_code` (provided by the harness)
+8. Prefer calling the vulnerable function(s) defined in the target code context
 
 For specific CWEs:
 - CWE-79 (XSS): Inject malicious JavaScript payloads
@@ -382,4 +386,38 @@ def format_summary_report_prompt(
         detection_rate=detection_rate,
         false_positive_rate=false_positive_rate,
         vulnerabilities_list=vulnerabilities_list
+    )
+
+# Scout Prompt - Used for autonomous candidate discovery
+SCOUT_PROMPT = """You are a security scout analyzing multiple files for potential vulnerabilities.
+
+FILES:
+{files}
+
+CWES:
+{cwes}
+
+TASK:
+Return a JSON object with an array named "findings". Each finding must include:
+- cwe: CWE-XXX
+- filepath: path of the file
+- line: line number (best estimate)
+- snippet: short code snippet
+- reason: short reasoning
+- confidence: 0.0 to 1.0
+
+Respond in JSON only.
+"""
+
+
+def format_scout_prompt(file_snippets, cwes):
+    formatted_files = []
+    for item in file_snippets:
+        formatted_files.append(
+            f"FILE: {item.get('filepath')}\nLANGUAGE: {item.get('language')}\nCODE:\n{item.get('code')}\n"
+        )
+
+    return SCOUT_PROMPT.format(
+        files="\n---\n".join(formatted_files),
+        cwes=", ".join(cwes)
     )

@@ -27,6 +27,8 @@ apiClient.interceptors.request.use((config) => {
 // API functions
 export const healthCheck = () => apiClient.get('/health')
 
+export const getConfig = () => apiClient.get('/config')
+
 export const scanGit = (data) => apiClient.post('/scan/git', data)
 
 export const scanZip = (formData) => apiClient.post('/scan/zip', formData, {
@@ -66,3 +68,8 @@ export const listApiKeys = (adminKey) =>
   })
 
 export default apiClient
+
+export const getLearningSummary = () => apiClient.get('/learning/summary')
+
+export const replayScan = (scanId, data) => apiClient.post(`/scan/${scanId}/replay`, data)
+

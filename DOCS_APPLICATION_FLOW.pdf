@@ -1,0 +1,249 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+2 0 obj
+<< /Length 1553 >>
+stream
+BT
+/F1 12 Tf
+72 720 Td
+14 TL
+(AUTOPOV APPLICATION FLOW \(END-TO-END\)) Tj
+T*
+T*
+T*
+(This document explains how AutoPoV works from start to finish, based on the current code) Tj
+T*
+(paths.) Tj
+T*
+T*
+(1. SCAN IS STARTED) Tj
+T*
+T*
+(A scan can be triggered in three ways:) Tj
+T*
+(- **Git repo** \(`/api/scan/git`\)) Tj
+T*
+(- **ZIP upload** \(`/api/scan/zip`\)) Tj
+T*
+(- **Paste code** \(`/api/scan/paste`\)) Tj
+T*
+T*
+(The backend creates a scan record with a new `scan_id` and initializes status + logs.) Tj
+T*
+T*
+(2. SOURCE PREPARATION) Tj
+T*
+T*
+(- **Git**: repository is cloned into a scan workspace.) Tj
+T*
+(- **ZIP**: archive is extracted into a scan workspace.) Tj
+T*
+(- **Paste**: code is saved to a file in a scan workspace.) Tj
+T*
+T*
+(The scan record is updated with `codebase_path`.) Tj
+T*
+T*
+(3. INGESTION) Tj
+T*
+T*
+(The codebase is chunked and indexed for analysis \(vector store\). Logs record file counts) Tj
+T*
+(and chunk counts.) Tj
+T*
+T*
+(4. DISCOVERY \(CANDIDATE FINDINGS\)) Tj
+T*
+T*
+(AutoPoV finds candidate issues by combining:) Tj
+T*
+(- **CodeQL** \(if available\)) Tj
+T*
+(- **Heuristic scout** \(rule-based patterns\)) Tj
+T*
+(- **LLM scout** \(optional LLM analysis\)) Tj
+T*
+T*
+(Candidates are merged and deduplicated.) Tj
+T*
+T*
+(5. INVESTIGATION \(LLM VALIDATION\)) Tj
+T*
+T*
+(Each candidate is analyzed by a routed model:) Tj
+T*
+(- Verdict: `REAL` or `FALSE_POSITIVE`) Tj
+T*
+(- Confidence score) Tj
+T*
+(- Explanation + vulnerable snippet) Tj
+T*
+(- Cost + model used) Tj
+T*
+T*
+(Only `REAL` findings continue to PoV generation.) Tj
+T*
+ET
+endstream
+endobj
+3 0 obj
+<< /Length 1564 >>
+stream
+BT
+/F1 12 Tf
+72 720 Td
+14 TL
+T*
+(6. POV GENERATION) Tj
+T*
+T*
+(A PoV script is generated for confirmed findings:) Tj
+T*
+(- Uses the routed model \(OpenRouter auto by default\)) Tj
+T*
+(- Script must print **`VULNERABILITY TRIGGERED`** when successful) Tj
+T*
+(- Script is designed to execute directly against the vulnerable code context) Tj
+T*
+T*
+(7. POV VALIDATION) Tj
+T*
+T*
+(AutoPoV validates PoVs using a hybrid flow:) Tj
+T*
+(- **Static validation** \(fast\)) Tj
+T*
+(- **Unit-test execution** \(isolated harness\)) Tj
+T*
+(- **LLM validation** \(fallback\)) Tj
+T*
+T*
+(If PoV does not conclusively validate, it proceeds to Docker execution.) Tj
+T*
+T*
+(8. POV EXECUTION \(PROOF STEP\)) Tj
+T*
+T*
+(PoVs are run in an isolated Docker container:) Tj
+T*
+(- If output contains **`VULNERABILITY TRIGGERED`**, the vulnerability is proven.) Tj
+T*
+(- Results \(stdout/stderr, exit code\) are stored.) Tj
+T*
+T*
+(9. RESULTS + REPORTS SAVED) Tj
+T*
+T*
+(Results are saved to:) Tj
+T*
+(- `results/runs/<scan_id>.json`) Tj
+T*
+(- `results/<scan_id>_report.json`) Tj
+T*
+(- `results/<scan_id>_report.pdf`) Tj
+T*
+T*
+(PoV scripts are saved to:) Tj
+T*
+(- `results/povs/` \(only for confirmed findings\)) Tj
+T*
+T*
+(10. UI RESULTS) Tj
+T*
+T*
+(The UI displays:) Tj
+T*
+(- Summary metrics \(total, confirmed, cost, PoV success\)) Tj
+T*
+(- Per-finding details \(explanation, vulnerable code, PoV status\)) Tj
+T*
+(- Validation method and PoV execution output) Tj
+T*
+(- Reports \(JSON + PDF\)) Tj
+T*
+T*
+(---) Tj
+T*
+T*
+(KEY API ENDPOINTS) Tj
+T*
+T*
+(- Start scan \(Git\): `POST /api/scan/git`) Tj
+T*
+ET
+endstream
+endobj
+4 0 obj
+<< /Length 759 >>
+stream
+BT
+/F1 12 Tf
+72 720 Td
+14 TL
+(- Start scan \(ZIP\): `POST /api/scan/zip`) Tj
+T*
+(- Start scan \(Paste\): `POST /api/scan/paste`) Tj
+T*
+(- Scan status: `GET /api/scan/{scan_id}`) Tj
+T*
+(- Live logs \(SSE\): `GET /api/scan/{scan_id}/stream`) Tj
+T*
+(- Reports: `GET /api/report/{scan_id}?format=pdf|json`) Tj
+T*
+(- System config: `GET /api/config`) Tj
+T*
+T*
+(---) Tj
+T*
+T*
+(NOTES ON MODEL ROUTING) Tj
+T*
+T*
+(Model selection is automatic by policy:) Tj
+T*
+(- `ROUTING_MODE=auto` uses `AUTO_ROUTER_MODEL` \(OpenRouter auto\)) Tj
+T*
+(- `ROUTING_MODE=fixed` uses `MODEL_NAME`) Tj
+T*
+(- `ROUTING_MODE=learning` uses the learning store if available, otherwise auto) Tj
+T*
+T*
+(The UI no longer asks for a model because the system already chooses the best one.) Tj
+T*
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 5 0 R /Resources << /Font << /F1 1 0 R >> >> /MediaBox [0 0 612 792] /Contents 2 0 R >>
+endobj
+6 0 obj
+<< /Type /Page /Parent 5 0 R /Resources << /Font << /F1 1 0 R >> >> /MediaBox [0 0 612 792] /Contents 3 0 R >>
+endobj
+7 0 obj
+<< /Type /Page /Parent 5 0 R /Resources << /Font << /F1 1 0 R >> >> /MediaBox [0 0 612 792] /Contents 4 0 R >>
+endobj
+8 0 obj
+<< /Type /Pages /Kids [5 0 R 6 0 R 7 0 R] /Count 3 >>
+endobj
+9 0 obj
+<< /Type /Catalog /Pages 5 0 R >>
+endobj
+xref
+0 10
+0000000000 65535 f 
+0000000009 00000 n 
+0000000079 00000 n 
+0000001684 00000 n 
+0000003300 00000 n 
+0000004110 00000 n 
+0000004236 00000 n 
+0000004362 00000 n 
+0000004488 00000 n 
+0000004557 00000 n 
+trailer
+<< /Size 10 /Root 9 0 R >>
+startxref
+4606
+%%EOF

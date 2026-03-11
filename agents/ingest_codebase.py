@@ -5,7 +5,7 @@ Handles code chunking, embedding, and ChromaDB storage for RAG
 
 import os
 import hashlib
-from typing import List, Dict, Optional, Iterator
+from typing import List, Dict, Optional, Iterator, Callable
 from pathlib import Path
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -202,7 +202,7 @@ class CodeIngester:
         self,
         directory: str,
         scan_id: str,
-        progress_callback: Optional[callable] = None
+        progress_callback: Optional[Callable] = None
     ) -> Dict[str, any]:
         """
         Ingest all code files from a directory

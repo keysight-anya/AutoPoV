@@ -1,6 +1,7 @@
 import { FileText, Code, Terminal, Shield } from 'lucide-react'
 
 function Docs() {
+  const apiBase = (import.meta.env.VITE_API_URL || 'http://localhost:8000/api').replace(/\/$/, '')
   return (
     <div className="max-w-4xl mx-auto">
       {/* Header */}
@@ -180,7 +181,7 @@ function Docs() {
           <h2 className="text-lg font-medium mb-4">Links</h2>
           <div className="flex space-x-4">
             <a
-              href="/api/docs"
+              href={`${apiBase}/docs`}
               target="_blank"
               rel="noopener noreferrer"
               className="text-primary-500 hover:text-primary-400"
@@ -188,7 +189,7 @@ function Docs() {
               Swagger UI →
             </a>
             <a
-              href="/api/openapi.json"
+              href={`${apiBase}/openapi.json`}
               target="_blank"
               rel="noopener noreferrer"
               className="text-primary-500 hover:text-primary-400"

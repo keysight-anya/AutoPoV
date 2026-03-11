@@ -11,7 +11,7 @@ from datetime import datetime
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, UploadFile, File, Form, Header, Request
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.security import HTTPBearer
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -22,7 +22,9 @@ from app.git_handler import get_git_handler
 from app.source_handler import get_source_handler
 from app.webhook_handler import get_webhook_handler
 from app.scan_manager import get_scan_manager, ScanResult
+from app.agent_graph import get_agent_graph
 from app.report_generator import get_report_generator
+from app.learning_store import get_learning_store
 
 
 # Pydantic models for API
@@ -40,6 +42,13 @@ class ScanPasteRequest(BaseModel):
     filename: Optional[str] = None
     model: str = Field(default="openai/gpt-4o")
     cwes: List[str] = Field(default=["CWE-89", "CWE-119", "CWE-190", "CWE-416"])
+
+
+
+class ReplayRequest(BaseModel):
+    models: List[str]
+    include_failed: bool = False
+    max_findings: int = 50
 
 
 class ScanResponse(BaseModel):
@@ -132,7 +141,7 @@ async def trigger_scan_from_webhook(
     """Trigger scan from webhook callback"""
     scan_id = get_scan_manager().create_scan(
         codebase_path="",  # Will be set after clone
-        model_name=settings.MODEL_NAME,
+        model_name=settings.MODEL_NAME if settings.ROUTING_MODE == "fixed" else settings.AUTO_ROUTER_MODEL,
         cwes=settings.SUPPORTED_CWES,
         triggered_by=triggered_by
     )
@@ -183,7 +192,11 @@ async def get_config(api_key: str = Depends(verify_api_key)):
         "supported_cwes": settings.SUPPORTED_CWES,
         "app_version": settings.APP_VERSION,
         "codeql_available": settings.is_codeql_available(),
-        "docker_available": settings.is_docker_available()
+        "docker_available": settings.is_docker_available(),
+        "routing_mode": settings.ROUTING_MODE,
+        "auto_router_model": settings.AUTO_ROUTER_MODEL,
+        "model_mode": settings.MODEL_MODE,
+        "model_name": settings.MODEL_NAME
     }
 
 
@@ -197,7 +210,7 @@ async def scan_git(
     """Scan a Git repository"""
     scan_id = get_scan_manager().create_scan(
         codebase_path="",  # Will be set after clone
-        model_name=request.model,
+        model_name=settings.MODEL_NAME if settings.ROUTING_MODE == "fixed" else settings.AUTO_ROUTER_MODEL,
         cwes=request.cwes
     )
     
@@ -246,11 +259,14 @@ async def scan_git(
             # Run scan synchronously in background using asyncio.run in a new event loop
             # Create a new event loop for this thread
             loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
             try:
+                asyncio.set_event_loop(loop)
                 loop.run_until_complete(scan_manager.run_scan_async(scan_id))
             finally:
-                loop.close()
+                try:
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                finally:
+                    loop.close()
             
         except Exception as e:
             error_msg = f"{str(e)}\n{traceback.format_exc()}"
@@ -282,7 +298,7 @@ async def scan_zip(
     
     scan_id = get_scan_manager().create_scan(
         codebase_path="",
-        model_name=model,
+        model_name=settings.MODEL_NAME if settings.ROUTING_MODE == "fixed" else settings.AUTO_ROUTER_MODEL,
         cwes=cwe_list
     )
     
@@ -330,7 +346,7 @@ async def scan_paste(
     """Scan pasted code"""
     scan_id = get_scan_manager().create_scan(
         codebase_path="",
-        model_name=request.model,
+        model_name=settings.MODEL_NAME if settings.ROUTING_MODE == "fixed" else settings.AUTO_ROUTER_MODEL,
         cwes=request.cwes
     )
     
@@ -365,6 +381,95 @@ async def scan_paste(
         message="Code paste scan initiated"
     )
 
+
+
+@app.post("/api/scan/{scan_id}/replay")
+async def replay_scan(
+    scan_id: str,
+    request: ReplayRequest,
+    background_tasks: BackgroundTasks,
+    api_key: str = Depends(verify_api_key)
+):
+    result = get_scan_manager().get_scan_result(scan_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Scan result not found")
+
+    if not request.models:
+        raise HTTPException(status_code=400, detail="No models provided")
+
+    findings = result.findings or []
+    if not request.include_failed:
+        findings = [f for f in findings if f.get("final_status") == "confirmed"]
+
+    findings = findings[: request.max_findings]
+    if not findings:
+        raise HTTPException(status_code=400, detail="No findings available for replay")
+
+    codebase_path = result.codebase_path
+    if not codebase_path or not os.path.exists(codebase_path):
+        snapshot_path = os.path.join(settings.SNAPSHOT_DIR, scan_id)
+        if os.path.exists(snapshot_path):
+            codebase_path = snapshot_path
+        else:
+            raise HTTPException(status_code=400, detail="Codebase path is not available for replay")
+
+    replay_findings = []
+    for f in findings:
+        replay_findings.append({
+            "cwe_type": f.get("cwe_type", ""),
+            "filepath": f.get("filepath", ""),
+            "line_number": f.get("line_number", 0),
+            "code_chunk": f.get("code_chunk", ""),
+            "llm_verdict": "",
+            "llm_explanation": "",
+            "confidence": f.get("confidence", 0.5),
+            "pov_script": None,
+            "pov_path": None,
+            "pov_result": None,
+            "retry_count": 0,
+            "inference_time_s": 0.0,
+            "cost_usd": 0.0,
+            "final_status": "pending",
+            "alert_message": "replay",
+            "source": "replay",
+            "language": f.get("language", "unknown")
+        })
+
+    detected_language = get_agent_graph()._detect_language(codebase_path)
+
+    replay_ids = []
+    for model in request.models:
+        replay_id = get_scan_manager().create_scan(
+            codebase_path=codebase_path,
+            model_name=settings.MODEL_NAME if settings.ROUTING_MODE == "fixed" else settings.AUTO_ROUTER_MODEL,
+            cwes=result.cwes
+        )
+        scan_info = get_scan_manager().get_scan(replay_id)
+        if scan_info:
+            scan_info["triggered_by"] = "replay"
+            scan_info["replay_of"] = scan_id
+
+        def run_replay(replay_id=replay_id):
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(
+                    get_scan_manager().run_scan_with_findings_async(
+                        replay_id,
+                        replay_findings,
+                        detected_language=detected_language
+                    )
+                )
+            finally:
+                try:
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                finally:
+                    loop.close()
+
+        background_tasks.add_task(run_replay)
+        replay_ids.append(replay_id)
+
+    return {"status": "replay_started", "replay_ids": replay_ids}
 
 # Scan status and results
 @app.get("/api/scan/{scan_id}", response_model=ScanStatusResponse)
@@ -467,24 +572,39 @@ async def get_report(
     if not result:
         raise HTTPException(status_code=404, detail="Scan result not found")
     
-    if format == "json":
-        report_path = get_report_generator().generate_json_report(result)
-        return FileResponse(
-            report_path,
-            media_type="application/json",
-            filename=f"{scan_id}_report.json"
-        )
-    
-    elif format == "pdf":
-        report_path = get_report_generator().generate_pdf_report(result)
-        return FileResponse(
-            report_path,
-            media_type="application/pdf",
-            filename=f"{scan_id}_report.pdf"
-        )
-    
-    else:
-        raise HTTPException(status_code=400, detail="Invalid format. Use 'json' or 'pdf'")
+    try:
+        if format == "json":
+            report_path = get_report_generator().generate_json_report(result)
+            return FileResponse(
+                report_path,
+                media_type="application/json",
+                filename=f"{scan_id}_report.json",
+                headers={
+                    "Access-Control-Expose-Headers": "Content-Disposition, Content-Type",
+                    "Content-Disposition": f"attachment; filename={scan_id}_report.json",
+                    "Content-Type": "application/json"
+                }
+            )
+        
+        elif format == "pdf":
+            report_path = get_report_generator().generate_pdf_report(result)
+            return FileResponse(
+                report_path,
+                media_type="application/pdf",
+                filename=f"{scan_id}_report.pdf",
+                headers={
+                    "Access-Control-Expose-Headers": "Content-Disposition, Content-Type",
+                    "Content-Disposition": f"attachment; filename={scan_id}_report.pdf",
+                    "Content-Type": "application/pdf"
+                }
+            )
+        
+        else:
+            raise HTTPException(status_code=400, detail="Invalid format. Use 'json' or 'pdf'")
+    except Exception as e:
+        import traceback
+        print(f"[Report Error] {str(e)}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Report generation failed: {str(e)}")
 
 
 # Webhook endpoints
@@ -566,6 +686,15 @@ async def revoke_api_key(
         raise HTTPException(status_code=404, detail="Key not found")
     return {"message": "API key revoked"}
 
+
+
+@app.get("/api/learning/summary")
+async def learning_summary(api_key: str = Depends(verify_api_key)):
+    store = get_learning_store()
+    return {
+        "summary": store.get_summary(),
+        "models": store.get_model_stats()
+    }
 
 # Metrics endpoint
 @app.get("/api/metrics")

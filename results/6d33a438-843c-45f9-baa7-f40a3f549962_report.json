@@ -1,0 +1,192 @@
+{
+  "report_metadata": {
+    "generated_at": "2026-03-11T14:56:16.456874",
+    "tool": "AutoPoV",
+    "version": "1.0.0",
+    "report_type": "comprehensive_security_assessment"
+  },
+  "scan_summary": {
+    "scan_id": "6d33a438-843c-45f9-baa7-f40a3f549962",
+    "status": "completed",
+    "codebase": "/tmp/autopov/6d33a438-843c-45f9-baa7-f40a3f549962",
+    "scan_started": null,
+    "scan_completed": null,
+    "duration_seconds": 273.036381,
+    "configuration": {
+      "model_mode": "online",
+      "routing_mode": "auto",
+      "auto_router_model": "openrouter/auto",
+      "cwes_checked": [
+        "CWE-89",
+        "CWE-79",
+        "CWE-94",
+        "CWE-78",
+        "CWE-22",
+        "CWE-798",
+        "CWE-502",
+        "CWE-352",
+        "CWE-601",
+        "CWE-312"
+      ],
+      "scout_enabled": true,
+      "codeql_enabled": true
+    }
+  },
+  "model_usage": {
+    "models_used": [
+      {
+        "model": "openrouter/auto",
+        "roles": [
+          "investigation",
+          "pov_generation"
+        ],
+        "findings_count": 3,
+        "total_cost_usd": 0.021063
+      }
+    ],
+    "openrouter_activity": [],
+    "total_cost_usd": 0.050003
+  },
+  "metrics": {
+    "total_findings": 2,
+    "confirmed_vulnerabilities": 1,
+    "false_positives": 1,
+    "failed_analyses": 0,
+    "detection_rate_percent": 50.0,
+    "false_positive_rate_percent": 50.0,
+    "pov_success_rate_percent": 100.0,
+    "pov_summary": {
+      "generated": 1,
+      "validated": 1,
+      "triggered": 1,
+      "failed": 0
+    },
+    "cost_per_confirmed_usd": 0.050003
+  },
+  "findings": [
+    {
+      "cwe_type": "CWE-89",
+      "filepath": "cli/autopov.py",
+      "line_number": 126,
+      "verdict": "FALSE_POSITIVE",
+      "confidence": 1.0,
+      "explanation": "The reported line is a simple console print statement used to display an error message for invalid user input during a CLI prompt. There is no database interaction, SQL query construction, or execution anywhere in this function or the surrounding code. Therefore, a SQL Injection (CWE-89) vulnerability is impossible here.",
+      "vulnerable_code": "console.print(\"[red]Invalid choice. Please enter 1, 2, 3, or 4.[/red]\")",
+      "final_status": "skipped",
+      "has_pov": false,
+      "pov_success": false,
+      "pov_model_used": null,
+      "model_used": "openrouter/auto",
+      "token_usage": {
+        "prompt_tokens": 1873,
+        "completion_tokens": 871,
+        "total_tokens": 2744
+      },
+      "pov_validation": {},
+      "pov_result": null,
+      "inference_time_s": 10.204022,
+      "cost_usd": 0.013393
+    },
+    {
+      "cwe_type": "CWE-89",
+      "filepath": "codebase/example.py",
+      "line_number": 18,
+      "verdict": "REAL",
+      "confidence": 1.0,
+      "explanation": "The function `get_user_unsafe` constructs a SQL query by directly concatenating the `username` parameter into the query string without any sanitization or validation. This allows an attacker to manipulate the structure of the SQL query by injecting malicious SQL syntax (e.g., `' OR '1'='1`), leading to a classic SQL Injection vulnerability.",
+      "vulnerable_code": "query = \"SELECT * FROM users WHERE username = '\" + username + \"'\"\ncursor.execute(query)",
+      "final_status": "confirmed",
+      "has_pov": true,
+      "pov_success": true,
+      "pov_model_used": "openrouter/auto",
+      "model_used": "openrouter/auto",
+      "token_usage": {
+        "prompt_tokens": 852,
+        "completion_tokens": 554,
+        "total_tokens": 1406
+      },
+      "pov_validation": {
+        "is_valid": true,
+        "issues": [],
+        "suggestions": [
+          "Static validation passed with 100% confidence"
+        ],
+        "will_trigger": "LIKELY",
+        "validation_method": "static_analysis",
+        "static_result": {
+          "is_valid": true,
+          "confidence": 1.0,
+          "matched_patterns": [
+            "has_vulnerability_indicator",
+            "imports: sqlite3",
+            "pattern: ['\\\"].*OR.*=.*['\\\"]...",
+            "indicators: sql, query, injection, payload, bypass",
+            "addresses_vulnerable_code"
+          ],
+          "issues": []
+        },
+        "unit_test_result": null
+      },
+      "pov_result": {
+        "success": true,
+        "vulnerability_triggered": true,
+        "validation_method": "static_analysis",
+        "confidence": 1.0,
+        "note": "Vulnerability confirmed via static analysis"
+      },
+      "inference_time_s": 7.631485,
+      "cost_usd": 0.00767
+    }
+  ],
+  "methodology": {
+    "routing_mode": "auto",
+    "model_mode": "online",
+    "scout_enabled": true,
+    "codeql_enabled": true,
+    "cwes_checked": [
+      "CWE-89",
+      "CWE-79",
+      "CWE-94",
+      "CWE-78",
+      "CWE-22",
+      "CWE-798",
+      "CWE-502",
+      "CWE-352",
+      "CWE-601",
+      "CWE-312"
+    ],
+    "duration_seconds": 273.036381,
+    "process_steps": [
+      {
+        "name": "Code Ingestion",
+        "description": "Source code was parsed, chunked, and embedded into a vector store for semantic analysis. Used text-embedding-3-small for embeddings."
+      },
+      {
+        "name": "Static Analysis",
+        "description": "CodeQL queries identified potential vulnerability patterns. CodeQL was available and used."
+      },
+      {
+        "name": "Autonomous Discovery",
+        "description": "Heuristic and LLM scouts analyzed code for vulnerability candidates. Scout was enabled."
+      },
+      {
+        "name": "LLM Investigation",
+        "description": "Each alert was analyzed using auto routing via openrouter/auto for validation and classification."
+      },
+      {
+        "name": "PoV Generation",
+        "description": "Proof-of-Vulnerability scripts were generated to confirm exploitable vulnerabilities."
+      },
+      {
+        "name": "PoV Validation",
+        "description": "Generated PoVs were validated using static analysis, unit tests, and Docker fallback execution."
+      }
+    ],
+    "metrics_definitions": {
+      "Detection Rate": "Percentage of findings that were confirmed as actual vulnerabilities",
+      "False Positive Rate": "Percentage of initial alerts that were determined to be non-vulnerabilities",
+      "PoV Success Rate": "Percentage of confirmed vulnerabilities with working Proof-of-Vulnerability scripts",
+      "Cost per Confirmed": "Average cost in USD to identify and verify each confirmed vulnerability"
+    }
+  }
+}

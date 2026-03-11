@@ -1,6 +1,5 @@
 import { useState } from 'react'
 import { GitBranch, FileArchive, Code, Upload } from 'lucide-react'
-import ModelSelector from './ModelSelector'
 
 function ScanForm({ onSubmit, isLoading }) {
   const [activeTab, setActiveTab] = useState('git')
@@ -10,8 +9,8 @@ function ScanForm({ onSubmit, isLoading }) {
     code: '',
     language: 'python',
     filename: '',
-    model: 'openai/gpt-4o',
-    cwes: ['CWE-89', 'CWE-79', 'CWE-94', 'CWE-78', 'CWE-22', 'CWE-798', 'CWE-502', 'CWE-352', 'CWE-601', 'CWE-312']
+    cwes: ['CWE-89', 'CWE-79', 'CWE-94', 'CWE-78', 'CWE-22', 'CWE-798', 'CWE-502', 'CWE-352', 'CWE-601', 'CWE-312'],
+    lite: false
   })
   const [selectedFile, setSelectedFile] = useState(null)
 
@@ -81,6 +80,20 @@ function ScanForm({ onSubmit, isLoading }) {
 
       {/* Form */}
       <form onSubmit={handleSubmit} className="p-6 space-y-6">
+        <div className="bg-gray-950 border border-gray-800 rounded-lg p-3 text-sm text-gray-400">
+          Model selection is automatic (OpenRouter auto). You don't need to pick a model.
+        </div>
+
+        <label className="flex items-center gap-2 text-sm text-gray-300">
+          <input
+            type="checkbox"
+            checked={formData.lite}
+            onChange={(e) => setFormData({ ...formData, lite: e.target.checked })}
+            className="accent-primary-500"
+          />
+          Lite scan (static only, faster)
+        </label>
+
         {/* Git Repository Tab */}
         {activeTab === 'git' && (
           <div className="space-y-4">
@@ -188,12 +201,6 @@ function ScanForm({ onSubmit, isLoading }) {
             </div>
           </div>
         )}
-
-        {/* Model Selection */}
-        <ModelSelector
-          value={formData.model}
-          onChange={(model) => setFormData({ ...formData, model })}
-        />
 
         {/* CWE Selection */}
         <div>

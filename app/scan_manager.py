@@ -8,6 +8,7 @@ import json
 import csv
 import uuid
 import threading
+import shutil
 from typing import Dict, Any, List, Optional, Callable
 from datetime import datetime
 from dataclasses import dataclass, asdict
@@ -75,7 +76,8 @@ class ScanManager:
         codebase_path: str,
         model_name: str,
         cwes: List[str],
-        triggered_by: Optional[str] = None
+        triggered_by: Optional[str] = None,
+        lite: bool = False
     ) -> str:
         """
         Create a new scan
@@ -85,6 +87,7 @@ class ScanManager:
             model_name: Model to use
             cwes: CWEs to check
             triggered_by: Who/what triggered the scan
+            lite: Whether to run in lite mode (static analysis only)
         
         Returns:
             Scan ID
@@ -98,6 +101,7 @@ class ScanManager:
             "model_name": model_name,
             "cwes": cwes,
             "triggered_by": triggered_by,
+            "lite": lite,
             "created_at": datetime.utcnow().isoformat(),
             "logs": [],
             "progress": 0,
@@ -109,6 +113,124 @@ class ScanManager:
         
         return scan_id
     
+
+    async def run_scan_with_findings_async(
+        self,
+        scan_id: str,
+        findings: List[Dict[str, Any]],
+        detected_language: Optional[str] = None
+    ) -> ScanResult:
+        """Run a replay scan using preloaded findings."""
+        if scan_id not in self._active_scans:
+            raise ValueError(f"Scan {scan_id} not found")
+
+        scan_info = self._active_scans[scan_id]
+        scan_info["status"] = "running"
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            self._executor,
+            self._run_replay_sync,
+            scan_id,
+            findings,
+            detected_language
+        )
+
+        return result
+
+    def _run_replay_sync(
+        self,
+        scan_id: str,
+        findings: List[Dict[str, Any]],
+        detected_language: Optional[str] = None
+    ) -> ScanResult:
+        scan_info = self._active_scans[scan_id]
+
+        try:
+            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Starting replay scan...")
+            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Model: {scan_info['model_name']}")
+            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Replay findings: {len(findings)}")
+
+            agent = get_agent_graph()
+            final_state = agent.run_scan(
+                codebase_path=scan_info["codebase_path"],
+                model_name=scan_info["model_name"],
+                cwes=scan_info["cwes"],
+                scan_id=scan_id,
+                preloaded_findings=findings,
+                detected_language=detected_language
+            )
+
+            if final_state.get("logs"):
+                existing_logs = set(scan_info["logs"])
+                for log in final_state["logs"]:
+                    if log not in existing_logs:
+                        scan_info["logs"].append(log)
+
+            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Replay completed with status: {final_state['status']}")
+
+            confirmed = sum(1 for f in final_state["findings"] if f["final_status"] == "confirmed")
+            skipped = sum(1 for f in final_state["findings"] if f["final_status"] == "skipped")
+            failed = sum(1 for f in final_state["findings"] if f["final_status"] == "failed")
+
+            start = datetime.fromisoformat(final_state["start_time"])
+            end = datetime.fromisoformat(final_state["end_time"]) if final_state["end_time"] else datetime.utcnow()
+            duration = (end - start).total_seconds()
+
+            result = ScanResult(
+                scan_id=scan_id,
+                status=final_state["status"],
+                codebase_path=scan_info["codebase_path"],
+                model_name=scan_info["model_name"],
+                cwes=scan_info["cwes"],
+                total_findings=len(final_state["findings"]),
+                confirmed_vulns=confirmed,
+                false_positives=skipped,
+                failed=failed,
+                total_cost_usd=final_state["total_cost_usd"],
+                duration_s=duration,
+                start_time=final_state["start_time"],
+                end_time=final_state["end_time"],
+                findings=[dict(f) for f in final_state["findings"]],
+                logs=scan_info.get("logs", [])
+            )
+
+            self._save_result(result)
+            scan_info["status"] = "completed"
+            scan_info["result"] = result
+
+            get_code_ingester().cleanup(scan_id)
+
+            return result
+
+        except Exception as e:
+            import traceback
+            error_msg = f"{str(e)}\n{traceback.format_exc()}"
+            scan_info["status"] = "failed"
+            scan_info["error"] = error_msg
+            scan_info["logs"].append(f"ERROR: {str(e)}")
+            print(f"Replay {scan_id} failed: {error_msg}")
+
+            result = ScanResult(
+                scan_id=scan_id,
+                status="failed",
+                codebase_path=scan_info["codebase_path"],
+                model_name=scan_info["model_name"],
+                cwes=scan_info["cwes"],
+                total_findings=0,
+                confirmed_vulns=0,
+                false_positives=0,
+                failed=0,
+                total_cost_usd=0.0,
+                duration_s=0.0,
+                start_time=scan_info["created_at"],
+                end_time=datetime.utcnow().isoformat(),
+                findings=[]
+            )
+
+            self._save_result(result)
+            return result
+
     async def run_scan_async(
         self,
         scan_id: str,
@@ -277,6 +399,22 @@ class ScanManager:
                 result.start_time,
                 result.end_time
             ])
+        
+        # Optional snapshot for replay support
+        if settings.SAVE_CODEBASE_SNAPSHOT and result.codebase_path and os.path.exists(result.codebase_path):
+            snapshot_path = os.path.join(settings.SNAPSHOT_DIR, result.scan_id)
+            if not os.path.exists(snapshot_path):
+                try:
+                    shutil.copytree(
+                        result.codebase_path,
+                        snapshot_path,
+                        ignore=shutil.ignore_patterns(
+                            '.git', 'node_modules', 'venv', '.venv', '__pycache__',
+                            '.pytest_cache', 'results', 'data', 'dist', 'build'
+                        )
+                    )
+                except Exception as e:
+                    print(f"[Snapshot] Failed to copy codebase: {e}")
     
     def get_scan(self, scan_id: str) -> Optional[Dict[str, Any]]:
         """Get scan information"""
@@ -350,7 +488,7 @@ class ScanManager:
         # Try to load from result
         result = self.get_scan_result(scan_id)
         if result:
-            return result.findings.get("logs", [])
+            return result.logs if result.logs else []
         
         return []
     

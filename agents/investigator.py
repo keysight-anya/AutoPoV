@@ -6,7 +6,7 @@ Uses RAG and LLM to investigate potential vulnerabilities
 import json
 import subprocess
 import os
-from typing import Dict, Optional, Any, List
+from typing import Dict, Optional, Any, List, Callable
 from datetime import datetime
 
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -334,9 +334,7 @@ class VulnerabilityInvestigator:
             actual_cost = 0.0
             token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
             
-            # Debug: Print response structure to understand what we get
-            # print(f"[DEBUG] Response type: {type(response)}")
-            # print(f"[DEBUG] Response attrs: {dir(response)}")
+
             
             # Try multiple ways to extract token usage from LangChain/OpenRouter response
             try:
@@ -477,7 +475,7 @@ class VulnerabilityInvestigator:
         scan_id: str,
         codebase_path: str,
         alerts: List[Dict[str, Any]],
-        progress_callback: Optional[callable] = None
+        progress_callback: Optional[Callable] = None
     ) -> List[Dict[str, Any]]:
         """
         Investigate multiple alerts

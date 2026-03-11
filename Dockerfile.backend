@@ -35,15 +35,10 @@ RUN wget -q https://github.com/github/codeql-cli-binaries/releases/download/v2.2
 # Set CodeQL environment variable
 ENV CODEQL_CLI_PATH=/usr/local/bin/codeql
 
-# Download CodeQL standard query packs (compatible with CLI 2.20.1)
+# Download CodeQL standard query packs
 RUN mkdir -p /usr/local/codeql/packs \
-    && cd /usr/local/codeql/packs \
-    && wget -q https://github.com/github/codeql/archive/refs/tags/codeql-cli/v2.20.1.zip -O /tmp/codeql-packs.zip \
-    && unzip -q /tmp/codeql-packs.zip \
-    && mv codeql-codeql-cli-v2.20.1 javascript \
-    && rm /tmp/codeql-packs.zip \
-    || echo "Using fallback query method"
-
+    && codeql pack download --dir /usr/local/codeql/packs codeql/javascript-queries codeql/python-queries \
+    || true
 # Copy requirements first for better caching
 COPY requirements.txt .
 

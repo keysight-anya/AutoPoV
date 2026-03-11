@@ -209,25 +209,23 @@ class DockerRunner:
         Returns:
             Execution result dictionary
         """
+        # Write input data to a separate file to avoid string escaping issues
+        extra_files = {
+            'input_data.txt': input_data,
+            'pov_script.py': pov_script
+        }
+        
         # Create wrapper script that reads from file
-        wrapper_script = f'''
+        wrapper_script = '''
 import sys
 import subprocess
-
-# Write input data to file for the PoV to read
-with open('/pov/input_data.txt', 'w') as f:
-    f.write("""{input_data}""")
 
 # Run the actual PoV
 exec(open('/pov/pov_script.py').read())
 '''
+        extra_files['wrapper.py'] = wrapper_script
         
-        extra_files = {
-            'input_data.txt': input_data,
-            'wrapper.py': wrapper_script
-        }
-        
-        return self.run_pov(pov_script, scan_id, pov_id, extra_files)
+        return self.run_pov(wrapper_script, scan_id, pov_id, extra_files)
     
     def run_binary_pov(
         self,

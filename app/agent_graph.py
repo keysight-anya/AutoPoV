@@ -6,6 +6,7 @@ LangGraph-based agentic workflow for vulnerability detection
 import os
 import json
 import uuid
+import shutil
 from typing import Dict, Any, List, Optional, TypedDict, Annotated
 from datetime import datetime
 from enum import Enum
@@ -13,13 +14,13 @@ from enum import Enum
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 
-try:
-    import subprocess
-    SUBPROCESS_AVAILABLE = True
-except ImportError:
-    SUBPROCESS_AVAILABLE = False
+import subprocess
 
 from app.config import settings
+from app.policy import get_policy_router
+from app.learning_store import get_learning_store
+from agents.heuristic_scout import get_heuristic_scout
+from agents.llm_scout import get_llm_scout
 from agents.ingest_codebase import get_code_ingester
 from agents.investigator import get_investigator
 from agents.verifier import get_verifier
@@ -68,6 +69,8 @@ class ScanState(TypedDict):
     model_name: str
     cwes: List[str]
     findings: List[VulnerabilityState]
+    preloaded_findings: Optional[List[VulnerabilityState]]
+    detected_language: Optional[str]
     current_finding_idx: int
     start_time: str
     end_time: Optional[str]
@@ -199,62 +202,109 @@ class AgentGraph:
         
         return state
     
+    def _run_autonomous_discovery(self, state: ScanState) -> List[VulnerabilityState]:
+        """Run autonomous discovery using heuristics and optional LLM scout."""
+        findings: List[VulnerabilityState] = []
+        if not settings.SCOUT_ENABLED:
+            return findings
+
+        try:
+            findings.extend(get_heuristic_scout().scan_directory(state["codebase_path"], state["cwes"]))
+            self._log(state, f"Heuristic scout found {len(findings)} candidates")
+        except Exception as e:
+            self._log(state, f"Heuristic scout failed: {e}")
+
+        if settings.SCOUT_LLM_ENABLED:
+            try:
+                model = get_policy_router().select_model("investigate", cwe=None, language=state.get("detected_language"))
+                llm_findings = get_llm_scout().scan_directory(state["codebase_path"], state["cwes"], model_name=model)
+                findings.extend(llm_findings)
+                self._log(state, f"LLM scout found {len(llm_findings)} candidates")
+            except Exception as e:
+                self._log(state, f"LLM scout failed: {e}")
+
+        return findings
+
+    def _merge_findings(self, base: List[VulnerabilityState], extra: List[VulnerabilityState]) -> List[VulnerabilityState]:
+        """Merge findings and deduplicate by (filepath, line, cwe)."""
+        merged: List[VulnerabilityState] = []
+        seen = set()
+        for item in base + extra:
+            key = (item.get("filepath"), item.get("line_number"), item.get("cwe_type"))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+        return merged
+
     def _node_run_codeql(self, state: ScanState) -> ScanState:
         """Run CodeQL analysis"""
         self._log(state, "Running CodeQL analysis...")
         state["status"] = ScanStatus.RUNNING_CODEQL
-        
+        if state.get("preloaded_findings"):
+            self._log(state, f"Using preloaded findings: {len(state['preloaded_findings'])}")
+            state["findings"] = state["preloaded_findings"]
+            return state
+
+
+        state["status"] = ScanStatus.RUNNING_CODEQL
+
         codeql_available = settings.is_codeql_available()
         self._log(state, f"CodeQL availability check: {codeql_available}")
-        
+
         if not codeql_available:
-            self._log(state, "CodeQL not available, using LLM-only analysis")
+            self._log(state, "CodeQL not available, using autonomous discovery")
             findings = self._run_llm_only_analysis(state)
-            state["findings"] = findings
+            auto_findings = self._run_autonomous_discovery(state)
+            state["findings"] = self._merge_findings(findings, auto_findings)
+            self._log(state, f"Autonomous discovery added {len(auto_findings)} candidates")
             return state
-        
+
         try:
             findings = []
             detected_lang = self._detect_language(state["codebase_path"])
             state["detected_language"] = detected_lang  # Store for later use
             self._log(state, f"Detected language: {detected_lang}")
-            
+
             # Create CodeQL database once for all queries
             db_path = os.path.join(settings.TEMP_DIR, f"codeql_db_{state['scan_id']}")
             db_created = self._create_codeql_database(state, detected_lang, db_path)
-            
+
             if not db_created:
-                self._log(state, "CodeQL database creation failed, using LLM-only analysis")
+                self._log(state, "CodeQL database creation failed, using autonomous discovery")
                 findings = self._run_llm_only_analysis(state)
-                state["findings"] = findings
+                auto_findings = self._run_autonomous_discovery(state)
+                state["findings"] = self._merge_findings(findings, auto_findings)
                 return state
-            
+
             # Run queries against the created database
             for cwe in state["cwes"]:
                 self._log(state, f"Running CodeQL query for {cwe}...")
                 cwe_findings = self._run_codeql_query(state, cwe, detected_lang, db_path)
                 self._log(state, f"{cwe}: Found {len(cwe_findings)} findings")
                 findings.extend(cwe_findings)
-            
-            state["findings"] = findings
+
+            auto_findings = self._run_autonomous_discovery(state)
+            state["findings"] = self._merge_findings(findings, auto_findings)
             self._log(state, f"CodeQL found {len(findings)} potential vulnerabilities")
-            
+            self._log(state, f"Autonomous discovery added {len(auto_findings)} candidates")
+
         except Exception as e:
             self._log(state, f"CodeQL error: {e}")
             import traceback
             self._log(state, f"Traceback: {traceback.format_exc()}")
             findings = self._run_llm_only_analysis(state)
-            state["findings"] = findings
+            auto_findings = self._run_autonomous_discovery(state)
+            state["findings"] = self._merge_findings(findings, auto_findings)
         finally:
             # Cleanup database after all queries are done
             db_path = os.path.join(settings.TEMP_DIR, f"codeql_db_{state['scan_id']}")
             if os.path.exists(db_path):
-                import shutil
                 shutil.rmtree(db_path, ignore_errors=True)
                 self._log(state, f"Cleaned up CodeQL database at {db_path}")
-        
+
         return state
-    
+
     def _create_codeql_database(self, state: ScanState, language: str, db_path: str) -> bool:
         """Create CodeQL database for the codebase. Returns True if successful."""
         if os.path.exists(db_path):
@@ -309,7 +359,12 @@ class AgentGraph:
             '.cc': 'cpp',
             '.h': 'cpp',
             '.go': 'go',
-            '.rb': 'ruby'
+            '.rb': 'ruby',
+            '.php': 'javascript',  # PHP - no native CodeQL support, use JS as fallback
+            '.phtml': 'javascript',
+            '.php3': 'javascript',
+            '.php4': 'javascript',
+            '.php5': 'javascript'
         }
         
         # Find the most common language
@@ -325,56 +380,96 @@ class AgentGraph:
     
     def _get_cwe_query(self, cwe: str, language: str) -> Optional[str]:
         """Get CodeQL query for a CWE based on language using local file paths"""
+        # Map detected languages to actual CodeQL language packs
+        # PHP uses javascript pack, TypeScript uses javascript pack, etc.
+        language_pack_map = {
+            'python': 'python',
+            'javascript': 'javascript',
+            'java': 'java',
+            'cpp': 'cpp',
+            'go': 'go',
+            'ruby': 'ruby',
+            'php': 'javascript',  # PHP uses JavaScript pack for CodeQL
+            'typescript': 'javascript',
+        }
+        
+        # Get the actual CodeQL language pack to use
+        actual_language = language_pack_map.get(language, language)
+        
         # Map CWEs to CodeQL query file paths (local filesystem paths)
-        base_path = "/usr/local/codeql/packs/javascript"
+        # Each language has its own pack directory
+        base_paths = {
+            'javascript': '/usr/local/codeql/packs/codeql/javascript-queries',
+            'python': '/usr/local/codeql/packs/codeql/python-queries',
+            'java': '/usr/local/codeql/packs/codeql/java-queries',
+            'cpp': '/usr/local/codeql/packs/codeql/cpp-queries',
+            'go': '/usr/local/codeql/packs/codeql/go-queries',
+            'ruby': '/usr/local/codeql/packs/codeql/ruby-queries',
+        }
+        
         cwe_query_map = {
             'javascript': {
-                'CWE-79': f'{base_path}/javascript/ql/src/Security/CWE-079/Xss.ql',
-                'CWE-89': f'{base_path}/javascript/ql/src/Security/CWE-089/SqlInjection.ql',
-                'CWE-94': f'{base_path}/javascript/ql/src/Security/CWE-094/CodeInjection.ql',
-                'CWE-502': f'{base_path}/javascript/ql/src/Security/CWE-502/UnsafeDeserialization.ql',
-                'CWE-22': f'{base_path}/javascript/ql/src/Security/CWE-022/TaintedPath.ql',
-                'CWE-312': f'{base_path}/javascript/ql/src/Security/CWE-312/CleartextStorage.ql',
-                'CWE-327': f'{base_path}/javascript/ql/src/Security/CWE-327/BrokenCryptoAlgorithm.ql',
-                'CWE-601': f'{base_path}/javascript/ql/src/Security/CWE-601/UrlRedirection.ql',
-                'CWE-611': f'{base_path}/javascript/ql/src/Security/CWE-611/Xxe.ql',
-                'CWE-918': f'{base_path}/javascript/ql/src/Security/CWE-918/RequestForgery.ql',
-                'CWE-352': f'{base_path}/javascript/ql/src/Security/CWE-352/MissingCsrfToken.ql',
-                'CWE-78': f'{base_path}/javascript/ql/src/Security/CWE-078/CommandInjection.ql',
-                'CWE-200': f'{base_path}/javascript/ql/src/Security/CWE-200/InformationExposure.ql',
-                'CWE-209': f'{base_path}/javascript/ql/src/Security/CWE-209/StackTraceExposure.ql',
-                'CWE-384': f'{base_path}/javascript/ql/src/Security/CWE-384/SessionFixation.ql',
-                'CWE-400': f'{base_path}/javascript/ql/src/Security/CWE-400/ResourceExhaustion.ql',
-                'CWE-798': f'{base_path}/javascript/ql/src/Security/CWE-798/HardcodedCredentials.ql',
+                'CWE-79': 'Security/CWE-079/Xss.ql',
+                'CWE-89': 'Security/CWE-089/SqlInjection.ql',
+                'CWE-94': 'Security/CWE-094/CodeInjection.ql',
+                'CWE-502': 'Security/CWE-502/UnsafeDeserialization.ql',
+                'CWE-22': 'Security/CWE-022/TaintedPath.ql',
+                'CWE-312': 'Security/CWE-312/CleartextStorage.ql',
+                'CWE-327': 'Security/CWE-327/BrokenCryptoAlgorithm.ql',
+                'CWE-601': 'Security/CWE-601/UrlRedirection.ql',
+                'CWE-611': 'Security/CWE-611/Xxe.ql',
+                'CWE-918': 'Security/CWE-918/RequestForgery.ql',
+                'CWE-352': 'Security/CWE-352/MissingCsrfToken.ql',
+                'CWE-78': 'Security/CWE-078/CommandInjection.ql',
+                'CWE-200': 'Security/CWE-200/InformationExposure.ql',
+                'CWE-209': 'Security/CWE-209/StackTraceExposure.ql',
+                'CWE-384': 'Security/CWE-384/SessionFixation.ql',
+                'CWE-400': 'Security/CWE-400/ResourceExhaustion.ql',
+                'CWE-798': 'Security/CWE-798/HardcodedCredentials.ql',
             },
             'python': {
-                'CWE-89': f'{base_path}/python/ql/src/Security/CWE-089/SqlInjection.ql',
-                'CWE-94': f'{base_path}/python/ql/src/Security/CWE-094/CodeInjection.ql',
-                'CWE-22': f'{base_path}/python/ql/src/Security/CWE-022/PathInjection.ql',
-                'CWE-502': f'{base_path}/python/ql/src/Security/CWE-502/UnsafeDeserialization.ql',
-                'CWE-78': f'{base_path}/python/ql/src/Security/CWE-078/CommandInjection.ql',
+                'CWE-89': 'Security/CWE-089/SqlInjection.ql',
+                'CWE-94': 'Security/CWE-094/CodeInjection.ql',
+                'CWE-22': 'Security/CWE-022/PathInjection.ql',
+                'CWE-502': 'Security/CWE-502/UnsafeDeserialization.ql',
+                'CWE-78': 'Security/CWE-078/CommandInjection.ql',
             },
             'java': {
-                'CWE-89': f'{base_path}/java/ql/src/Security/CWE-089/SqlInjection.ql',
-                'CWE-79': f'{base_path}/java/ql/src/Security/CWE-079/Xss.ql',
-                'CWE-502': f'{base_path}/java/ql/src/Security/CWE-502/UnsafeDeserialization.ql',
+                'CWE-89': 'Security/CWE-089/SqlInjection.ql',
+                'CWE-79': 'Security/CWE-079/Xss.ql',
+                'CWE-502': 'Security/CWE-502/UnsafeDeserialization.ql',
             },
             'cpp': {
-                'CWE-119': f'{base_path}/cpp/ql/src/Security/CWE/CWE-119/BufferOverflow.ql',
-                'CWE-190': f'{base_path}/cpp/ql/src/Security/CWE/CWE-190/IntegerOverflow.ql',
-                'CWE-416': f'{base_path}/cpp/ql/src/Security/CWE/CWE-416/UseAfterFree.ql',
+                'CWE-119': 'Security/CWE/CWE-119/BufferOverflow.ql',
+                'CWE-190': 'Security/CWE/CWE-190/IntegerOverflow.ql',
+                'CWE-416': 'Security/CWE/CWE-416/UseAfterFree.ql',
             }
         }
         
-        queries = cwe_query_map.get(language, {})
-        query_path = queries.get(cwe)
+        # Get the relative query path for the ACTUAL language pack (not detected language)
+        queries = cwe_query_map.get(actual_language, {})
+        relative_path = queries.get(cwe)
+        
+        if not relative_path:
+            self._log(None, f"No query available for {cwe} in {actual_language} (detected: {language})")
+            return None
+            
+        # Construct full path using the correct base path for the actual language
+        base_path = base_paths.get(actual_language)
+        if not base_path:
+            self._log(None, f"No base path for language pack: {actual_language}")
+            return None
+            
+        query_path = f"{base_path}/{relative_path}"
         
         # Check if the query file exists
         if query_path and os.path.exists(query_path):
+            self._log(None, f"Found query for {cwe} using {actual_language} pack: {query_path}")
             return query_path
         
         # Fallback: try to find query in alternative locations
-        return self._find_fallback_query(cwe, language)
+        self._log(None, f"Query not found at {query_path}, trying fallback")
+        return self._find_fallback_query(cwe, actual_language)
     
     def _find_fallback_query(self, cwe: str, language: str) -> Optional[str]:
         """Find a fallback query file if the standard one doesn't exist"""
@@ -536,8 +631,11 @@ class AgentGraph:
             return state
         
         self._log(state, f"Investigating {finding['cwe_type']} at {finding['filepath']}:{finding['line_number']}")
-        self._log(state, f"Using model: {state.get('model_name', 'default')}")
+        self._log(state, "Selecting model via policy...")
         
+        policy = get_policy_router()
+        model_to_use = policy.select_model("investigate", cwe=finding["cwe_type"], language=state.get("detected_language"))
+        self._log(state, f"Using model (policy): {model_to_use}")
         investigator = get_investigator()
         
         # Pass the model name from scan state
@@ -549,7 +647,7 @@ class AgentGraph:
                 filepath=finding["filepath"],
                 line_number=finding["line_number"],
                 alert_message=finding.get("alert_message", ""),
-                model_name=state.get("model_name")
+                model_name=model_to_use
             )
             self._log(state, f"Investigation completed with verdict: {result.get('verdict', 'UNKNOWN')}")
         except Exception as e:
@@ -575,7 +673,7 @@ class AgentGraph:
         actual_cost = result.get("cost_usd", 0.0)
         if actual_cost > 0:
             finding["cost_usd"] = actual_cost
-            finding["model_used"] = result.get("model_used", state.get("model_name", "unknown"))
+            finding["model_used"] = result.get("model_used", model_to_use)
             finding["token_usage"] = result.get("token_usage", {})
         else:
             # Fallback to estimation
@@ -586,7 +684,22 @@ class AgentGraph:
         state["findings"][idx] = finding
         
         self._log(state, f"  Verdict: {finding['llm_verdict']} (confidence: {finding['confidence']:.2f})")
-        
+
+        try:
+            get_learning_store().record_investigation(
+                scan_id=state["scan_id"],
+                cwe=finding.get("cwe_type", ""),
+                filepath=finding.get("filepath", ""),
+                language=state.get("detected_language", "unknown"),
+                source=finding.get("source", "codeql"),
+                verdict=finding.get("llm_verdict", "UNKNOWN"),
+                confidence=finding.get("confidence", 0.0),
+                model=model_to_use,
+                cost_usd=finding.get("cost_usd", 0.0)
+            )
+        except Exception as e:
+            self._log(state, f"Learning store record failed: {e}")
+
         return state
     
     def _node_generate_pov(self, state: ScanState) -> ScanState:
@@ -604,6 +717,10 @@ class AgentGraph:
             return state
         
         self._log(state, f"Generating PoV for {finding['cwe_type']}...")
+
+        policy = get_policy_router()
+        model_to_use = policy.select_model("pov", cwe=finding["cwe_type"], language=state.get("detected_language"))
+        self._log(state, f"Using model (policy) for PoV: {model_to_use}")
         
         verifier = get_verifier()
         
@@ -624,7 +741,7 @@ class AgentGraph:
             explanation=finding["llm_explanation"],
             code_context=code_context,
             target_language=target_language,
-            model_name=state.get("model_name")
+            model_name=model_to_use
         )
         
         # Log model and cost info
@@ -636,6 +753,7 @@ class AgentGraph:
         
         if result["success"]:
             finding["pov_script"] = result["pov_script"]
+            finding["pov_model_used"] = result.get("model_used", model_to_use)
             # Cost already added above, just store it in finding
             if "cost_usd" not in finding:
                 finding["cost_usd"] = result.get("cost_usd", 0)
@@ -709,24 +827,24 @@ class AgentGraph:
         
         state["findings"][idx] = finding
         return state
-    
+
     def _node_run_in_docker(self, state: ScanState) -> ScanState:
         """Run PoV - uses validation results instead of Docker execution"""
         state["status"] = ScanStatus.RUNNING_POV
-        
+
         idx = state.get("current_finding_idx", 0)
         if idx >= len(state["findings"]):
             return state
-        
+
         finding = state["findings"][idx]
-        
+
         if not finding.get("pov_script"):
             return state
-        
+
         # Check if we already have validation results
-        validation_result = finding.get("validation_result", {})
-        unit_test_result = validation_result.get("unit_test_result", {})
-        
+        validation_result = finding.get("validation_result") or {}
+        unit_test_result = validation_result.get("unit_test_result") or {}
+
         # If unit test already confirmed vulnerability, use that result
         if unit_test_result.get("vulnerability_triggered"):
             self._log(state, "Using unit test confirmation (vulnerability triggered)")
@@ -738,10 +856,21 @@ class AgentGraph:
                 "stderr": unit_test_result.get("stderr", ""),
                 "execution_time_s": unit_test_result.get("execution_time_s", 0)
             }
-            self._log(state, "  ✓ VULNERABILITY CONFIRMED!")
+            self._log(state, "VULNERABILITY CONFIRMED")
+            try:
+                get_learning_store().record_pov(
+                    scan_id=state["scan_id"],
+                    cwe=finding.get("cwe_type", ""),
+                    model=finding.get("pov_model_used", ""),
+                    cost_usd=finding.get("cost_usd", 0.0),
+                    success=True,
+                    validation_method="unit_test"
+                )
+            except Exception as e:
+                self._log(state, f"Learning store PoV record failed: {e}")
             state["findings"][idx] = finding
             return state
-        
+
         # If static validation has high confidence, trust it
         static_result = validation_result.get("static_result", {})
         if static_result.get("is_valid") and static_result.get("confidence", 0) >= 0.8:
@@ -753,30 +882,53 @@ class AgentGraph:
                 "confidence": static_result.get("confidence", 0),
                 "note": "Vulnerability confirmed via static analysis"
             }
-            self._log(state, "  ✓ VULNERABILITY CONFIRMED (static analysis)")
+            self._log(state, "VULNERABILITY CONFIRMED (static analysis)")
+            try:
+                get_learning_store().record_pov(
+                    scan_id=state["scan_id"],
+                    cwe=finding.get("cwe_type", ""),
+                    model=finding.get("pov_model_used", ""),
+                    cost_usd=finding.get("cost_usd", 0.0),
+                    success=True,
+                    validation_method="static_analysis"
+                )
+            except Exception as e:
+                self._log(state, f"Learning store PoV record failed: {e}")
             state["findings"][idx] = finding
             return state
-        
+
         # Fall back to Docker-based testing for cases where validation was inconclusive
         self._log(state, "Running PoV in Docker (fallback)...")
-        
+
         runner = get_docker_runner()
         result = runner.run_pov(
             pov_script=finding["pov_script"],
             scan_id=state["scan_id"],
             pov_id=str(idx)
         )
-        
+
         finding["pov_result"] = result
-        
+
         if result["vulnerability_triggered"]:
-            self._log(state, "  ✓ VULNERABILITY TRIGGERED!")
+            self._log(state, "VULNERABILITY TRIGGERED")
         else:
             self._log(state, f"  PoV did not trigger vulnerability (exit code: {result['exit_code']})")
-        
+
+        try:
+            get_learning_store().record_pov(
+                scan_id=state["scan_id"],
+                cwe=finding.get("cwe_type", ""),
+                model=finding.get("pov_model_used", ""),
+                cost_usd=finding.get("cost_usd", 0.0),
+                success=bool(result.get("vulnerability_triggered")),
+                validation_method="docker"
+            )
+        except Exception as e:
+            self._log(state, f"Learning store PoV record failed: {e}")
+
         state["findings"][idx] = finding
         return state
-    
+
     def _node_log_confirmed(self, state: ScanState) -> ScanState:
         """Log confirmed vulnerability"""
         idx = state.get("current_finding_idx", 0)
@@ -918,7 +1070,9 @@ class AgentGraph:
         codebase_path: str,
         model_name: str,
         cwes: List[str],
-        scan_id: Optional[str] = None
+        scan_id: Optional[str] = None,
+        preloaded_findings: Optional[List[VulnerabilityState]] = None,
+        detected_language: Optional[str] = None
     ) -> ScanState:
         """
         Run a complete vulnerability scan
@@ -928,6 +1082,8 @@ class AgentGraph:
             model_name: LLM model name
             cwes: List of CWEs to check
             scan_id: Optional scan ID
+            preloaded_findings: Optional preloaded findings for replay
+            detected_language: Optional detected language
         
         Returns:
             Final scan state
@@ -942,6 +1098,8 @@ class AgentGraph:
             model_name=model_name,
             cwes=cwes,
             findings=[],
+            preloaded_findings=preloaded_findings,
+            detected_language=detected_language,
             current_finding_idx=0,
             start_time=datetime.utcnow().isoformat(),
             end_time=None,
@@ -963,3 +1121,26 @@ agent_graph = AgentGraph()
 def get_agent_graph() -> AgentGraph:
     """Get the global agent graph instance"""
     return agent_graph
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

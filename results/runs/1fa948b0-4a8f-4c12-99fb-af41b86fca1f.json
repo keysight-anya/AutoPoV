@@ -1,0 +1,18 @@
+{
+  "scan_id": "1fa948b0-4a8f-4c12-99fb-af41b86fca1f",
+  "status": "completed",
+  "codebase_path": "/tmp",
+  "model_name": "openai/gpt-4o",
+  "cwes": [
+    "CWE-89"
+  ],
+  "total_findings": 0,
+  "confirmed_vulns": 0,
+  "false_positives": 0,
+  "failed": 0,
+  "total_cost_usd": 0.0,
+  "duration_s": 0.202574,
+  "start_time": "2026-03-08T18:22:32.005050",
+  "end_time": "2026-03-08T18:22:32.207624",
+  "findings": []
+}

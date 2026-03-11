@@ -1,0 +1,21 @@
+{
+  "scan_id": "eb674a12-86a2-49c9-8947-2026222ff737",
+  "status": "completed",
+  "codebase_path": "/tmp/autopov/eb674a12-86a2-49c9-8947-2026222ff737",
+  "model_name": "openai/gpt-4o",
+  "cwes": [
+    "CWE-89",
+    "CWE-119",
+    "CWE-190",
+    "CWE-416"
+  ],
+  "total_findings": 0,
+  "confirmed_vulns": 0,
+  "false_positives": 0,
+  "failed": 0,
+  "total_cost_usd": 0.0,
+  "duration_s": 0.353646,
+  "start_time": "2026-03-08T17:58:46.139302",
+  "end_time": "2026-03-08T17:58:46.492948",
+  "findings": []
+}
