@@ -1,6 +1,15 @@
 import { useEffect, useRef } from 'react'
 import { Terminal } from 'lucide-react'
 
+const LINE_COLOR = (msg) => {
+  if (/VULNERABILITY TRIGGERED/i.test(msg)) return 'text-threat-400 font-semibold'
+  if (/error|failed|exception/i.test(msg)) return 'text-red-400'
+  if (/success|confirmed|complete/i.test(msg)) return 'text-safe-400'
+  if (/warning|warn/i.test(msg)) return 'text-warn-400'
+  if (/\[INFO\]|→|✓/i.test(msg)) return 'text-primary-400'
+  return 'text-gray-400'
+}
+
 function LiveLog({ logs }) {
   const logEndRef = useRef(null)
 
@@ -8,50 +17,44 @@ function LiveLog({ logs }) {
     logEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [logs])
 
-  const formatLog = (log) => {
-    // Extract timestamp if present
-    const match = log.match(/^\[(.*?)\] (.*)$/)
-    if (match) {
-      return {
-        timestamp: match[1],
-        message: match[2]
-      }
-    }
-    return { timestamp: null, message: log }
+  const parseLine = (log) => {
+    const match = log.match(/^\[(.*?)\]\s(.*)$/)
+    if (match) return { ts: match[1], msg: match[2] }
+    return { ts: null, msg: log }
   }
 
   return (
-    <div className="bg-gray-900 rounded-lg border border-gray-800 overflow-hidden">
-      <div className="flex items-center space-x-2 px-4 py-3 border-b border-gray-800 bg-gray-850">
-        <Terminal className="w-5 h-5 text-primary-500" />
-        <span className="font-medium">Live Logs</span>
+    <div className="bg-gray-950 rounded-xl border border-gray-800/60 overflow-hidden">
+      {/* Header */}
+      <div className="flex items-center gap-2 px-4 py-2.5 border-b border-gray-800/60 bg-gray-900/60">
+        <div className="flex gap-1.5">
+          <div className="w-2.5 h-2.5 rounded-full bg-red-500/60" />
+          <div className="w-2.5 h-2.5 rounded-full bg-warn-500/60" />
+          <div className="w-2.5 h-2.5 rounded-full bg-safe-500/60" />
+        </div>
+        <div className="flex items-center gap-1.5 text-xs text-gray-500 ml-2">
+          <Terminal className="w-3.5 h-3.5 text-primary-500/70" />
+          <span>scan log</span>
+        </div>
+        <span className="ml-auto text-xs text-gray-700">{logs.length} lines</span>
       </div>
-      
-      <div className="h-96 overflow-y-auto p-4 font-mono text-sm">
+
+      {/* Log body */}
+      <div className="h-96 overflow-y-auto p-4 font-mono text-xs leading-relaxed">
         {logs.length === 0 ? (
-          <p className="text-gray-500 italic">Waiting for scan to start...</p>
+          <span className="text-gray-600 italic">Waiting for scan output…</span>
         ) : (
-          <div className="space-y-1">
-            {logs.map((log, index) => {
-              const { timestamp, message } = formatLog(log)
+          <div className="space-y-0.5">
+            {logs.map((log, i) => {
+              const { ts, msg } = parseLine(log)
               return (
-                <div key={index} className="log-entry flex space-x-3">
-                  {timestamp && (
-                    <span className="text-gray-500 text-xs shrink-0">
-                      {new Date(timestamp).toLocaleTimeString()}
+                <div key={i} className="log-entry flex gap-3 group">
+                  {ts && (
+                    <span className="text-gray-700 shrink-0 group-hover:text-gray-500 transition-colors">
+                      {new Date(ts).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}
                     </span>
                   )}
-                  <span className={`${
-                    message.includes('Error') || message.includes('Failed')
-                      ? 'text-red-400'
-                      : message.includes('Success') || message.includes('confirmed')
-                      ? 'text-green-400'
-                      : message.includes('VULNERABILITY TRIGGERED')
-                      ? 'text-red-500 font-bold'
-                      : 'text-gray-300'
-                  }`}>
-                    {message}
-                  </span>
+                  <span className={LINE_COLOR(msg)}>{msg}</span>
                 </div>
               )
             })}

@@ -14,6 +14,10 @@ function Results() {
   const [error, setError] = useState(null)
   const [activeTab, setActiveTab] = useState('all')
 
+  const [scanStatus, setScanStatus] = useState(null)
+  const [scanError, setScanError] = useState(null)
+  const [scanLogs, setScanLogs] = useState([])
+
   useEffect(() => {
     const fetchResults = async () => {
       try {
@@ -21,7 +25,11 @@ function Results() {
           getScanStatus(scanId),
           getConfig().catch(() => null)
         ])
-        setResult(scanRes.data.result)
+        const data = scanRes.data
+        setScanStatus(data.status)
+        setScanError(data.error || null)
+        setScanLogs(data.logs || [])
+        setResult(data.result)
         setConfig(configRes?.data || null)
       } catch (err) {
         setError(err.message)
@@ -98,11 +106,42 @@ function Results() {
   }
 
   if (!result) {
+    const isFailed = scanStatus === 'failed'
     return (
       <div className="max-w-4xl mx-auto">
-        <div className="p-4 bg-yellow-900/30 border border-yellow-800 rounded-lg">
-          <p className="text-yellow-300">No results found for this scan</p>
+        <div className="flex items-center space-x-4 mb-6">
+          <button onClick={() => navigate('/')} className="p-2 hover:bg-gray-800 rounded-lg transition-colors">
+            <ArrowLeft className="w-5 h-5" />
+          </button>
+          <div>
+            <h1 className="text-2xl font-bold">Scan {isFailed ? 'Failed' : 'Results'}</h1>
+            <p className="text-sm text-gray-400">ID: {scanId}</p>
+          </div>
         </div>
+
+        <div className={`p-4 rounded-lg border mb-4 ${isFailed ? 'bg-red-900/30 border-red-800' : 'bg-yellow-900/30 border-yellow-800'}`}>
+          <p className={`font-medium mb-1 ${isFailed ? 'text-red-300' : 'text-yellow-300'}`}>
+            {isFailed ? 'Scan failed — no results were produced.' : 'No results found for this scan.'}
+          </p>
+          {scanError && (
+            <p className="text-sm text-red-400 mt-1 font-mono break-all">
+              {scanError.split('\n')[0]}
+            </p>
+          )}
+        </div>
+
+        {scanLogs.length > 0 && (
+          <div className="bg-gray-900 rounded-lg border border-gray-800 p-4">
+            <h3 className="text-sm font-medium text-gray-400 mb-2">Scan Logs</h3>
+            <div className="space-y-1 max-h-64 overflow-y-auto font-mono text-xs">
+              {scanLogs.map((log, i) => (
+                <div key={i} className={`${log.startsWith('ERROR') ? 'text-red-400' : 'text-gray-300'}`}>
+                  {log}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     )
   }

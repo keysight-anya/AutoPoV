@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Shield, AlertCircle } from 'lucide-react'
+import { Shield, AlertCircle, Bug, FlaskConical, BarChart2, Zap } from 'lucide-react'
 import ScanForm from '../components/ScanForm'
 import { scanGit, scanZip, scanPaste } from '../api/client'
 
@@ -26,13 +26,14 @@ function Home() {
           })
           break
 
-        case 'zip':
+        case 'zip': {
           const formData = new FormData()
           formData.append('file', file)
           formData.append('cwes', data.cwes.join(','))
           formData.append('lite', data.lite ? 'true' : 'false')
           response = await scanZip(formData)
           break
+        }
 
         case 'paste':
           response = await scanPaste({
@@ -57,46 +58,72 @@ function Home() {
 
   return (
     <div className="max-w-4xl mx-auto">
-      {/* Header */}
-      <div className="text-center mb-8">
-        <div className="flex justify-center mb-4">
-          <Shield className="w-16 h-16 text-primary-500" />
+      {/* Hero */}
+      <div className="relative text-center mb-10 py-10">
+        <div className="absolute inset-0 bg-grid opacity-40 pointer-events-none rounded-2xl" />
+
+        {/* Pill badge */}
+        <div className="inline-flex items-center gap-1.5 px-3 py-1 mb-5 rounded-full bg-primary-500/10 border border-primary-500/20 text-primary-400 text-xs font-medium">
+          <Zap className="w-3 h-3" />
+          AI-Powered Vulnerability Analysis
         </div>
-        <h1 className="text-4xl font-bold mb-4">AutoPoV</h1>
-        <p className="text-xl text-gray-400">
-          Autonomous Proof-of-Vulnerability Framework for LLM Benchmarking
+
+        {/* Glowing shield */}
+        <div className="relative flex justify-center mb-5">
+          <div className="relative">
+            <div className="absolute inset-0 bg-primary-500/30 rounded-full blur-2xl scale-150 opacity-60" />
+            <Shield className="relative w-14 h-14 text-primary-400" />
+          </div>
+        </div>
+
+        <h1 className="relative text-4xl font-bold tracking-tight mb-3">
+          Auto<span className="text-primary-400">PoV</span>
+        </h1>
+        <p className="relative text-gray-400 text-base max-w-xl mx-auto">
+          Autonomous Proof-of-Vulnerability framework — detects, validates, and generates working exploits for real vulnerabilities.
         </p>
       </div>
 
-      {/* Error Message */}
+      {/* Error */}
       {error && (
-        <div className="mb-6 p-4 bg-red-900/30 border border-red-800 rounded-lg flex items-center space-x-2">
-          <AlertCircle className="w-5 h-5 text-red-400" />
-          <span className="text-red-300">{error}</span>
+        <div className="mb-6 p-4 bg-red-900/20 border border-red-800/60 rounded-lg flex items-start gap-3">
+          <AlertCircle className="w-4 h-4 text-red-400 mt-0.5 shrink-0" />
+          <span className="text-red-300 text-sm">{error}</span>
         </div>
       )}
 
       {/* Scan Form */}
       <ScanForm onSubmit={handleSubmit} isLoading={isLoading} />
 
-      {/* Features */}
-      <div className="mt-12 grid md:grid-cols-3 gap-6">
-        <div className="bg-gray-900 rounded-lg p-6 border border-gray-800">
-          <h3 className="font-medium mb-2">AI-Powered Detection</h3>
-          <p className="text-sm text-gray-400">
-            Uses LLMs to analyze code and identify vulnerabilities with high accuracy
+      {/* Feature grid */}
+      <div className="mt-10 grid md:grid-cols-3 gap-4">
+        <div className="bg-gray-900/60 rounded-xl p-5 border border-gray-800/60 hover:border-threat-500/30 transition-colors group">
+          <div className="w-8 h-8 rounded-lg bg-threat-500/10 border border-threat-500/20 flex items-center justify-center mb-3 group-hover:bg-threat-500/20 transition-colors">
+            <Bug className="w-4 h-4 text-threat-400" />
+          </div>
+          <h3 className="font-medium text-sm mb-1.5">Deep Vulnerability Detection</h3>
+          <p className="text-xs text-gray-500 leading-relaxed">
+            LLM-driven code analysis across OWASP Top 10 — finds injection flaws, auth bypass, and logic errors.
           </p>
         </div>
-        <div className="bg-gray-900 rounded-lg p-6 border border-gray-800">
-          <h3 className="font-medium mb-2">PoV Generation</h3>
-          <p className="text-sm text-gray-400">
-            Automatically generates and executes Proof-of-Vulnerability scripts
+
+        <div className="bg-gray-900/60 rounded-xl p-5 border border-gray-800/60 hover:border-primary-500/30 transition-colors group">
+          <div className="w-8 h-8 rounded-lg bg-primary-500/10 border border-primary-500/20 flex items-center justify-center mb-3 group-hover:bg-primary-500/20 transition-colors">
+            <FlaskConical className="w-4 h-4 text-primary-400" />
+          </div>
+          <h3 className="font-medium text-sm mb-1.5">Proof-of-Vulnerability</h3>
+          <p className="text-xs text-gray-500 leading-relaxed">
+            Automatically generates and executes exploit scripts to confirm findings are real, not false positives.
           </p>
         </div>
-        <div className="bg-gray-900 rounded-lg p-6 border border-gray-800">
-          <h3 className="font-medium mb-2">Benchmarking</h3>
-          <p className="text-sm text-gray-400">
-            Compare LLM performance on vulnerability detection tasks
+
+        <div className="bg-gray-900/60 rounded-xl p-5 border border-gray-800/60 hover:border-warn-500/30 transition-colors group">
+          <div className="w-8 h-8 rounded-lg bg-warn-500/10 border border-warn-500/20 flex items-center justify-center mb-3 group-hover:bg-warn-500/20 transition-colors">
+            <BarChart2 className="w-4 h-4 text-warn-400" />
+          </div>
+          <h3 className="font-medium text-sm mb-1.5">LLM Benchmarking</h3>
+          <p className="text-xs text-gray-500 leading-relaxed">
+            Compare model performance on vulnerability detection tasks with detection rate and cost metrics.
           </p>
         </div>
       </div>
