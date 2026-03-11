@@ -225,10 +225,12 @@ class ScanManager:
                 duration_s=0.0,
                 start_time=scan_info["created_at"],
                 end_time=datetime.utcnow().isoformat(),
-                findings=[]
+                findings=[],
+                logs=scan_info.get("logs", [])
             )
 
             self._save_result(result)
+            scan_info["result"] = result
             return result
 
     async def run_scan_async(
@@ -343,7 +345,7 @@ class ScanManager:
             scan_info["error"] = error_msg
             scan_info["logs"].append(f"ERROR: {str(e)}")
             print(f"Scan {scan_id} failed: {error_msg}")
-            
+
             result = ScanResult(
                 scan_id=scan_id,
                 status="failed",
@@ -358,12 +360,20 @@ class ScanManager:
                 duration_s=0.0,
                 start_time=scan_info["created_at"],
                 end_time=datetime.utcnow().isoformat(),
-                findings=[]
+                findings=[],
+                logs=scan_info.get("logs", [])
             )
-            
+
             self._save_result(result)
+            scan_info["result"] = result
+
+            try:
+                get_code_ingester().cleanup(scan_id)
+            except Exception:
+                pass
+
             return result
-    
+
     def _save_result(self, result: ScanResult):
         """Save scan result to file"""
         # Save as JSON
