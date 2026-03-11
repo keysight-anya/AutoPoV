@@ -52,12 +52,12 @@ if ! command -v docker &> /dev/null; then
     echo "   sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
     echo ""
     echo "6. Add your user to docker group (to run docker without sudo):"
-    echo "   sudo usermod -aG docker \$USER"
+    echo "   sudo usermod -aG docker $USER"
     echo "   newgrp docker"
     echo ""
     exit 1
 else
-    print_info "Docker is already installed ✓"
+    print_info "Docker is already installed ?"
 fi
 
 # Check if Docker Compose is installed
@@ -66,7 +66,12 @@ if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/
     echo "It should be installed with Docker. Please check your Docker installation."
     exit 1
 else
-    print_info "Docker Compose is available ✓"
+    if command -v docker-compose &> /dev/null; then
+        COMPOSE_CMD="docker-compose"
+    else
+        COMPOSE_CMD="docker compose"
+    fi
+    print_info "Docker Compose is available ?"
 fi
 
 # Check if .env file exists
@@ -81,7 +86,7 @@ if [ ! -f .env ]; then
         exit 1
     fi
 else
-    print_info ".env file exists ✓"
+    print_info ".env file exists ?"
 fi
 
 # Check if OPENROUTER_API_KEY is set
@@ -100,20 +105,20 @@ echo ""
 echo "Next steps:"
 echo ""
 echo "1. Build and start the containers:"
-echo "   docker-compose up --build"
+echo "   $COMPOSE_CMD up --build"
 echo ""
 echo "2. Or run in detached mode (background):"
-echo "   docker-compose up --build -d"
+echo "   $COMPOSE_CMD up --build -d"
 echo ""
 echo "3. Access the applications:"
 echo "   - Backend API: http://localhost:8000"
 echo "   - Frontend UI: http://localhost:5173"
 echo ""
 echo "4. View logs:"
-echo "   docker-compose logs -f"
+echo "   $COMPOSE_CMD logs -f"
 echo ""
 echo "5. Stop the containers:"
-echo "   docker-compose down"
+echo "   $COMPOSE_CMD down"
 echo ""
 echo "6. To run a scan using Docker:"
 echo "   docker exec -it autopov-backend python -m cli.autopov scan <repo-url> --api-key <your-key>"

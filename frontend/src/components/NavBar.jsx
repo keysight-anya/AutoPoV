@@ -1,9 +1,30 @@
 import { Link, useLocation } from 'react-router-dom'
-import { Shield, Home, History, Settings, FileText } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { Shield, Home, History, Settings, FileText, BarChart } from 'lucide-react'
 
 function NavBar() {
   const location = useLocation()
-  
+    const [activeScanId, setActiveScanId] = useState(null)
+
+  useEffect(() => {
+    const raw = localStorage.getItem('autopov_active_scans')
+    if (!raw) {
+      setActiveScanId(null)
+      return
+    }
+    try {
+      const list = JSON.parse(raw)
+      if (Array.isArray(list) && list.length > 0) {
+        setActiveScanId(list[list.length - 1])
+      } else {
+        setActiveScanId(null)
+      }
+    } catch {
+      setActiveScanId(null)
+    }
+  }, [location.pathname])
+
+
   const isActive = (path) => {
     return location.pathname === path ? 'text-primary-500' : 'text-gray-400 hover:text-gray-200'
   }
@@ -33,6 +54,11 @@ function NavBar() {
               <span>Settings</span>
             </Link>
             
+
+            <Link to="/policy" className={`flex items-center space-x-1 ${isActive('/policy')}`}>
+              <BarChart className="w-4 h-4" />
+              <span>Policy</span>
+            </Link>
             <Link to="/docs" className={`flex items-center space-x-1 ${isActive('/docs')}`}>
               <FileText className="w-4 h-4" />
               <span>Docs</span>

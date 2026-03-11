@@ -176,6 +176,11 @@ try:
 {vulnerable_code}
 """
     
+    # Provide helpers for PoV scripts
+    vulnerable_code = vulnerable_code_context
+    target_url = "http://localhost"
+    TARGET_URL = target_url
+    
     # Execute vulnerable code in isolated namespace
     vulnerable_namespace = {{}}
     exec(vulnerable_code_context, vulnerable_namespace)
@@ -220,8 +225,8 @@ except Exception as e:
 '''
         
         # Escape the code to safely embed in the harness
-        escaped_vulnerable = vulnerable_function.replace('\\', '\\\\').replace('"""', '"\"\"').replace("'''", "'\'\'")
-        escaped_pov = pov_script.replace('\\', '\\\\').replace('"""', '"\"\"').replace("'''", "'\'\'")
+        escaped_vulnerable = vulnerable_function.replace('\\', '\\\\').replace('"""', '\\"\\"\\"').replace("'''", "\\'\\'\\'")
+        escaped_pov = pov_script.replace('\\', '\\\\').replace('"""', '\\"\\"\\"').replace("'''", "\\'\\'\\'")
         
         return harness.format(
             vulnerable_code=escaped_vulnerable,

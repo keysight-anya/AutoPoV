@@ -27,6 +27,12 @@ function ScanProgress() {
         }
 
         if (data.status === 'completed' || data.status === 'failed') {
+          try {
+            const raw = localStorage.getItem('autopov_active_scans')
+            const list = raw ? JSON.parse(raw) : []
+            const next = Array.isArray(list) ? list.filter(id => id !== scanId) : []
+            localStorage.setItem('autopov_active_scans', JSON.stringify(next))
+          } catch {}
           // Navigate to results after a delay
           setTimeout(() => {
             navigate(`/results/${scanId}`)

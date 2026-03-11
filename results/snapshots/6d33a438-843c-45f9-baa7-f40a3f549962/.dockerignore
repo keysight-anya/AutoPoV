@@ -1,0 +1,54 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info
+dist
+build
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data and Results (will be mounted as volumes)
+data/*
+!data/.gitkeep
+results/*
+!results/.gitkeep
+results/povs/*
+!results/povs/.gitkeep
+results/runs/*
+!results/runs/.gitkeep
+
+# Temporary files
+*.log
+*.tmp
+/tmp
+
+# Docker files themselves
+Dockerfile*
+docker-compose.yml
+.dockerignore
+
+# Node modules (for frontend)
+frontend/node_modules
+frontend/dist

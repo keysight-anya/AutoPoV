@@ -558,3 +558,4 @@ verifier = VulnerabilityVerifier()
 def get_verifier() -> VulnerabilityVerifier:
     """Get the global verifier instance"""
     return verifier
+

@@ -21,16 +21,16 @@ function Home() {
           response = await scanGit({
             url: data.gitUrl,
             branch: data.branch,
-            model: data.model,
-            cwes: data.cwes
+            cwes: data.cwes,
+            lite: data.lite
           })
           break
 
         case 'zip':
           const formData = new FormData()
           formData.append('file', file)
-          formData.append('model', data.model)
           formData.append('cwes', data.cwes.join(','))
+          formData.append('lite', data.lite ? 'true' : 'false')
           response = await scanZip(formData)
           break
 
@@ -39,8 +39,8 @@ function Home() {
             code: data.code,
             language: data.language,
             filename: data.filename,
-            model: data.model,
-            cwes: data.cwes
+            cwes: data.cwes,
+            lite: data.lite
           })
           break
 

@@ -1,0 +1,52 @@
+rules:
+  - id: php-sqli-simple
+    languages: [php]
+    message: Possible SQL injection (user input used in SQL query).
+    severity: ERROR
+    metadata:
+      cwe: [CWE-89]
+    pattern-either:
+      - pattern: mysqli_query(, [])
+      - pattern: mysqli_query(, [])
+      - pattern: ->query([])
+      - pattern: ->query([])
+
+  - id: php-xss-echo
+    languages: [php]
+    message: Possible XSS (unescaped user input echoed).
+    severity: WARNING
+    metadata:
+      cwe: [CWE-79]
+    pattern-either:
+      - pattern: echo [];
+      - pattern: echo [];
+      - pattern: print [];
+      - pattern: print [];
+
+  - id: php-command-injection
+    languages: [php]
+    message: Possible command injection (user input passed to exec).
+    severity: ERROR
+    metadata:
+      cwe: [CWE-78]
+    pattern-either:
+      - pattern: system([]);
+      - pattern: system([]);
+      - pattern: exec([]);
+      - pattern: exec([]);
+      - pattern: shell_exec([]);
+      - pattern: shell_exec([]);
+
+  - id: php-path-traversal
+    languages: [php]
+    message: Possible path traversal (user input used in file include/read).
+    severity: WARNING
+    metadata:
+      cwe: [CWE-22]
+    pattern-either:
+      - pattern: include([]);
+      - pattern: include([]);
+      - pattern: require([]);
+      - pattern: require([]);
+      - pattern: file_get_contents([]);
+      - pattern: file_get_contents([]);

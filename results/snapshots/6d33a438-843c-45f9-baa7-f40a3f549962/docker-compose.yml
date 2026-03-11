@@ -1,0 +1,32 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: autopov-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./results:/app/results
+      - ./.env:/app/.env:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - DOCKER_ENABLED=true
+      - CODEQL_CLI_PATH=/usr/local/bin/codeql
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: autopov-frontend
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend/.env:/app/.env:ro
+    depends_on:
+      - backend
+    restart: unless-stopped

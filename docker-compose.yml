@@ -12,10 +12,17 @@ services:
       - ./.env:/app/.env:ro
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
+      - DEBUG=false
       - API_HOST=0.0.0.0
       - API_PORT=8000
       - DOCKER_ENABLED=true
       - CODEQL_CLI_PATH=/usr/local/bin/codeql
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
     restart: unless-stopped
 
   frontend:
@@ -28,5 +35,6 @@ services:
     volumes:
       - ./frontend/.env:/app/.env:ro
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     restart: unless-stopped

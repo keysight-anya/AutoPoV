@@ -1,0 +1,14 @@
+[2026-03-06 16:04:41] This is codeql database analyze test-db --format=csv --output=results.csv codeql/cpp-queries:Security/CWE/CWE-120/OverrunWrite.ql
+[2026-03-06 16:04:41] Log file was started late.
+[2026-03-06 16:04:41] [PROGRESS] database analyze> Running queries.
+[2026-03-06 16:04:41] Running plumbing command: codeql database run-queries --evaluator-log-level=5 --warnings=show --qlconfig-file=/home/user/AutoPoV/qlconfig.yml --dynamic-join-order-mode=none --no-rerun --interpret-passthrough=null,--format=csv,-o=/home/user/AutoPoV/results.csv,--max-paths=4,--csv-location-format=line-column,--print-diagnostics-summary,--print-metrics-summary,--qlconfig-file=/home/user/AutoPoV/qlconfig.yml,--,/home/user/AutoPoV/test-db,codeql/cpp-queries:Security/CWE/CWE-120/OverrunWrite.ql -- /home/user/AutoPoV/test-db codeql/cpp-queries:Security/CWE/CWE-120/OverrunWrite.ql
+[2026-03-06 16:04:41] Calling plumbing command: codeql resolve ram --dataset=/home/user/AutoPoV/test-db/db-cpp --format=json
+[2026-03-06 16:04:41] [PROGRESS] resolve ram> Stringpool size measured as 2179482
+[2026-03-06 16:04:41] Plumbing command codeql resolve ram completed:
+                      [
+                        "-J-Xmx1800M",
+                        "--off-heap-ram=1421"
+                      ]
+[2026-03-06 16:04:41] Chaining via /tmp/codeql.bxlZxw10 to plumbing: execute queries -J-Xmx1800M --off-heap-ram=1421 --verbosity=progress --logdir=/home/user/AutoPoV/test-db/log --evaluator-log-level=5 --warnings=show --qlconfig-file=/home/user/AutoPoV/qlconfig.yml --dynamic-join-order-mode=none --no-rerun --interpret-passthrough=null,--format=csv,-o=/home/user/AutoPoV/results.csv,--max-paths=4,--csv-location-format=line-column,--print-diagnostics-summary,--print-metrics-summary,--qlconfig-file=/home/user/AutoPoV/qlconfig.yml,--,/home/user/AutoPoV/test-db,codeql/cpp-queries:Security/CWE/CWE-120/OverrunWrite.ql --output=/home/user/AutoPoV/test-db/results -- /home/user/AutoPoV/test-db/db-cpp codeql/cpp-queries:Security/CWE/CWE-120/OverrunWrite.ql
+[2026-03-06 16:04:41] Plumbing command codeql database run-queries completed with status 70.
+[2026-03-06 16:04:41] Exiting with code 70
