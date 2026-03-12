@@ -67,6 +67,8 @@ export const listApiKeys = (adminKey) =>
     headers: { Authorization: `Bearer ${adminKey}` }
   })
 
+export const cancelScan = (scanId) => apiClient.post(`/scan/${scanId}/cancel`)
+
 export default apiClient
 
 export const getLearningSummary = () => apiClient.get('/learning/summary')

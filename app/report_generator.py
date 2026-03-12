@@ -26,6 +26,31 @@ class ReportGeneratorError(Exception):
     pass
 
 
+def _safe(text: Any, max_len: int = 0) -> str:
+    """Sanitize any value to a plain latin-1-safe string for fpdf core fonts."""
+    if text is None:
+        return ""
+    s = str(text)
+    # Replace common problematic characters
+    replacements = {
+        "\u2019": "'", "\u2018": "'", "\u201c": '"', "\u201d": '"',
+        "\u2013": "-", "\u2014": "-", "\u2022": "-", "\u2026": "...",
+        "\u00e9": "e", "\u00e8": "e", "\u00ea": "e", "\u00eb": "e",
+        "\u00e0": "a", "\u00e1": "a", "\u00e2": "a", "\u00e3": "a",
+        "\u00f3": "o", "\u00f2": "o", "\u00f4": "o", "\u00f5": "o",
+        "\u00fa": "u", "\u00f9": "u", "\u00fb": "u",
+        "\u00ed": "i", "\u00ec": "i", "\u00ee": "i",
+        "\u00f1": "n", "\u00e7": "c",
+    }
+    for ch, rep in replacements.items():
+        s = s.replace(ch, rep)
+    # Strip any remaining non-latin-1 characters
+    s = s.encode("latin-1", errors="replace").decode("latin-1")
+    if max_len and len(s) > max_len:
+        s = s[:max_len - 3] + "..."
+    return s
+
+
 class ProfessionalPDFReport(FPDF):
     """Professional PDF report with modern design"""
     
@@ -76,7 +101,7 @@ class ProfessionalPDFReport(FPDF):
         """Add body text"""
         self.set_font('Arial', 'B' if bold else '', 10)
         self.set_text_color(75, 85, 99)
-        self.multi_cell(0, 5, text)
+        self.multi_cell(0, 5, _safe(text))
         self.ln(2)
     
     def metric_card(self, label: str, value: str, color: Tuple[int, int, int] = (59, 130, 246)):
@@ -118,9 +143,9 @@ class ProfessionalPDFReport(FPDF):
         self.set_text_color(226, 232, 240)
         self.set_font('Courier', '', 8)
         
-        lines = code.split('\n')[:max_lines]
+        lines = _safe(code).split('\n')[:max_lines]
         formatted_code = '\n'.join(lines)
-        if len(code.split('\n')) > max_lines:
+        if len(_safe(code).split('\n')) > max_lines:
             formatted_code += "\n\n... [truncated for brevity]"
         
         self.multi_cell(0, 4, formatted_code, fill=True)
@@ -224,8 +249,8 @@ class ReportGenerator:
                 "scan_id": result.scan_id,
                 "status": result.status,
                 "codebase": result.codebase_path,
-                "scan_started": result.started_at.isoformat() if hasattr(result, 'started_at') else None,
-                "scan_completed": result.completed_at.isoformat() if hasattr(result, 'completed_at') else None,
+                "scan_started": result.start_time if hasattr(result, 'start_time') else None,
+                "scan_completed": result.end_time if hasattr(result, 'end_time') else None,
                 "duration_seconds": result.duration_s,
                 "configuration": {
                     "model_mode": settings.MODEL_MODE,
@@ -307,8 +332,18 @@ class ReportGenerator:
         
         # Key findings summary
         pdf.subsection_header('Assessment Overview')
+        # Extract repo name from codebase path
+        codebase_name = result.codebase_path
+        if '/' in codebase_name:
+            parts = codebase_name.split('/')
+            # Get last meaningful part (repo name)
+            codebase_name = parts[-1] if parts[-1] else parts[-2] if len(parts) > 1 else codebase_name
+        # Remove .git suffix if present
+        if codebase_name.endswith('.git'):
+            codebase_name = codebase_name[:-4]
+        
         summary_text = (
-            f"This security assessment analyzed {os.path.basename(result.codebase_path)} "
+            f"This security assessment analyzed '{codebase_name}' "
             f"for {len(result.cwes)} vulnerability classes using AutoPoV's hybrid "
             f"agentic framework. The scan completed in {result.duration_s:.1f} seconds "
             f"with a total cost of ${result.total_cost_usd:.4f} USD."
@@ -340,35 +375,42 @@ class ReportGenerator:
         pdf.add_page()
         pdf.section_header('AI Model Usage')
         
+        # Use OpenRouter activity if available for actual model names
+        if openrouter_activity:
+            pdf.subsection_header('Actual Models Used (from OpenRouter)')
+            headers = ['Model', 'Requests', 'Tokens', 'Cost (USD)']
+            widths = [70, 30, 50, 40]
+            pdf.table_header(headers, widths)
+            
+            for i, activity in enumerate(openrouter_activity[:15]):  # Limit to 15 entries
+                cells = [
+                    _safe(activity.get('model', 'N/A'), 28),
+                    str(activity.get('requests', 0)),
+                    f"{activity.get('prompt_tokens', 0) + activity.get('completion_tokens', 0):,}",
+                    f"${activity.get('usage', 0):.6f}"
+                ]
+                pdf.table_row(cells, widths, alternate=(i % 2 == 1))
+            
+            pdf.ln(5)
+            pdf.set_font('Arial', 'I', 9)
+            pdf.set_text_color(100, 100, 100)
+            pdf.cell(0, 6, f"Total API calls: {len(openrouter_activity)} | Data from OpenRouter activity API", 0, 1)
+        
+        # Show internal model tracking
         if models_used:
-            pdf.subsection_header('Models Deployed')
-            headers = ['Model', 'Roles', 'Findings', 'Cost (USD)']
+            pdf.ln(10)
+            pdf.subsection_header('Internal Model Tracking')
+            headers = ['Model/Router', 'Roles', 'Findings', 'Cost (USD)']
             widths = [70, 50, 30, 40]
             pdf.table_header(headers, widths)
             
             for i, model in enumerate(models_used):
                 roles = ', '.join(model.get('roles', []))
                 cells = [
-                    model.get('model', 'N/A')[:25],
-                    roles[:20],
+                    _safe(model.get('model', 'N/A'), 25),
+                    _safe(roles, 20),
                     str(model.get('findings_count', 0)),
                     f"${model.get('total_cost_usd', 0):.6f}"
-                ]
-                pdf.table_row(cells, widths, alternate=(i % 2 == 1))
-        
-        if openrouter_activity:
-            pdf.ln(10)
-            pdf.subsection_header('OpenRouter Activity')
-            headers = ['Model', 'Requests', 'Tokens', 'Cost (USD)']
-            widths = [70, 30, 50, 40]
-            pdf.table_header(headers, widths)
-            
-            for i, activity in enumerate(openrouter_activity[:10]):  # Limit to 10 entries
-                cells = [
-                    activity.get('model', 'N/A')[:25],
-                    str(activity.get('requests', 0)),
-                    f"{activity.get('prompt_tokens', 0) + activity.get('completion_tokens', 0):,}",
-                    f"${activity.get('usage', 0):.6f}"
                 ]
                 pdf.table_row(cells, widths, alternate=(i % 2 == 1))
         
@@ -387,19 +429,19 @@ class ReportGenerator:
                 cwe = finding.get('cwe_type', 'Unknown')
                 pdf.set_font('Arial', 'B', 12)
                 pdf.set_text_color(239, 68, 68)
-                pdf.cell(0, 8, f"Finding #{i}: {cwe}", 0, 1)
+                pdf.cell(0, 8, _safe(f"Finding #{i}: {cwe}"), 0, 1)
                 
                 # Location
                 pdf.set_font('Arial', '', 10)
                 pdf.set_text_color(75, 85, 99)
                 filepath = finding.get('filepath', 'N/A')
                 line = finding.get('line_number', 'N/A')
-                pdf.cell(0, 6, f"Location: {filepath}:{line}", 0, 1)
+                pdf.cell(0, 6, _safe(f"Location: {filepath}:{line}"), 0, 1)
                 
                 # Confidence and model
                 confidence = finding.get('confidence', 0)
                 model_used = finding.get('model_used', 'N/A')
-                pdf.cell(0, 6, f"Confidence: {confidence:.2f} | Detected by: {model_used}", 0, 1)
+                pdf.cell(0, 6, _safe(f"Confidence: {confidence:.2f} | Detected by: {model_used}"), 0, 1)
                 pdf.ln(2)
                 
                 # Explanation
@@ -408,25 +450,72 @@ class ReportGenerator:
                 pdf.cell(0, 6, 'Vulnerability Description:', 0, 1)
                 pdf.set_font('Arial', '', 10)
                 pdf.set_text_color(75, 85, 99)
-                pdf.multi_cell(0, 5, finding.get('llm_explanation', 'No explanation available.'))
+                pdf.multi_cell(0, 5, _safe(finding.get('llm_explanation', 'No explanation available.')))
                 pdf.ln(3)
                 
-                # PoV Status
+                # PoV Status and Validation Evidence
                 pov_result = finding.get('pov_result') or {}
                 validation = finding.get('validation_result') or {}
                 
                 triggered = pov_result.get('vulnerability_triggered', False)
                 status_color = (34, 197, 94) if triggered else (245, 158, 11)
-                status_text = "TRIGGERED" if triggered else "NOT TRIGGERED"
+                status_text = "CONFIRMED - VULNERABILITY TRIGGERED" if triggered else "NOT TRIGGERED"
                 
-                pdf.set_font('Arial', 'B', 10)
+                pdf.set_font('Arial', 'B', 11)
                 pdf.set_text_color(*status_color)
-                pdf.cell(0, 6, f"PoV Status: {status_text}", 0, 1)
+                pdf.cell(0, 7, f"Validation Result: {status_text}", 0, 1)
+                
+                # Validation details
+                pdf.set_font('Arial', '', 10)
+                pdf.set_text_color(75, 85, 99)
                 
                 if validation.get('validation_method'):
-                    pdf.set_text_color(75, 85, 99)
-                    pdf.set_font('Arial', '', 10)
                     pdf.cell(0, 6, f"Validation Method: {validation.get('validation_method')}", 0, 1)
+                
+                if validation.get('execution_time_s'):
+                    pdf.cell(0, 6, f"Execution Time: {validation.get('execution_time_s'):.2f} seconds", 0, 1)
+                
+                pdf.ln(2)
+                
+                # Validation Evidence/Reasoning
+                pdf.set_font('Arial', 'B', 10)
+                pdf.set_text_color(51, 65, 85)
+                pdf.cell(0, 6, 'Validation Evidence:', 0, 1)
+                pdf.set_font('Arial', '', 10)
+                pdf.set_text_color(75, 85, 99)
+                
+                if triggered:
+                    evidence_text = (
+                        "The PoV script successfully demonstrated the vulnerability by executing "
+                        "exploitation code that confirmed the security weakness. "
+                    )
+                    if validation.get('stdout'):
+                        evidence_text += "The execution produced expected output indicating successful exploitation."
+                else:
+                    evidence_text = (
+                        "The PoV script did not trigger the vulnerability. This could mean:\n"
+                        "- The vulnerability requires specific conditions not met in the test environment\n"
+                        "- The vulnerability is context-dependent and the PoV needs refinement\n"
+                        "- The finding may be a false positive that requires manual review"
+                    )
+                pdf.multi_cell(0, 5, _safe(evidence_text))
+                
+                # Show stdout/stderr if available
+                if validation.get('stdout') or validation.get('stderr'):
+                    pdf.ln(2)
+                    pdf.set_font('Arial', 'B', 10)
+                    pdf.set_text_color(51, 65, 85)
+                    pdf.cell(0, 6, 'Execution Output:', 0, 1)
+                    
+                    if validation.get('stdout'):
+                        pdf.set_font('Arial', 'I', 9)
+                        pdf.cell(0, 5, 'Standard Output:', 0, 1)
+                        pdf.code_block(validation.get('stdout'), max_lines=10)
+                    
+                    if validation.get('stderr'):
+                        pdf.set_font('Arial', 'I', 9)
+                        pdf.cell(0, 5, 'Standard Error:', 0, 1)
+                        pdf.code_block(validation.get('stderr'), max_lines=10)
                 
                 # PoV Script (if available)
                 if finding.get('pov_script'):
@@ -439,26 +528,56 @@ class ReportGenerator:
                 pdf.ln(5)
         
         # ===== FALSE POSITIVES =====
+        pdf.add_page()
+        pdf.section_header('False Positives Analysis')
+        
         if result.false_positives > 0:
-            pdf.add_page()
-            pdf.section_header('False Positives')
+            false_positives = [f for f in (result.findings or []) if f.get('final_status') == 'skipped']
             
-            false_positives = [f for f in (result.findings or []) if f.get('final_status') == 'false_positive']
+            pdf.body_text(
+                f"The following {len(false_positives)} finding(s) were classified as false positives "
+                f"after automated analysis. These represent initial alerts that were determined "
+                f"not to be actual vulnerabilities."
+            )
+            pdf.ln(3)
             
             for i, finding in enumerate(false_positives, 1):
-                if pdf.get_y() > 260:
+                if pdf.get_y() > 240:
                     pdf.add_page()
                 
                 cwe = finding.get('cwe_type', 'Unknown')
-                pdf.set_font('Arial', 'B', 11)
+                pdf.set_font('Arial', 'B', 12)
                 pdf.set_text_color(245, 158, 11)
-                pdf.cell(0, 7, f"#{i}: {cwe}", 0, 1)
+                pdf.cell(0, 8, _safe(f"False Positive #{i}: {cwe}"), 0, 1)
                 
                 pdf.set_font('Arial', '', 10)
                 pdf.set_text_color(75, 85, 99)
-                pdf.cell(0, 6, f"Location: {finding.get('filepath', 'N/A')}:{finding.get('line_number', 'N/A')}", 0, 1)
-                pdf.multi_cell(0, 5, f"Reason: {finding.get('llm_explanation', 'No explanation')}")
-                pdf.ln(3)
+                pdf.cell(0, 6, _safe(f"File: {finding.get('filepath', 'N/A')}"), 0, 1)
+                pdf.cell(0, 6, _safe(f"Line: {finding.get('line_number', 'N/A')}"), 0, 1)
+                
+                confidence = finding.get('confidence', 0)
+                model_used = finding.get('model_used', 'N/A')
+                pdf.cell(0, 6, _safe(f"Initial Confidence: {confidence:.2f} | Analyzed by: {model_used}"), 0, 1)
+                pdf.ln(2)
+                
+                pdf.set_font('Arial', 'B', 10)
+                pdf.set_text_color(51, 65, 85)
+                pdf.cell(0, 6, 'Why this was marked as false positive:', 0, 1)
+                pdf.set_font('Arial', '', 10)
+                pdf.set_text_color(75, 85, 99)
+                pdf.multi_cell(0, 5, _safe(finding.get('llm_explanation', 'No explanation available.')))
+                
+                # Show the code that was flagged
+                if finding.get('code_chunk'):
+                    pdf.ln(2)
+                    pdf.set_font('Arial', 'B', 10)
+                    pdf.set_text_color(51, 65, 85)
+                    pdf.cell(0, 6, 'Flagged Code:', 0, 1)
+                    pdf.code_block(finding.get('code_chunk'), max_lines=15)
+                
+                pdf.ln(5)
+        else:
+            pdf.body_text("No false positives were identified in this scan.")
         
         # ===== METHODOLOGY =====
         pdf.add_page()

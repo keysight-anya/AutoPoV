@@ -152,11 +152,13 @@ class SourceHandler:
         for file_path in file_paths:
             if os.path.isfile(file_path):
                 if preserve_structure:
-                    # Use original filename
-                    dest_path = os.path.join(source_dir, os.path.basename(file_path))
+                    # Preserve relative path structure under source_dir
+                    rel = os.path.relpath(file_path)
+                    dest_path = os.path.join(source_dir, rel)
+                    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
                 else:
                     dest_path = os.path.join(source_dir, os.path.basename(file_path))
-                
+
                 shutil.copy2(file_path, dest_path)
         
         return source_dir

@@ -2,270 +2,360 @@
 
 <cite>
 **Referenced Files in This Document**
-- [README.md](file://autopov/README.md)
-- [requirements.txt](file://autopov/requirements.txt)
-- [package.json](file://autopov/frontend/package.json)
-- [run.sh](file://autopov/run.sh)
-- [main.py](file://autopov/app/main.py)
-- [config.py](file://autopov/app/config.py)
-- [client.js](file://autopov/frontend/src/api/client.js)
-- [Home.jsx](file://autopov/frontend/src/pages/Home.jsx)
-- [Settings.jsx](file://autopov/frontend/src/pages/Settings.jsx)
-- [vite.config.js](file://autopov/frontend/vite.config.js)
-- [autopov.py](file://autopov/cli/autopov.py)
-- [analyse.py](file://autopov/analyse.py)
+- [README.md](file://README.md)
+- [requirements.txt](file://requirements.txt)
+- [frontend/package.json](file://frontend/package.json)
+- [Dockerfile.backend](file://Dockerfile.backend)
+- [Dockerfile.frontend](file://Dockerfile.frontend)
+- [docker-compose.yml](file://docker-compose.yml)
+- [app/config.py](file://app/config.py)
+- [app/main.py](file://app/main.py)
+- [cli/autopov.py](file://cli/autopov.py)
+- [run.sh](file://run.sh)
+- [start-all.sh](file://start-all.sh)
+- [frontend/src/App.jsx](file://frontend/src/App.jsx)
+- [frontend/src/pages/Home.jsx](file://frontend/src/pages/Home.jsx)
 </cite>
 
 ## Table of Contents
 1. [Introduction](#introduction)
-2. [Project Structure](#project-structure)
-3. [Prerequisites](#prerequisites)
-4. [Installation](#installation)
-5. [Quick Start Tutorial](#quick-start-tutorial)
-6. [Initial Configuration](#initial-configuration)
-7. [Common Usage Patterns](#common-usage-patterns)
-8. [Architecture Overview](#architecture-overview)
-9. [Troubleshooting Guide](#troubleshooting-guide)
-10. [Conclusion](#conclusion)
+2. [Prerequisites](#prerequisites)
+3. [Installation](#installation)
+4. [Environment Configuration](#environment-configuration)
+5. [Quick Start](#quick-start)
+6. [First Scan Workflow](#first-scan-workflow)
+7. [Architecture Overview](#architecture-overview)
+8. [Dependency Analysis](#dependency-analysis)
+9. [Performance Considerations](#performance-considerations)
+10. [Troubleshooting Guide](#troubleshooting-guide)
+11. [Conclusion](#conclusion)
 
 ## Introduction
-AutoPoV is a full-stack research prototype that combines static analysis (CodeQL, Joern) with AI-powered reasoning (LLMs via LangGraph) to detect, verify, and benchmark vulnerabilities. It provides:
-- A React-based web UI for interactive scanning
-- A FastAPI backend exposing REST endpoints
-- A CLI for automation and scripting
-- Support for multiple CWE families (buffer overflow, SQL injection, use-after-free, integer overflow)
-- Docker-based Proof-of-Vulnerability (PoV) execution for safe verification
-
-## Project Structure
-The project is organized into distinct layers:
-- Backend: FastAPI application with authentication, scan orchestration, and API endpoints
-- Agents: LangGraph components for code ingestion, investigation, verification, and Docker execution
-- Frontend: React application with Vite and Tailwind for the web UI
-- CLI: Click-based command-line interface for automation
-- Supporting assets: CodeQL queries, test suite, and analysis utilities
-
-```mermaid
-graph TB
-subgraph "Backend"
-A["FastAPI App<br/>app/main.py"]
-B["Configuration<br/>app/config.py"]
-C["Agent Graph<br/>agents/*"]
-end
-subgraph "Frontend"
-D["React App<br/>frontend/src/*"]
-E["Vite Proxy<br/>frontend/vite.config.js"]
-end
-subgraph "CLI"
-F["Click CLI<br/>cli/autopov.py"]
-end
-subgraph "Supporting"
-G["CodeQL Queries<br/>codeql_queries/*.ql"]
-H["Analysis<br/>analyse.py"]
-end
-D --> |"HTTP API"| A
-F --> |"HTTP API"| A
-A --> B
-A --> C
-E --> |"Proxy /api"| A
-H --> |"CSV/JSON Reports"| A
-```
-
-**Diagram sources**
-- [main.py](file://autopov/app/main.py#L102-L118)
-- [config.py](file://autopov/app/config.py#L13-L116)
-- [client.js](file://autopov/frontend/src/api/client.js#L1-L25)
-- [vite.config.js](file://autopov/frontend/vite.config.js#L7-L15)
-- [autopov.py](file://autopov/cli/autopov.py#L26-L27)
-- [analyse.py](file://autopov/analyse.py#L42-L44)
-
-**Section sources**
-- [README.md](file://autopov/README.md#L17-L35)
-- [main.py](file://autopov/app/main.py#L102-L118)
-- [config.py](file://autopov/app/config.py#L13-L116)
-- [client.js](file://autopov/frontend/src/api/client.js#L1-L25)
-- [vite.config.js](file://autopov/frontend/vite.config.js#L7-L15)
-- [autopov.py](file://autopov/cli/autopov.py#L26-L27)
-- [analyse.py](file://autopov/analyse.py#L42-L44)
+AutoPoV is an autonomous vulnerability research platform that orchestrates multi-agent workflows to discover, analyze, exploit, and validate security issues without human intervention. It supports web UI, CLI, and REST API entry points, integrates with LLM providers, static analysis tools, and Docker for sandboxed exploit execution.
 
 ## Prerequisites
 Before installing AutoPoV, ensure your environment meets the following requirements:
-- Python 3.11+ for the backend and CLI
-- Node.js 20+ for the frontend development server
-- Docker Desktop for PoV execution
-- Optional: CodeQL CLI and/or Joern for enhanced static analysis
+- Python 3.11 or newer (backend)
+- Node.js 20 or newer (frontend)
+- Docker Desktop (required for sandboxed exploit execution)
+- OpenRouter API key (for online LLM reasoning)
+- Optional: CodeQL CLI and Joern for enhanced static analysis
 
-These prerequisites are documented in the project's quick start guide and enforced by the startup scripts.
+These prerequisites are documented in the project’s quick start guide and configuration reference.
 
 **Section sources**
-- [README.md](file://autopov/README.md#L39-L45)
-- [run.sh](file://autopov/run.sh#L36-L56)
+- [README.md:130-140](file://README.md#L130-L140)
+- [README.md:288-328](file://README.md#L288-L328)
 
 ## Installation
-Follow these steps to set up AutoPoV locally:
+AutoPoV provides multiple installation approaches. Choose the one that best fits your environment.
 
-1. Clone the repository and enter the project directory
-2. Create and activate a Python virtual environment
-3. Install Python dependencies from requirements.txt
-4. Install frontend dependencies using npm
-5. Configure environment variables by copying .env.example to .env and adding your API keys
-
-The run.sh script automates dependency installation and environment setup, including virtual environment creation and Node.js dependency installation.
+### Option A: Local Python + Node (Development)
+- Create and activate a Python virtual environment
+- Install Python dependencies
+- Install frontend dependencies
 
 ```mermaid
 flowchart TD
-Start(["Start"]) --> Clone["Clone repository"]
-Clone --> Venv["Create Python venv"]
-Venv --> Pip["Install Python deps"]
-Pip --> Npm["Install frontend deps"]
-Npm --> Env["Copy .env and configure keys"]
-Env --> Ready(["Ready"])
+Start(["Start"]) --> CheckPy["Check Python 3.11+"]
+CheckPy --> Venv["Create venv and activate"]
+Venv --> Pip["Install Python deps from requirements.txt"]
+Pip --> CheckNode["Check Node.js 20+"]
+CheckNode --> Npm["Install frontend deps"]
+Npm --> Ready(["Ready"])
 ```
 
 **Diagram sources**
-- [run.sh](file://autopov/run.sh#L58-L75)
-- [run.sh](file://autopov/run.sh#L108-L117)
-- [run.sh](file://autopov/run.sh#L84-L90)
+- [run.sh:36-75](file://run.sh#L36-L75)
+- [requirements.txt:1-44](file://requirements.txt#L1-L44)
+- [frontend/package.json:1-34](file://frontend/package.json#L1-L34)
 
 **Section sources**
-- [README.md](file://autopov/README.md#L47-L74)
-- [run.sh](file://autopov/run.sh#L58-L75)
-- [run.sh](file://autopov/run.sh#L108-L117)
-- [requirements.txt](file://autopov/requirements.txt#L1-L42)
-- [package.json](file://autopov/frontend/package.json#L6-L11)
+- [run.sh:36-118](file://run.sh#L36-L118)
+- [requirements.txt:1-44](file://requirements.txt#L1-L44)
+- [frontend/package.json:1-34](file://frontend/package.json#L1-L34)
 
-## Quick Start Tutorial
-Begin scanning immediately using the web UI, CLI, or API:
+### Option B: Dockerized Backend + Local Frontend
+- Build and run the backend container with Docker Compose
+- Install frontend dependencies locally
+- Start the frontend dev server
 
-- Web UI: Start both backend and frontend, then open http://localhost:5173. Enter your API key in Settings and use the form to select scan type (Git, ZIP, or Paste), model, and CWEs.
-- CLI: Use autopov scan to target Git repositories, local directories, or ZIP archives. Use autopov results and autopov report to inspect outcomes.
-- API: Use curl to POST scan requests to /api/scan/git, /api/scan/zip, or /api/scan/paste, then GET /api/scan/{scan_id} for status and results.
+```mermaid
+flowchart TD
+DStart(["Docker Compose"]) --> Build["Build backend image"]
+Build --> Up["docker-compose up backend"]
+Up --> Health["Wait for /api/health"]
+Health --> FE["Install frontend deps locally"]
+FE --> Dev["npm run dev (frontend)"]
+Dev --> Done(["Ready"])
+```
 
-The run.sh script provides convenient shortcuts to start backend-only, frontend-only, or both services.
+**Diagram sources**
+- [docker-compose.yml:1-41](file://docker-compose.yml#L1-L41)
+- [Dockerfile.backend:1-64](file://Dockerfile.backend#L1-L64)
+- [Dockerfile.frontend:1-29](file://Dockerfile.frontend#L1-L29)
+- [start-all.sh:32-62](file://start-all.sh#L32-L62)
+
+**Section sources**
+- [docker-compose.yml:1-41](file://docker-compose.yml#L1-L41)
+- [Dockerfile.backend:1-64](file://Dockerfile.backend#L1-L64)
+- [Dockerfile.frontend:1-29](file://Dockerfile.frontend#L1-L29)
+- [start-all.sh:32-62](file://start-all.sh#L32-L62)
+
+## Environment Configuration
+AutoPoV uses environment variables to configure runtime behavior. At minimum, create a .env file and set the required variables.
+
+- Copy the example environment file
+- Edit .env to include:
+  - OPENROUTER_API_KEY
+  - ADMIN_API_KEY
+  - MODEL_MODE (online or offline)
+  - ROUTING_MODE (auto, fixed, learning)
+  - Optional: OLLAMA_BASE_URL, MAX_COST_USD, DOCKER_ENABLED, etc.
+
+```mermaid
+flowchart TD
+EnvStart(["Create .env"]) --> Required["Set OPENROUTER_API_KEY<br/>ADMIN_API_KEY<br/>MODEL_MODE"]
+Required --> Optional["Set ROUTING_MODE<br/>Optional tools and limits"]
+Optional --> Load["App loads via pydantic Settings"]
+Load --> Validate["Runtime checks for Docker/CodeQL/Joern"]
+Validate --> Ready(["Ready"])
+```
+
+**Diagram sources**
+- [app/config.py:13-255](file://app/config.py#L13-L255)
+
+**Section sources**
+- [README.md:158-169](file://README.md#L158-L169)
+- [app/config.py:13-255](file://app/config.py#L13-L255)
+
+## Quick Start
+Choose your preferred entry point to begin scanning.
+
+### Web UI
+- Open the dashboard at http://localhost:5173
+- Navigate to Settings and enter your API key
+- Select a scan input (Git URL, ZIP upload, or paste code)
+- Choose CWE targets and submit
+- Monitor live logs and review results
 
 ```mermaid
 sequenceDiagram
-participant User as "User"
-participant UI as "Web UI"
-participant API as "FastAPI"
-participant Agent as "Scan Manager"
-User->>UI : "Submit scan form"
-UI->>API : "POST /api/scan/git"
-API->>Agent : "Create and schedule scan"
-Agent-->>API : "scan_id"
-API-->>UI : "scan_id"
-UI-->>User : "Navigate to scan progress"
+participant U as "User"
+participant F as "Frontend"
+participant B as "Backend"
+U->>F : "Enter API key and scan settings"
+F->>B : "POST /api/scan/*"
+B-->>F : "scan_id"
+U->>F : "View progress and results"
 ```
 
 **Diagram sources**
-- [Home.jsx](file://autopov/frontend/src/pages/Home.jsx#L12-L56)
-- [client.js](file://autopov/frontend/src/api/client.js#L30-L36)
-- [main.py](file://autopov/app/main.py#L175-L216)
+- [frontend/src/pages/Home.jsx:12-56](file://frontend/src/pages/Home.jsx#L12-L56)
+- [app/main.py:204-401](file://app/main.py#L204-L401)
 
 **Section sources**
-- [README.md](file://autopov/README.md#L75-L144)
-- [run.sh](file://autopov/run.sh#L120-L161)
-- [Home.jsx](file://autopov/frontend/src/pages/Home.jsx#L12-L56)
-- [client.js](file://autopov/frontend/src/api/client.js#L30-L36)
-- [main.py](file://autopov/app/main.py#L175-L216)
+- [README.md:198-208](file://README.md#L198-L208)
+- [frontend/src/pages/Home.jsx:12-56](file://frontend/src/pages/Home.jsx#L12-L56)
+- [app/main.py:204-401](file://app/main.py#L204-L401)
 
-## Initial Configuration
-Set up your environment and API keys:
+### CLI
+- Generate an API key (admin only)
+- Run scans from the terminal for Git repos, ZIP archives, or pasted code
+- View results, history, and reports
 
-- Backend environment: Copy .env.example to .env and add required keys (e.g., OPENROUTER_API_KEY for online mode, ADMIN_API_KEY for admin operations).
-- Frontend API key: Enter your API key in the Settings page or set it via environment variable (VITE_API_KEY) or localStorage.
-- Model selection: Choose online (OpenRouter) or offline (Ollama) mode and specify MODEL_NAME in .env.
+```mermaid
+sequenceDiagram
+participant U as "User"
+participant CLI as "CLI"
+participant B as "Backend"
+U->>CLI : "autopov keys generate ..."
+CLI->>B : "POST /api/keys/generate"
+B-->>CLI : "apov_* key"
+U->>CLI : "autopov scan <source>"
+CLI->>B : "POST /api/scan/*"
+B-->>CLI : "scan_id"
+CLI-->>U : "Results and metrics"
+```
 
-The configuration module validates environment variables and checks tool availability (Docker, CodeQL, Joern).
+**Diagram sources**
+- [cli/autopov.py:685-723](file://cli/autopov.py#L685-L723)
+- [cli/autopov.py:139-240](file://cli/autopov.py#L139-L240)
+- [app/main.py:204-401](file://app/main.py#L204-L401)
+
+**Section sources**
+- [README.md:179-193](file://README.md#L179-L193)
+- [README.md:209-244](file://README.md#L209-L244)
+- [cli/autopov.py:139-240](file://cli/autopov.py#L139-L240)
+- [cli/autopov.py:685-723](file://cli/autopov.py#L685-L723)
+
+### REST API
+- Use the interactive docs at http://localhost:8000/api/docs
+- Trigger scans, poll progress, stream logs, and download reports
+- Admin endpoints for key management and cleanup
+
+```mermaid
+sequenceDiagram
+participant C as "Client"
+participant B as "Backend"
+C->>B : "POST /api/scan/git"
+B-->>C : "{scan_id}"
+C->>B : "GET /api/scan/{scan_id}/stream"
+B-->>C : "SSE logs"
+C->>B : "GET /api/report/{scan_id}?format=pdf"
+B-->>C : "PDF attachment"
+```
+
+**Diagram sources**
+- [app/main.py:204-644](file://app/main.py#L204-L644)
+
+**Section sources**
+- [README.md:245-284](file://README.md#L245-L284)
+- [app/main.py:204-644](file://app/main.py#L204-L644)
+
+## First Scan Workflow
+Follow this end-to-end workflow to run your first scan from input selection to result interpretation.
 
 ```mermaid
 flowchart TD
-A[".env present?"] --> |No| B["Copy .env.example to .env"]
-A --> |Yes| C["Load settings"]
-C --> D["Check Docker/CodeQL/Joern"]
-D --> E["Start services"]
+A["Select Input Source"] --> B["Provide API Key"]
+B --> C["Submit Scan Request"]
+C --> D["Backend validates and queues"]
+D --> E["Agent Graph executes stages"]
+E --> F["Static Analysis + LLM Scout"]
+F --> G["Investigator + PoV Generation"]
+G --> H["Validation (static/unit/Docker)"]
+H --> I["Store Results and Reports"]
+I --> J["View in Web UI / CLI / REST"]
 ```
 
 **Diagram sources**
-- [run.sh](file://autopov/run.sh#L84-L90)
-- [config.py](file://autopov/app/config.py#L123-L172)
+- [README.md:34-69](file://README.md#L34-L69)
+- [app/main.py:204-401](file://app/main.py#L204-L401)
+- [frontend/src/pages/Home.jsx:12-56](file://frontend/src/pages/Home.jsx#L12-L56)
 
 **Section sources**
-- [README.md](file://autopov/README.md#L69-L100)
-- [run.sh](file://autopov/run.sh#L84-L90)
-- [config.py](file://autopov/app/config.py#L13-L116)
-- [client.js](file://autopov/frontend/src/api/client.js#L5-L8)
-- [Settings.jsx](file://autopov/frontend/src/pages/Settings.jsx#L63-L108)
-
-## Common Usage Patterns
-Perform typical scanning tasks:
-
-- Scan a Git repository: Use the web UI form or CLI autopov scan with a Git URL and optional branch.
-- Scan a local directory: Package the directory as a ZIP or use the CLI to zip and upload.
-- Scan raw code: Paste code into the web UI or use the CLI with paste mode.
-- Generate reports: Use autopov report to download JSON or PDF reports for a given scan_id.
-
-The CLI supports waiting for completion and displaying results in table or JSON formats.
-
-**Section sources**
-- [README.md](file://autopov/README.md#L102-L126)
-- [autopov.py](file://autopov/cli/autopov.py#L104-L210)
-- [autopov.py](file://autopov/cli/autopov.py#L229-L291)
+- [README.md:34-69](file://README.md#L34-L69)
+- [app/main.py:204-401](file://app/main.py#L204-L401)
+- [frontend/src/pages/Home.jsx:12-56](file://frontend/src/pages/Home.jsx#L12-L56)
 
 ## Architecture Overview
-AutoPoV integrates a React frontend, FastAPI backend, LangGraph agents, and optional static analysis tools:
+AutoPoV consists of:
+- Backend: FastAPI application exposing REST endpoints and managing agent orchestration
+- Frontend: React-based dashboard for UI interactions
+- CLI: Command-line interface mirroring backend capabilities
+- Configuration: Environment-driven settings with runtime tool availability checks
 
 ```mermaid
 graph TB
 subgraph "Frontend"
-FE["React Pages<br/>Home.jsx, Settings.jsx"]
-AX["Axios Client<br/>client.js"]
+FE_App["React App"]
+FE_Routes["Routes"]
 end
 subgraph "Backend"
-API["FastAPI Endpoints<br/>main.py"]
-CFG["Settings & Tools<br/>config.py"]
+API["FastAPI App"]
+CFG["Settings (pydantic)"]
+AUTH["Auth + Rate Limit"]
+SCAN["Scan Manager"]
+WEB["Webhook Handler"]
+REP["Report Generator"]
 end
-subgraph "Agents"
-INV["Investigator"]
-VER["Verifier"]
-DR["Docker Runner"]
+subgraph "External"
+OR["OpenRouter API"]
+OLL["Ollama"]
+DOCK["Docker Engine"]
+CODE["CodeQL"]
+JOE["Joern"]
 end
-FE --> AX --> API
+FE_App --> API
+FE_Routes --> API
 API --> CFG
-API --> INV
-API --> VER
-VER --> DR
+API --> AUTH
+API --> SCAN
+API --> WEB
+API --> REP
+CFG --> OR
+CFG --> OLL
+SCAN --> DOCK
+SCAN --> CODE
+SCAN --> JOE
 ```
 
 **Diagram sources**
-- [Home.jsx](file://autopov/frontend/src/pages/Home.jsx#L1-L108)
-- [Settings.jsx](file://autopov/frontend/src/pages/Settings.jsx#L1-L119)
-- [client.js](file://autopov/frontend/src/api/client.js#L1-L69)
-- [main.py](file://autopov/app/main.py#L175-L314)
-- [config.py](file://autopov/app/config.py#L13-L116)
+- [app/main.py:114-131](file://app/main.py#L114-L131)
+- [app/config.py:13-255](file://app/config.py#L13-L255)
+- [frontend/src/App.jsx:1-33](file://frontend/src/App.jsx#L1-L33)
 
 **Section sources**
-- [README.md](file://autopov/README.md#L17-L35)
-- [main.py](file://autopov/app/main.py#L175-L314)
-- [config.py](file://autopov/app/config.py#L13-L116)
-- [client.js](file://autopov/frontend/src/api/client.js#L1-L69)
+- [app/main.py:114-131](file://app/main.py#L114-L131)
+- [app/config.py:13-255](file://app/config.py#L13-L255)
+- [frontend/src/App.jsx:1-33](file://frontend/src/App.jsx#L1-L33)
+
+## Dependency Analysis
+Key runtime dependencies and their roles:
+- FastAPI and Uvicorn for the REST API
+- LangChain/LangGraph for agent orchestration
+- ChromaDB for vector storage
+- Docker SDK for sandboxed execution
+- Requests for CLI HTTP calls
+- React + Vite for the frontend
+
+```mermaid
+graph LR
+PY["Python Backend"] --> FA["FastAPI"]
+PY --> LC["LangChain / LangGraph"]
+PY --> CD["ChromaDB"]
+PY --> DK["Docker SDK"]
+PY --> PR["pydantic-settings"]
+FE["Frontend"] --> AX["axios"]
+FE --> RT["react-router-dom"]
+FE --> RC["recharts"]
+```
+
+**Diagram sources**
+- [requirements.txt:1-44](file://requirements.txt#L1-L44)
+- [frontend/package.json:12-19](file://frontend/package.json#L12-L19)
+
+**Section sources**
+- [requirements.txt:1-44](file://requirements.txt#L1-L44)
+- [frontend/package.json:12-19](file://frontend/package.json#L12-L19)
+
+## Performance Considerations
+- Cost control: Adjust MAX_COST_USD to limit per-scan spending
+- Routing modes: Use auto, fixed, or learning routing to balance cost and accuracy
+- Lite scans: Reduce analysis depth for faster results when appropriate
+- Tool availability: Ensure Docker, CodeQL, and Joern are available to unlock advanced capabilities
+
+[No sources needed since this section provides general guidance]
 
 ## Troubleshooting Guide
-Common setup and runtime issues:
+Common setup issues and verification steps:
 
-- Missing Python or Node.js: The run.sh script checks for Python 3 and Node.js and exits if not found.
-- Missing .env: The backend startup copies .env.example and instructs you to add API keys.
-- Docker not available: The configuration module detects Docker availability; disable Docker execution if Docker is not installed.
-- Port conflicts: Backend runs on port 8000, frontend on 5173; adjust vite.config.js or run.sh if ports are in use.
-- API key errors: Ensure ADMIN_API_KEY is set for admin operations and your user API key is configured in the web UI or CLI.
+- Missing .env or API keys
+  - Copy the example file and add OPENROUTER_API_KEY and ADMIN_API_KEY
+  - Verify MODEL_MODE and ROUTING_MODE are set appropriately
 
-Use the health endpoint to verify service readiness and tool availability.
+- Port conflicts
+  - Backend runs on 8000; frontend on 5173
+  - Change ports in configuration if needed
+
+- Docker not available
+  - The backend health endpoint reports docker_available
+  - Ensure Docker Desktop is running and accessible
+
+- Tool availability checks
+  - CodeQL and Joern availability is validated at startup
+  - Install or adjust CODEQL_CLI_PATH and JOERN_CLI_PATH accordingly
+
+- Health and diagnostics
+  - Use the CLI health command to verify tool integrations
+  - Check backend logs and frontend console for errors
 
 **Section sources**
-- [run.sh](file://autopov/run.sh#L36-L56)
-- [run.sh](file://autopov/run.sh#L84-L90)
-- [config.py](file://autopov/app/config.py#L123-L172)
-- [vite.config.js](file://autopov/frontend/vite.config.js#L7-L15)
-- [main.py](file://autopov/app/main.py#L161-L171)
+- [run.sh:84-90](file://run.sh#L84-L90)
+- [app/main.py:176-186](file://app/main.py#L176-L186)
+- [app/config.py:162-211](file://app/config.py#L162-L211)
+- [cli/autopov.py:613-637](file://cli/autopov.py#L613-L637)
 
 ## Conclusion
-You are now ready to use AutoPoV for autonomous vulnerability detection and benchmarking. Start with the web UI for guided scanning, automate with the CLI, and integrate via the API. Use the analysis utilities to benchmark model performance and generate reports. For advanced scenarios, configure offline models, webhooks, and static analysis tools as needed.
+You now have the essentials to install AutoPoV, configure environment variables, and run your first scan via web UI, CLI, or REST API. Use the troubleshooting section to resolve common setup issues and refer to the architecture overview to understand how components interact.

@@ -72,8 +72,14 @@ class CodeIngester:
             if not api_key:
                 raise CodeIngestionError("OpenRouter API key not configured")
             
+            embedding_model = llm_config["embedding_model"]
+            
+            # text-embedding-3-small is an OpenAI-native model.
+            # OpenRouter proxies it but requires different auth handling.
+            # Use OpenRouter base URL with the key as-is; it should work.
+            # If OpenRouter returns 401, fall back to a simpler approach.
             self._embeddings = OpenAIEmbeddings(
-                model=llm_config["embedding_model"],
+                model=embedding_model,
                 api_key=api_key,
                 base_url=llm_config["base_url"]
             )
@@ -93,9 +99,9 @@ class CodeIngester:
             raise CodeIngestionError("ChromaDB not available. Install chromadb")
         
         if self._chroma_client is None:
-            self._chroma_client = chromadb.Client(
-                Settings(
-                    persist_directory=self.persist_dir,
+            self._chroma_client = chromadb.PersistentClient(
+                path=self.persist_dir,
+                settings=Settings(
                     anonymized_telemetry=False
                 )
             )

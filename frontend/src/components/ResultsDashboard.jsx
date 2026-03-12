@@ -33,6 +33,8 @@ const TooltipStyle = { backgroundColor: '#111827', border: '1px solid #1f2937', 
 
 function ResultsDashboard({ result }) {
   const [showCostBreakdown, setShowCostBreakdown] = useState(false)
+  const [activeCard, setActiveCard] = useState(null)
+
 
   const metrics = useMemo(() => {
     if (!result) return null
@@ -40,8 +42,14 @@ function ResultsDashboard({ result }) {
     const confirmed = result.confirmed_vulns || 0
     const fp = result.false_positives || 0
     const failed = result.failed || 0
-    const confirmedFindings = (result.findings || []).filter(f => f.final_status === 'confirmed')
-    const povTriggered = confirmedFindings.filter(f => f.pov_result?.vulnerability_triggered).length
+
+    const allFindings = result.findings || []
+    const confirmedFindings = allFindings.filter(f => f.final_status === 'confirmed')
+    const fpFindings        = allFindings.filter(f => f.final_status === 'skipped')
+    const failedFindings    = allFindings.filter(f => f.final_status === 'failed')
+    const povFindings       = confirmedFindings.filter(f => f.pov_result?.vulnerability_triggered)
+    const povTriggered      = povFindings.length
+
     return {
       total, confirmed, fp, failed,
       detectionRate: total > 0 ? (confirmed / total * 100).toFixed(1) : 0,
@@ -49,7 +57,13 @@ function ResultsDashboard({ result }) {
       povTriggered,
       povSuccessRate: confirmed > 0 ? (povTriggered / confirmed * 100).toFixed(1) : 0,
       cost: result.total_cost_usd || 0,
-      duration: result.duration_s || 0
+      duration: result.duration_s || 0,
+      // for detail panels
+      allFindings,
+      confirmedFindings,
+      fpFindings,
+      failedFindings,
+      povFindings,
     }
   }, [result])
 

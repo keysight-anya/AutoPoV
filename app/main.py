@@ -17,7 +17,7 @@ from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from app.config import settings
-from app.auth import verify_api_key, verify_admin_key, get_api_key_manager
+from app.auth import verify_api_key, verify_api_key_with_rate_limit, verify_admin_key, get_api_key_manager
 from app.git_handler import get_git_handler
 from app.source_handler import get_source_handler
 from app.webhook_handler import get_webhook_handler
@@ -186,7 +186,7 @@ async def health_check():
 
 
 @app.get("/api/config")
-async def get_config(api_key: str = Depends(verify_api_key)):
+async def get_config(auth: tuple = Depends(verify_api_key)):
     """Get system configuration including supported CWEs"""
     return {
         "supported_cwes": settings.SUPPORTED_CWES,
@@ -205,7 +205,7 @@ async def get_config(api_key: str = Depends(verify_api_key)):
 async def scan_git(
     request: ScanGitRequest,
     background_tasks: BackgroundTasks,
-    api_key: str = Depends(verify_api_key)
+    auth: tuple = Depends(verify_api_key_with_rate_limit)
 ):
     """Scan a Git repository"""
     scan_id = get_scan_manager().create_scan(
@@ -291,7 +291,7 @@ async def scan_zip(
     file: UploadFile = File(...),
     model: str = Form("openai/gpt-4o"),
     cwes: str = Form("CWE-89,CWE-119,CWE-190,CWE-416"),
-    api_key: str = Depends(verify_api_key)
+    auth: tuple = Depends(verify_api_key_with_rate_limit)
 ):
     """Scan a ZIP file upload"""
     cwe_list = cwes.split(",")
@@ -302,15 +302,17 @@ async def scan_zip(
         cwes=cwe_list
     )
     
+    # Read file content before passing to background task (UploadFile is not thread-safe)
+    file_content = await file.read()
+
     def run_scan():
         try:
             # Save uploaded file
             temp_path = f"/tmp/autopov/{scan_id}/upload.zip"
             os.makedirs(os.path.dirname(temp_path), exist_ok=True)
             
-            with open(temp_path, "wb") as f:
-                content = file.file.read()
-                f.write(content)
+            with open(temp_path, "wb") as f_out:
+                f_out.write(file_content)
             
             # Extract
             path = get_source_handler().handle_zip_upload(temp_path, scan_id)
@@ -319,8 +321,16 @@ async def scan_zip(
             scan_info = get_scan_manager().get_scan(scan_id)
             scan_info["codebase_path"] = path
             
-            # Run scan
-            asyncio.run(get_scan_manager().run_scan_async(scan_id))
+            # Run scan using a new event loop (same pattern as scan_git)
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(get_scan_manager().run_scan_async(scan_id))
+            finally:
+                try:
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                finally:
+                    loop.close()
             
         except Exception as e:
             scan_info = get_scan_manager().get_scan(scan_id)
@@ -341,7 +351,7 @@ async def scan_zip(
 async def scan_paste(
     request: ScanPasteRequest,
     background_tasks: BackgroundTasks,
-    api_key: str = Depends(verify_api_key)
+    auth: tuple = Depends(verify_api_key_with_rate_limit)
 ):
     """Scan pasted code"""
     scan_id = get_scan_manager().create_scan(
@@ -364,8 +374,16 @@ async def scan_paste(
             scan_info = get_scan_manager().get_scan(scan_id)
             scan_info["codebase_path"] = path
             
-            # Run scan
-            asyncio.run(get_scan_manager().run_scan_async(scan_id))
+            # Run scan using a new event loop (same pattern as scan_git)
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(get_scan_manager().run_scan_async(scan_id))
+            finally:
+                try:
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                finally:
+                    loop.close()
             
         except Exception as e:
             scan_info = get_scan_manager().get_scan(scan_id)
@@ -388,7 +406,7 @@ async def replay_scan(
     scan_id: str,
     request: ReplayRequest,
     background_tasks: BackgroundTasks,
-    api_key: str = Depends(verify_api_key)
+    auth: tuple = Depends(verify_api_key_with_rate_limit)
 ):
     result = get_scan_manager().get_scan_result(scan_id)
     if not result:
@@ -471,11 +489,29 @@ async def replay_scan(
 
     return {"status": "replay_started", "replay_ids": replay_ids}
 
+@app.post("/api/scan/{scan_id}/cancel")
+async def cancel_scan(
+    scan_id: str,
+    auth: tuple = Depends(verify_api_key)
+):
+    """Cancel a running scan"""
+    success = get_scan_manager().cancel_scan(scan_id)
+    if not success:
+        scan_info = get_scan_manager().get_scan(scan_id)
+        if not scan_info:
+            raise HTTPException(status_code=404, detail="Scan not found")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Scan cannot be cancelled (current status: {scan_info.get('status', 'unknown')})"
+        )
+    return {"scan_id": scan_id, "status": "cancelled", "message": "Scan cancellation requested"}
+
+
 # Scan status and results
 @app.get("/api/scan/{scan_id}", response_model=ScanStatusResponse)
 async def get_scan_status(
     scan_id: str,
-    api_key: str = Depends(verify_api_key)
+    auth: tuple = Depends(verify_api_key)
 ):
     """Get scan status and results"""
     scan_info = get_scan_manager().get_scan(scan_id)
@@ -512,7 +548,7 @@ async def get_scan_status(
 @app.get("/api/scan/{scan_id}/stream")
 async def stream_scan_logs(
     scan_id: str,
-    api_key: str = Depends(verify_api_key)
+    auth: tuple = Depends(verify_api_key)
 ):
     """Stream scan logs via SSE"""
     async def event_generator():
@@ -552,7 +588,7 @@ async def stream_scan_logs(
 async def get_history(
     limit: int = 100,
     offset: int = 0,
-    api_key: str = Depends(verify_api_key)
+    auth: tuple = Depends(verify_api_key)
 ):
     """Get scan history"""
     history = get_scan_manager().get_scan_history(limit=limit, offset=offset)
@@ -564,7 +600,7 @@ async def get_history(
 async def get_report(
     scan_id: str,
     format: str = "json",
-    api_key: str = Depends(verify_api_key)
+    auth: tuple = Depends(verify_api_key)
 ):
     """Get scan report"""
     result = get_scan_manager().get_scan_result(scan_id)
@@ -687,9 +723,27 @@ async def revoke_api_key(
     return {"message": "API key revoked"}
 
 
+@app.post("/api/admin/cleanup")
+async def cleanup_results(
+    max_age_days: int = 30,
+    max_results: int = 500,
+    admin_key: str = Depends(verify_admin_key)
+):
+    """Clean up old scan result files (admin only)"""
+    files_removed, bytes_freed = get_scan_manager().cleanup_old_results(
+        max_age_days=max_age_days,
+        max_results=max_results
+    )
+    return {
+        "files_removed": files_removed,
+        "bytes_freed": bytes_freed,
+        "message": f"Removed {files_removed} files, freed {bytes_freed / 1024:.1f} KB"
+    }
+
+
 
 @app.get("/api/learning/summary")
-async def learning_summary(api_key: str = Depends(verify_api_key)):
+async def learning_summary(auth: tuple = Depends(verify_api_key)):
     store = get_learning_store()
     return {
         "summary": store.get_summary(),
@@ -698,7 +752,7 @@ async def learning_summary(api_key: str = Depends(verify_api_key)):
 
 # Metrics endpoint
 @app.get("/api/metrics")
-async def get_metrics(api_key: str = Depends(verify_api_key)):
+async def get_metrics(auth: tuple = Depends(verify_api_key)):
     """Get system metrics"""
     return get_scan_manager().get_metrics()
 

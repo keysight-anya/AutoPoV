@@ -109,10 +109,76 @@ class HeuristicScout:
                 _p(r"(localStorage|sessionStorage)\.setItem\s*\([^)]*(?:password|token|secret)"),
                 _p(r"console\.(log|info|debug)\s*\([^)]*(?:password|token|secret)"),
             ],
-            # CSRF - routes without CSRF protection (heuristic only)
+            # CSRF
             "CWE-352": [
                 _p(r"app\.(post|put|delete|patch)\s*\("),
                 _p(r"@(app|router|blueprint)\.(post|put|delete|patch)\s*\("),
+            ],
+            # Use of Broken Crypto
+            "CWE-327": [
+                re.compile(r"MD5\s*\(", re.IGNORECASE),
+                re.compile(r"SHA1\s*\(", re.IGNORECASE),
+                re.compile(r"hashlib\.md5", re.IGNORECASE),
+                re.compile(r"hashlib\.sha1\b", re.IGNORECASE),
+                re.compile(r"\bDES\b", re.IGNORECASE),
+                re.compile(r"\bRC4\b", re.IGNORECASE),
+            ],
+            # Improper Authentication
+            "CWE-287": [
+                re.compile(r"if\s+username\s*==\s*[\"']admin[\"']", re.IGNORECASE),
+                re.compile(r"authenticate\s*\(.*skip", re.IGNORECASE),
+                re.compile(r"auth\s*=\s*False", re.IGNORECASE),
+                re.compile(r"bypass.*auth", re.IGNORECASE),
+            ],
+            # Missing Auth for Critical Function
+            "CWE-306": [
+                re.compile(r"allow_anonymous\s*=\s*True", re.IGNORECASE),
+                re.compile(r"authentication_classes\s*=\s*\[\s*\]", re.IGNORECASE),
+                re.compile(r"permission_classes\s*=\s*\[\s*\]", re.IGNORECASE),
+            ],
+            # SSRF
+            "CWE-918": [
+                re.compile(r"requests\.(get|post)\s*\(.*request\.", re.IGNORECASE),
+                re.compile(r"urllib.*urlopen\s*\(.*request\.", re.IGNORECASE),
+                re.compile(r"fetch\s*\(.*req\.", re.IGNORECASE),
+                re.compile(r"http\.get\s*\(.*req\.", re.IGNORECASE),
+            ],
+            # Unrestricted Upload
+            "CWE-434": [
+                re.compile(r"filename\s*=\s*file\.(filename|name)", re.IGNORECASE),
+                re.compile(r"\.save\s*\(.*upload", re.IGNORECASE),
+                re.compile(r"move_uploaded_file\s*\(", re.IGNORECASE),
+                re.compile(r"MultipartFile.*transfer", re.IGNORECASE),
+            ],
+            # XXE
+            "CWE-611": [
+                re.compile(r"XMLParser\s*\(.*resolve_entities\s*=\s*True", re.IGNORECASE),
+                re.compile(r"etree\.parse\s*\(", re.IGNORECASE),
+                re.compile(r"DocumentBuilderFactory\s*\.", re.IGNORECASE),
+                re.compile(r"FEATURE_EXTERNAL_GENERAL_ENTITIES", re.IGNORECASE),
+            ],
+            # Resource Exhaustion
+            "CWE-400": [
+                re.compile(r"re\.compile\s*\(.*request\.", re.IGNORECASE),
+                re.compile(r"time\.sleep\s*\(.*request\.", re.IGNORECASE),
+            ],
+            # Session Fixation
+            "CWE-384": [
+                re.compile(r"SESSION_ID\s*=.*request\.", re.IGNORECASE),
+                re.compile(r"setSession\s*\(.*request\.", re.IGNORECASE),
+            ],
+            # Info Exposure
+            "CWE-200": [
+                re.compile(r"traceback\.print_exc\s*\(", re.IGNORECASE),
+                re.compile(r"printStackTrace\s*\(", re.IGNORECASE),
+                re.compile(r"DEBUG\s*=\s*True", re.IGNORECASE),
+                re.compile(r"e\.getMessage\s*\(\)\s*\+", re.IGNORECASE),
+            ],
+            # Improper Input Validation
+            "CWE-20": [
+                re.compile(r"int\s*\(\s*request\.", re.IGNORECASE),
+                re.compile(r"float\s*\(\s*request\.", re.IGNORECASE),
+                re.compile(r"request\.(GET|POST|args|params|body)\s*\[.*\]", re.IGNORECASE),
             ],
             # Buffer Overflow (C/C++)
             "CWE-119": [

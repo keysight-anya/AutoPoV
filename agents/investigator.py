@@ -498,7 +498,7 @@ class VulnerabilityInvestigator:
                 cwe_type=alert.get("cwe_type", "UNKNOWN"),
                 filepath=alert.get("filepath", ""),
                 line_number=alert.get("line_number", 0),
-                alert_message=alert.get("message", "")
+                alert_message=alert.get("alert_message", "")
             )
             
             results.append(result)

@@ -1,6 +1,6 @@
 import { Link, useLocation } from 'react-router-dom'
 import { useEffect, useState } from 'react'
-import { Shield, Clock, History, Settings, FileText, BarChart2 } from 'lucide-react'
+import { Shield, Clock, History, Settings, FileText, BarChart2, Activity } from 'lucide-react'
 
 function NavBar() {
   const location = useLocation()
@@ -20,6 +20,7 @@ function NavBar() {
   const navLinks = [
     { to: '/', label: 'Scan', icon: Shield },
     { to: '/history', label: 'History', icon: History },
+    { to: '/metrics', label: 'Metrics', icon: Activity },
     { to: '/policy', label: 'Policy', icon: BarChart2 },
     { to: '/docs', label: 'Docs', icon: FileText },
     { to: '/settings', label: 'Settings', icon: Settings },
