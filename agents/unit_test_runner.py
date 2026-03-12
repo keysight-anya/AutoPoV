@@ -28,6 +28,26 @@ class TestResult:
 class UnitTestRunner:
     """Runs PoV scripts against isolated code in unit test style"""
     
+    # CWE-specific validation oracles
+    CWE_ORACLES = {
+        "CWE-22": {  # Path Traversal
+            "side_effect_files": ["/tmp/autopov_traversal_test", "/tmp/autopov_path_test"],
+            "expected_content_patterns": ["root:x:0:0:", "etc/passwd", "windows/system32"],
+        },
+        "CWE-78": {  # Command Injection
+            "side_effect_files": ["/tmp/autopov_rce", "/tmp/autopov_cmd_injection"],
+            "expected_output_patterns": ["uid=", "root", "bin/bash"],
+        },
+        "CWE-89": {  # SQL Injection
+            "expected_output_patterns": ["MariaDB", "MySQL", "SQLite", "PostgreSQL", "version", "@@version"],
+            "timing_threshold_s": 5.0,  # Time-based detection
+        },
+        "CWE-94": {  # Code Injection
+            "side_effect_files": ["/tmp/autopov_code_exec"],
+            "expected_output_patterns": ["eval executed", "exec completed", "code injected"],
+        },
+    }
+    
     def __init__(self):
         self.test_history = []
     
@@ -80,10 +100,12 @@ class UnitTestRunner:
             end_time = datetime.utcnow()
             execution_time = (end_time - start_time).total_seconds()
             
-            # Check if vulnerability was triggered
-            vuln_triggered = (
-                "VULNERABILITY TRIGGERED" in result.get("stdout", "") or
-                result.get("vulnerability_triggered", False)
+            # Check if vulnerability was triggered using CWE-specific oracles
+            vuln_triggered = self._check_cwe_oracle(
+                cwe_type=cwe_type,
+                stdout=result.get("stdout", ""),
+                stderr=result.get("stderr", ""),
+                execution_time=execution_time
             )
             
             test_result = TestResult(
@@ -316,6 +338,53 @@ sys.stdin = io.StringIO("""{mock_input}""")
             ))
         
         return results
+    
+    def _check_cwe_oracle(
+        self,
+        cwe_type: str,
+        stdout: str,
+        stderr: str,
+        execution_time: float
+    ) -> bool:
+        """
+        Check if vulnerability was triggered using CWE-specific oracles.
+        
+        Returns True if the oracle indicates successful exploitation.
+        """
+        combined_output = (stdout + stderr).lower()
+        
+        # Always check for the basic indicator first
+        if "VULNERABILITY TRIGGERED" in stdout:
+            return True
+        
+        # Get oracle config for this CWE
+        oracle = self.CWE_ORACLES.get(cwe_type, {})
+        if not oracle:
+            # No specific oracle, fall back to basic check
+            return "VULNERABILITY TRIGGERED" in stdout
+        
+        # Check for expected output patterns
+        expected_patterns = oracle.get("expected_output_patterns", [])
+        for pattern in expected_patterns:
+            if pattern.lower() in combined_output:
+                return True
+        
+        # Check for side-effect files (for file-based oracles)
+        side_effect_files = oracle.get("side_effect_files", [])
+        for file_path in side_effect_files:
+            try:
+                if os.path.exists(file_path):
+                    # File was created - potential RCE/path traversal
+                    return True
+            except Exception:
+                pass
+        
+        # Check timing for time-based detection (SQL injection)
+        timing_threshold = oracle.get("timing_threshold_s")
+        if timing_threshold and execution_time >= timing_threshold:
+            return True
+        
+        return False
     
     def validate_syntax(self, pov_script: str) -> Dict[str, Any]:
         """Validate PoV script syntax without execution"""

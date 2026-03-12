@@ -39,9 +39,14 @@ class Settings(BaseSettings):
     MODEL_NAME: str = Field(default="openai/gpt-4o", env="MODEL_NAME")
 
     # Routing / Policy
-    ROUTING_MODE: str = Field(default="auto", env="ROUTING_MODE")  # auto|fixed|learning
+    ROUTING_MODE: str = Field(default="auto", env="ROUTING_MODE")  # auto|fixed|learning|hierarchical
     AUTO_ROUTER_MODEL: str = Field(default="openrouter/auto", env="AUTO_ROUTER_MODEL")
     LEARNING_DB_PATH: str = Field(default="./data/learning.db", env="LEARNING_DB_PATH")
+    
+    # Hierarchical LLM Configuration (Sifter + Architect pattern)
+    HIERARCHICAL_SIFTER_MODEL: str = Field(default="google/gemini-2.0-flash-001", env="HIERARCHICAL_SIFTER_MODEL")
+    HIERARCHICAL_SIFTER_CONFIDENCE_THRESHOLD: float = Field(default=0.7, env="HIERARCHICAL_SIFTER_CONFIDENCE_THRESHOLD")
+    HIERARCHICAL_ARCHITECT_MODEL: str = Field(default="anthropic/claude-3.5-sonnet", env="HIERARCHICAL_ARCHITECT_MODEL")
 
     # Scout Settings
     SCOUT_ENABLED: bool = Field(default=True, env="SCOUT_ENABLED")
@@ -100,10 +105,18 @@ class Settings(BaseSettings):
     MAX_COST_USD: float = Field(default=100.0, env="MAX_COST_USD")
     COST_TRACKING_ENABLED: bool = Field(default=True, env="COST_TRACKING_ENABLED")
     
+    # Token Tracking (per model)
+    TOKEN_TRACKING_ENABLED: bool = Field(default=True, env="TOKEN_TRACKING_ENABLED")
+    
     # Scanning Configuration
     MAX_CHUNK_SIZE: int = 4000
     CHUNK_OVERLAP: int = 200
-    MAX_RETRIES: int = 2
+    MAX_RETRIES: int = 3  # Increased for self-healing refiner
+    
+    # Parallel Processing Configuration
+    PARALLEL_PROCESSING_ENABLED: bool = Field(default=False, env="PARALLEL_PROCESSING_ENABLED")
+    PARALLEL_MAX_WORKERS: int = Field(default=5, env="PARALLEL_MAX_WORKERS")
+    PARALLEL_RATE_LIMIT_RPS: int = Field(default=10, env="PARALLEL_RATE_LIMIT_RPS")  # Requests per second
     
     # Supported CWEs - Focused list for faster scanning (high-impact web vulnerabilities)
     # Top 20 most common web vulnerabilities (OWASP Top 10 + extras)

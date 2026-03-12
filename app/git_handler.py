@@ -163,9 +163,14 @@ class GitHandler:
         
         if provider == "github":
             info = self.get_github_repo_info(url)
-            
+
             if not info.get("exists"):
-                return False, info.get("error", "Repository not found"), info
+                error = info.get("error", "Repository not found")
+                # 401/rate-limit from GitHub API shouldn't block the scan —
+                # the repo may still be publicly cloneable. Fall through.
+                if "401" in error or "403" in error or "rate limit" in error.lower() or "timed out" in error.lower():
+                    return True, f"GitHub API unavailable ({error}), attempting clone directly", {}
+                return False, error, info
             
             if info.get("private") and not settings.GITHUB_TOKEN:
                 return False, "Repository is private. Please configure GITHUB_TOKEN in settings.", info

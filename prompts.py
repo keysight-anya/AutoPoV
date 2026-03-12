@@ -421,3 +421,81 @@ def format_scout_prompt(file_snippets, cwes):
         files="\n---\n".join(formatted_files),
         cwes=", ".join(cwes)
     )
+
+
+# PoV Refinement Prompt - Used to fix failed PoV scripts
+POV_REFINEMENT_PROMPT = """You are fixing a failed Proof-of-Vulnerability (PoV) script.
+
+VULNERABILITY DETAILS:
+- CWE: {cwe_type}
+- File: {filepath}
+- Line: {line_number}
+- Vulnerable Code: {vulnerable_code}
+- Explanation: {explanation}
+- Target Language: {target_language}
+
+TARGET CODE:
+```
+{code_context}
+```
+
+FAILED POV SCRIPT:
+```python
+{failed_pov}
+```
+
+VALIDATION ERRORS:
+{validation_errors}
+
+ATTEMPT: {attempt_number}
+
+TASK:
+Fix the PoV script to address the validation errors. The script must:
+1. Use only Python standard library (no external packages)
+2. Print "VULNERABILITY TRIGGERED" when successful
+3. Include error handling
+4. Add comments explaining each step
+5. Make the PoV as deterministic as possible
+6. Do NOT make network calls
+
+For specific CWEs:
+- CWE-79 (XSS): Inject malicious JavaScript payloads
+- CWE-89 (SQL Injection): Craft malicious SQL input that bypasses filters
+- CWE-22 (Path Traversal): Use ../ sequences to access files outside intended directory
+- CWE-94 (Code Injection): Inject and execute arbitrary code
+- CWE-78 (Command Injection): Inject shell commands via input
+- CWE-798 (Hardcoded Credentials): Try default/known credentials
+- CWE-502 (Deserialization): Craft malicious serialized objects
+- CWE-352 (CSRF): Forge cross-site requests
+- CWE-601 (Open Redirect): Manipulate redirect URLs
+- CWE-312 (Cleartext Storage): Check for unencrypted sensitive data
+
+Respond with ONLY the corrected Python script, no markdown formatting:
+"""
+
+
+def format_pov_refinement_prompt(
+    cwe_type: str,
+    filepath: str,
+    line_number: int,
+    vulnerable_code: str,
+    explanation: str,
+    code_context: str,
+    failed_pov: str,
+    validation_errors: list,
+    attempt_number: int,
+    target_language: str = "python"
+) -> str:
+    """Format the PoV refinement prompt"""
+    return POV_REFINEMENT_PROMPT.format(
+        cwe_type=cwe_type,
+        filepath=filepath,
+        line_number=line_number,
+        vulnerable_code=vulnerable_code,
+        explanation=explanation,
+        code_context=code_context,
+        failed_pov=failed_pov,
+        validation_errors="\n".join(f"- {e}" for e in validation_errors),
+        attempt_number=attempt_number,
+        target_language=target_language
+    )

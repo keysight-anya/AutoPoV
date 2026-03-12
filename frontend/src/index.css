@@ -4,41 +4,42 @@
 
 /* Custom scrollbar for dark theme */
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 6px;
+  height: 6px;
 }
 
 ::-webkit-scrollbar-track {
-  background: #1f2937;
+  background: #090d1a;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #4b5563;
-  border-radius: 4px;
+  background: #374151;
+  border-radius: 3px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #6b7280;
+  background: #4b5563;
 }
 
 /* Code block styling */
 pre {
-  background: #1f2937;
+  background: #090d1a;
   border-radius: 0.5rem;
   padding: 1rem;
   overflow-x: auto;
+  border: 1px solid #1e2a3a;
 }
 
 code {
-  font-family: 'Fira Code', monospace;
-  font-size: 0.875rem;
+  font-family: 'Fira Code', 'JetBrains Mono', monospace;
+  font-size: 0.8125rem;
 }
 
 /* Animation for live logs */
 @keyframes fadeIn {
   from {
     opacity: 0;
-    transform: translateY(-5px);
+    transform: translateY(-4px);
   }
   to {
     opacity: 1;
@@ -47,26 +48,53 @@ code {
 }
 
 .log-entry {
-  animation: fadeIn 0.3s ease-out;
+  animation: fadeIn 0.2s ease-out;
+}
+
+/* Scanning pulse animation */
+@keyframes scanPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.scan-pulse {
+  animation: scanPulse 1.5s ease-in-out infinite;
 }
 
 /* Status badges */
 .status-badge {
-  @apply px-2 py-1 rounded-full text-xs font-medium;
+  @apply px-2 py-0.5 rounded text-xs font-medium;
 }
 
 .status-completed {
-  @apply bg-green-900 text-green-300;
+  @apply bg-green-900/30 text-green-400 border border-green-500/20;
 }
 
 .status-running {
-  @apply bg-blue-900 text-blue-300;
+  @apply bg-blue-900/20 text-blue-400 border border-blue-500/20;
 }
 
 .status-failed {
-  @apply bg-red-900 text-red-300;
+  @apply bg-red-900/30 text-red-400 border border-red-500/20;
 }
 
 .status-pending {
-  @apply bg-gray-700 text-gray-300;
+  @apply bg-gray-800 text-gray-400 border border-gray-700;
+}
+
+/* Glow effects for findings */
+.finding-confirmed {
+  box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.25), 0 0 24px rgba(239, 68, 68, 0.04);
+}
+
+.finding-false-positive {
+  box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.2);
+}
+
+/* Background grid pattern */
+.bg-grid {
+  background-image:
+    linear-gradient(rgba(14, 165, 233, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(14, 165, 233, 0.04) 1px, transparent 1px);
+  background-size: 48px 48px;
 }

@@ -59,6 +59,19 @@ class VulnerabilityState(TypedDict):
     inference_time_s: float
     cost_usd: float
     final_status: str
+    # Token tracking per model
+    model_used: Optional[str]
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    # Hierarchical LLM tracking
+    sifter_model: Optional[str]
+    sifter_tokens: Optional[Dict[str, int]]  # {prompt, completion, total}
+    architect_model: Optional[str]
+    architect_tokens: Optional[Dict[str, int]]  # {prompt, completion, total}
+    # Validation and refinement tracking
+    validation_result: Optional[Dict[str, Any]]
+    refinement_history: Optional[List[Dict[str, Any]]]
 
 
 class ScanState(TypedDict):
@@ -75,6 +88,9 @@ class ScanState(TypedDict):
     start_time: str
     end_time: Optional[str]
     total_cost_usd: float
+    # Token tracking per model
+    total_tokens: int
+    tokens_by_model: Dict[str, Dict[str, int]]  # {model_name: {prompt, completion, total}}
     logs: List[str]
     error: Optional[str]
 
@@ -97,6 +113,7 @@ class AgentGraph:
         workflow.add_node("investigate", self._node_investigate)
         workflow.add_node("generate_pov", self._node_generate_pov)
         workflow.add_node("validate_pov", self._node_validate_pov)
+        workflow.add_node("refine_pov", self._node_refine_pov)  # Self-healing refiner
         workflow.add_node("run_in_docker", self._node_run_in_docker)
         workflow.add_node("log_confirmed", self._node_log_confirmed)
         workflow.add_node("log_skip", self._node_log_skip)
@@ -129,10 +146,13 @@ class AgentGraph:
             self._should_run_pov,
             {
                 "run_in_docker": "run_in_docker",
-                "generate_pov": "generate_pov",  # Retry
+                "refine_pov": "refine_pov",  # Self-healing refinement
                 "log_failure": "log_failure"
             }
         )
+        
+        # Refiner loop: refinement goes back to validation
+        workflow.add_edge("refine_pov", "validate_pov")
         
         workflow.add_edge("run_in_docker", "log_confirmed")
         
@@ -743,21 +763,44 @@ class AgentGraph:
         finding["inference_time_s"] = result.get("inference_time_s", 0.0)
         finding["code_chunk"] = result.get("vulnerable_code", "")
         
-        # Use actual cost from API response, or estimate if not available
+        # Track tokens per model
+        token_usage = result.get("token_usage", {})
+        model_used = result.get("model_used", model_to_use)
+        
+        finding["model_used"] = model_used
+        finding["prompt_tokens"] = token_usage.get("prompt_tokens", 0)
+        finding["completion_tokens"] = token_usage.get("completion_tokens", 0)
+        finding["total_tokens"] = token_usage.get("total_tokens", 0)
+        
+        # Update scan-level token tracking
+        if finding["total_tokens"] > 0:
+            state["total_tokens"] = state.get("total_tokens", 0) + finding["total_tokens"]
+            
+            # Track tokens by model
+            if "tokens_by_model" not in state or state["tokens_by_model"] is None:
+                state["tokens_by_model"] = {}
+            
+            if model_used not in state["tokens_by_model"]:
+                state["tokens_by_model"][model_used] = {"prompt": 0, "completion": 0, "total": 0}
+            
+            state["tokens_by_model"][model_used]["prompt"] += finding["prompt_tokens"]
+            state["tokens_by_model"][model_used]["completion"] += finding["completion_tokens"]
+            state["tokens_by_model"][model_used]["total"] += finding["total_tokens"]
+        
+        # Track cost (optional, for backward compatibility)
         actual_cost = result.get("cost_usd", 0.0)
         if actual_cost > 0:
             finding["cost_usd"] = actual_cost
-            finding["model_used"] = result.get("model_used", model_to_use)
-            finding["token_usage"] = result.get("token_usage", {})
         else:
-            # Fallback to estimation
-            finding["cost_usd"] = self._estimate_cost(finding["inference_time_s"])
+            finding["cost_usd"] = 0.0
         
         state["total_cost_usd"] += finding["cost_usd"]
         
         state["findings"][idx] = finding
         
         self._log(state, f"  Verdict: {finding['llm_verdict']} (confidence: {finding['confidence']:.2f})")
+        if finding["total_tokens"] > 0:
+            self._log(state, f"  Tokens: {finding['total_tokens']} (prompt: {finding['prompt_tokens']}, completion: {finding['completion_tokens']})")
 
         try:
             get_learning_store().record_investigation(
@@ -818,16 +861,43 @@ class AgentGraph:
             model_name=model_to_use
         )
         
-        # Log model and cost info
-        if result.get("model_used"):
-            self._log(state, f"  Model: {result['model_used']}")
+        # Log model and token info
+        model_used = result.get("model_used", model_to_use)
+        token_usage = result.get("token_usage", {})
+        
+        if model_used:
+            self._log(state, f"  Model: {model_used}")
+        
+        # Track tokens
+        prompt_tokens = token_usage.get("prompt_tokens", 0)
+        completion_tokens = token_usage.get("completion_tokens", 0)
+        total_tokens = token_usage.get("total_tokens", 0)
+        
+        if total_tokens > 0:
+            self._log(state, f"  Tokens: {total_tokens} (prompt: {prompt_tokens}, completion: {completion_tokens})")
+            state["total_tokens"] = state.get("total_tokens", 0) + total_tokens
+            
+            # Track tokens by model
+            if "tokens_by_model" not in state or state["tokens_by_model"] is None:
+                state["tokens_by_model"] = {}
+            
+            if model_used not in state["tokens_by_model"]:
+                state["tokens_by_model"][model_used] = {"prompt": 0, "completion": 0, "total": 0}
+            
+            state["tokens_by_model"][model_used]["prompt"] += prompt_tokens
+            state["tokens_by_model"][model_used]["completion"] += completion_tokens
+            state["tokens_by_model"][model_used]["total"] += total_tokens
+        
+        # Track cost for backward compatibility
         if result.get("cost_usd", 0) > 0:
-            self._log(state, f"  Cost: ${result['cost_usd']:.6f}")
             state["total_cost_usd"] += result["cost_usd"]
         
         if result["success"]:
             finding["pov_script"] = result["pov_script"]
-            finding["pov_model_used"] = result.get("model_used", model_to_use)
+            finding["pov_model_used"] = model_used
+            finding["pov_prompt_tokens"] = prompt_tokens
+            finding["pov_completion_tokens"] = completion_tokens
+            finding["pov_total_tokens"] = total_tokens
             # Cost already added above, just store it in finding
             if "cost_usd" not in finding:
                 finding["cost_usd"] = result.get("cost_usd", 0)
@@ -898,6 +968,113 @@ class AgentGraph:
         
         # Store validation result in finding
         finding["validation_result"] = result
+        
+        state["findings"][idx] = finding
+        return state
+
+    def _node_refine_pov(self, state: ScanState) -> ScanState:
+        """Refine PoV script based on validation errors (Self-Healing)"""
+        state["status"] = ScanStatus.GENERATING_POV  # Still generating
+        
+        idx = state.get("current_finding_idx", 0)
+        if idx >= len(state["findings"]):
+            return state
+        
+        finding = state["findings"][idx]
+        
+        if not finding.get("pov_script"):
+            return state
+        
+        # Get validation errors
+        validation_result = finding.get("validation_result", {})
+        validation_errors = validation_result.get("issues", [])
+        
+        if not validation_errors:
+            self._log(state, "No validation errors to refine, skipping refinement")
+            return state
+        
+        self._log(state, f"Refining PoV for {finding['cwe_type']} (attempt {finding['retry_count'] + 1})...")
+        self._log(state, f"  Errors: {validation_errors[:2]}")
+        
+        # Get code context
+        code_context = get_code_ingester().get_file_content(
+            finding["filepath"], state["scan_id"]
+        ) or ""
+        
+        # Get target language
+        target_language = state.get("detected_language", "python")
+        
+        # Select model for refinement (use architect model in hierarchical mode)
+        policy = get_policy_router()
+        model_to_use = policy.select_model("pov", cwe=finding["cwe_type"], language=target_language)
+        
+        # Initialize refinement history
+        if "refinement_history" not in finding:
+            finding["refinement_history"] = []
+        
+        # Call verifier to refine the PoV
+        verifier = get_verifier()
+        result = verifier.refine_pov(
+            cwe_type=finding["cwe_type"],
+            filepath=finding["filepath"],
+            line_number=finding["line_number"],
+            vulnerable_code=finding.get("code_chunk", ""),
+            explanation=finding["llm_explanation"],
+            code_context=code_context,
+            failed_pov=finding["pov_script"],
+            validation_errors=validation_errors,
+            attempt_number=finding["retry_count"] + 1,
+            target_language=target_language,
+            model_name=model_to_use
+        )
+        
+        # Track refinement in history with tokens
+        model_used = result.get("model_used", model_to_use)
+        token_usage = result.get("token_usage", {})
+        
+        finding["refinement_history"].append({
+            "attempt": finding["retry_count"] + 1,
+            "errors": validation_errors,
+            "success": result.get("success", False),
+            "timestamp": result.get("timestamp", ""),
+            "model_used": model_used,
+            "tokens": token_usage,
+            "cost_usd": result.get("cost_usd", 0.0)
+        })
+        
+        # Track tokens
+        prompt_tokens = token_usage.get("prompt_tokens", 0)
+        completion_tokens = token_usage.get("completion_tokens", 0)
+        total_tokens = token_usage.get("total_tokens", 0)
+        
+        if total_tokens > 0:
+            state["total_tokens"] = state.get("total_tokens", 0) + total_tokens
+            
+            # Track tokens by model
+            if "tokens_by_model" not in state or state["tokens_by_model"] is None:
+                state["tokens_by_model"] = {}
+            
+            if model_used not in state["tokens_by_model"]:
+                state["tokens_by_model"][model_used] = {"prompt": 0, "completion": 0, "total": 0}
+            
+            state["tokens_by_model"][model_used]["prompt"] += prompt_tokens
+            state["tokens_by_model"][model_used]["completion"] += completion_tokens
+            state["tokens_by_model"][model_used]["total"] += total_tokens
+        
+        # Update cost tracking (for backward compatibility)
+        if result.get("cost_usd", 0) > 0:
+            state["total_cost_usd"] += result["cost_usd"]
+            finding["cost_usd"] = finding.get("cost_usd", 0) + result["cost_usd"]
+        
+        if result["success"]:
+            finding["pov_script"] = result["pov_script"]
+            finding["retry_count"] += 1
+            self._log(state, f"  PoV refined successfully (attempt {finding['retry_count']})")
+            if total_tokens > 0:
+                self._log(state, f"  Tokens: {total_tokens} (prompt: {prompt_tokens}, completion: {completion_tokens})")
+        else:
+            self._log(state, f"  PoV refinement failed: {result.get('error')}")
+            finding["retry_count"] += 1
         
         state["findings"][idx] = finding
         return state
@@ -1077,18 +1254,24 @@ class AgentGraph:
             return "log_skip"
     
     def _should_run_pov(self, state: ScanState) -> str:
-        """Determine if we should run PoV or retry"""
+        """Determine if we should run PoV, refine, or fail"""
         idx = state.get("current_finding_idx", 0)
         if idx >= len(state["findings"]):
             return "log_failure"
         
         finding = state["findings"][idx]
+        validation_result = finding.get("validation_result", {})
         
-        if finding.get("pov_script") and finding["retry_count"] < settings.MAX_RETRIES:
+        # Check if validation passed
+        if validation_result.get("is_valid"):
             return "run_in_docker"
-        elif finding["retry_count"] < settings.MAX_RETRIES:
-            return "generate_pov"  # Retry generation
+        
+        # Check if we can retry with refinement
+        if finding["retry_count"] < settings.MAX_RETRIES:
+            self._log(state, f"PoV validation failed, attempting refinement (attempt {finding['retry_count'] + 1}/{settings.MAX_RETRIES})")
+            return "refine_pov"
         else:
+            self._log(state, f"PoV validation failed after {settings.MAX_RETRIES} attempts")
             return "log_failure"
     
     def _has_more_findings(self, state: ScanState) -> str:
@@ -1182,6 +1365,8 @@ class AgentGraph:
             start_time=datetime.utcnow().isoformat(),
             end_time=None,
             total_cost_usd=0.0,
+            total_tokens=0,
+            tokens_by_model={},
             logs=[],
             error=None
         )
