@@ -1,0 +1,192 @@
+/* frontend/src/custom.css */
+
+/* ── Glassmorphism Tab Row ─────────────────────────── */
+.tabs-row {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border2);
+  margin-bottom: 20px;
+}
+
+.tabs-group {
+  display: flex;
+  gap: 3px;
+}
+
+.glass-tab {
+  position: relative;
+  padding: 10px 20px 12px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--text3);
+  cursor: pointer;
+  background: rgba(255,255,255,0.02);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-bottom: none;
+  margin-bottom: -1px;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  transition: color .15s, background .15s, border-color .15s;
+  overflow: hidden;
+  user-select: none;
+}
+
+.glass-tab::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0; height: 1px;
+  background: linear-gradient(90deg,
+    transparent 10%,
+    rgba(255,255,255,0.12) 50%,
+    transparent 90%);
+}
+
+.glass-tab:hover {
+  color: var(--text2);
+  background: rgba(255,255,255,0.04);
+}
+
+.glass-tab.active {
+  color: var(--accent);
+  background: rgba(254,127,45,0.06);
+  border-color: rgba(254,127,45,0.28);
+  border-bottom: 1px solid var(--bg);
+}
+
+.glass-tab.active::before {
+  background: linear-gradient(90deg,
+    transparent 10%,
+    rgba(254,127,45,0.45) 50%,
+    transparent 90%);
+}
+
+/* ── Depth Mode Toggle ─────────────────────────────── */
+.depth-btn {
+  padding: 10px 16px 12px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  background: rgba(255,255,255,0.02);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-bottom: none;
+  color: var(--text3);
+  cursor: pointer;
+  margin-bottom: -1px;
+  transition: color .2s, background .2s, border-color .2s;
+}
+
+.depth-btn.deep {
+  background: rgba(254,127,45,0.08);
+  border-color: rgba(254,127,45,0.35);
+  color: var(--accent);
+}
+
+/* ── Corner Brackets ───────────────────────────────── */
+.corner {
+  position: fixed;
+  width: 14px;
+  height: 14px;
+  will-change: transform;
+  pointer-events: none;
+  z-index: 100;
+}
+
+.corner.tl {
+  top: calc(var(--topbar-h) + 18px);
+  left: calc(var(--sidebar-w) + 18px);
+  border-top: 1.5px solid var(--accent);
+  border-left: 1.5px solid var(--accent);
+  opacity: .6;
+}
+
+.corner.tr {
+  top: calc(var(--topbar-h) + 18px);
+  right: 18px;
+  border-top: 1.5px solid var(--accent);
+  border-right: 1.5px solid var(--accent);
+  opacity: .6;
+}
+
+.corner.bl {
+  bottom: calc(var(--statusbar-h) + 8px);
+  left: calc(var(--sidebar-w) + 18px);
+  border-bottom: 1.5px solid var(--accent);
+  border-left: 1.5px solid var(--accent);
+  opacity: .6;
+}
+
+.corner.br {
+  bottom: calc(var(--statusbar-h) + 8px);
+  right: 18px;
+  border-bottom: 1.5px solid var(--accent);
+  border-right: 1.5px solid var(--accent);
+  opacity: .6;
+}
+
+/* ── Parallax Rings ────────────────────────────────── */
+.parallax-bg {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.ring {
+  position: absolute;
+  top: 50%; left: 50%;
+  border-radius: 50%;
+  will-change: transform;
+  transform: translate(-50%, -50%);
+}
+
+.ring-1 {
+  width: 420px; height: 420px;
+  border: 1px solid rgba(254,127,45,0.06);
+}
+
+.ring-2 {
+  width: 640px; height: 640px;
+  border: 1px solid rgba(254,127,45,0.04);
+}
+
+.ring-3 {
+  width: 860px; height: 860px;
+  border: 1px solid rgba(254,127,45,0.025);
+}
+
+.grid-lines {
+  position: absolute;
+  inset: -100px;
+  background-image:
+    linear-gradient(rgba(254,127,45,0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(254,127,45,0.03) 1px, transparent 1px);
+  background-size: 40px 40px;
+  will-change: transform;
+}
+
+/* ── Agent Pipeline ────────────────────────────────── */
+.agent-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  border-left: 2px solid transparent;
+  transition: border-color .15s;
+}
+
+.agent-row.running {
+  border-left-color: var(--accent);
+}
+
+.agent-row.done {
+  border-left-color: rgba(34,197,94,0.5);
+}
+
+.agent-row.failed {
+  border-left-color: rgba(239,68,68,0.5);
+}
