@@ -239,3 +239,7 @@ heuristic_scout = HeuristicScout()
 
 def get_heuristic_scout() -> HeuristicScout:
     return heuristic_scout
+
+
+# Export for agentic discovery
+__all__ = ['HeuristicScout', 'get_heuristic_scout']

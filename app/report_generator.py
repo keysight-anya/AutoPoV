@@ -252,6 +252,12 @@ class ReportGenerator:
                 "scan_started": result.start_time if hasattr(result, 'start_time') else None,
                 "scan_completed": result.end_time if hasattr(result, 'end_time') else None,
                 "duration_seconds": result.duration_s,
+                "language_analysis": {
+                    "primary_language": result.detected_language or language_info.get('primary', 'unknown'),
+                    "all_languages_detected": language_info.get('all_languages', []),
+                    "language_distribution": language_info.get('language_stats', {}),
+                    "total_source_files": language_info.get('total_files', 0)
+                },
                 "configuration": {
                     "model_mode": settings.MODEL_MODE,
                     "routing_mode": settings.ROUTING_MODE,
@@ -278,6 +284,7 @@ class ReportGenerator:
                 "cost_per_confirmed_usd": round(self._calculate_cost_per_confirmed(result), 6)
             },
             "findings": self._format_findings(result.findings),
+            "detailed_findings": self._format_detailed_findings(result.findings, result),
             "methodology": self._generate_methodology(result)
         }
         
@@ -285,6 +292,179 @@ class ReportGenerator:
             json.dump(report_data, f, indent=2, default=str)
         
         return report_path
+    
+    def _format_detailed_findings(self, findings: List[Dict[str, Any]], result: ScanResult) -> List[Dict[str, Any]]:
+        """Format detailed findings with full evidence and proof"""
+        detailed = []
+        scan_info = getattr(result, 'scan_info', {}) or {}
+        language_info = scan_info.get('language_info', {})
+        
+        for idx, finding in enumerate(findings or []):
+            if not finding:
+                continue
+                
+            # Get file language
+            filepath = finding.get('filepath', '')
+            file_lang = language_info.get('file_mappings', {}).get(filepath, result.detected_language or 'unknown')
+            
+            # Get validation details
+            validation = finding.get('validation_result', {}) or {}
+            pov_result = finding.get('pov_result', {}) or {}
+            unit_test = validation.get('unit_test_result', {}) or {}
+            oracle = unit_test.get('oracle', {}) or {}
+            
+            # Build comprehensive evidence description
+            evidence_description = []
+            if oracle.get('evidence'):
+                for ev in oracle['evidence']:
+                    evidence_description.append(f"- {ev}")
+            
+            # Determine proof quality
+            proof_quality = "none"
+            if pov_result.get('vulnerability_triggered'):
+                if oracle.get('confidence') == 'high':
+                    proof_quality = "strong"
+                elif oracle.get('confidence') == 'medium':
+                    proof_quality = "moderate"
+                else:
+                    proof_quality = "weak"
+            
+            detailed_finding = {
+                "finding_number": idx + 1,
+                "finding_id": f"{finding.get('cwe_type', 'UNKNOWN')}-{idx+1:03d}",
+                
+                "vulnerability": {
+                    "cwe_id": finding.get('cwe_type', 'Unknown'),
+                    "cwe_name": self._get_cwe_name(finding.get('cwe_type', '')),
+                    "description": finding.get('llm_explanation', 'No description available'),
+                    "severity": self._calculate_severity(finding),
+                    "confidence": finding.get('confidence', 0.0),
+                    "final_status": finding.get('final_status', 'unknown')
+                },
+                
+                "location": {
+                    "file_path": filepath,
+                    "line_number": finding.get('line_number', 0),
+                    "language": file_lang,
+                    "code_snippet": finding.get('code_chunk', ''),
+                    "full_context": finding.get('full_code_context', '')
+                },
+                
+                "detection": {
+                    "source": finding.get('source', 'unknown'),
+                    "detection_method": finding.get('detection_method', 'AI investigation'),
+                    "investigation_model": finding.get('model_used', 'unknown'),
+                    "investigation_verdict": finding.get('llm_verdict', 'UNKNOWN'),
+                    "investigation_time_seconds": finding.get('inference_time_s', 0),
+                    "token_usage": {
+                        "prompt_tokens": finding.get('prompt_tokens', 0),
+                        "completion_tokens": finding.get('completion_tokens', 0),
+                        "total_tokens": finding.get('total_tokens', 0)
+                    }
+                },
+                
+                "proof_of_vulnerability": {
+                    "pov_script": finding.get('pov_script', ''),
+                    "pov_generation_model": finding.get('pov_model_used', ''),
+                    "pov_token_usage": {
+                        "prompt_tokens": finding.get('pov_prompt_tokens', 0),
+                        "completion_tokens": finding.get('pov_completion_tokens', 0),
+                        "total_tokens": finding.get('pov_total_tokens', 0)
+                    },
+                    "refinement_attempts": len(finding.get('refinement_history', [])),
+                    "refinement_history": finding.get('refinement_history', [])
+                },
+                
+                "validation": {
+                    "validation_method": validation.get('validation_method', 'unknown'),
+                    "static_validation": validation.get('static_result', {}),
+                    "unit_test_result": {
+                        "success": unit_test.get('success', False),
+                        "vulnerability_triggered": unit_test.get('vulnerability_triggered', False),
+                        "exit_code": unit_test.get('exit_code', -1),
+                        "execution_time_seconds": unit_test.get('execution_time_s', 0)
+                    },
+                    "proof_quality": proof_quality,
+                    "evidence": {
+                        "confidence_level": oracle.get('confidence', 'low'),
+                        "detection_method": oracle.get('method', 'unknown'),
+                        "evidence_items": oracle.get('evidence', []),
+                        "evidence_description": "\n".join(evidence_description) if evidence_description else "No specific evidence recorded",
+                        "stdout_output": unit_test.get('stdout', ''),
+                        "stderr_output": unit_test.get('stderr', '')
+                    }
+                },
+                
+                "impact_assessment": {
+                    "what_was_tested": f"The {finding.get('cwe_type', 'vulnerability')} vulnerability at {filepath}:{finding.get('line_number', 0)}",
+                    "how_it_was_tested": f"An automated Proof-of-Vulnerability (PoV) script was generated and executed to trigger the vulnerability",
+                    "outcome": "VULNERABILITY CONFIRMED" if pov_result.get('vulnerability_triggered') else "VULNERABILITY NOT TRIGGERED",
+                    "proof_summary": self._generate_proof_summary(finding, oracle)
+                },
+                
+                "resource_usage": {
+                    "investigation_cost_usd": finding.get('cost_usd', 0),
+                    "pov_generation_cost_usd": pov_result.get('cost_usd', 0),
+                    "total_cost_usd": (finding.get('cost_usd', 0) or 0) + (pov_result.get('cost_usd', 0) or 0)
+                }
+            }
+            
+            detailed.append(detailed_finding)
+        
+        return detailed
+    
+    def _get_cwe_name(self, cwe_id: str) -> str:
+        """Get human-readable CWE name"""
+        cwe_names = {
+            "CWE-22": "Path Traversal",
+            "CWE-78": "OS Command Injection",
+            "CWE-79": "Cross-site Scripting (XSS)",
+            "CWE-89": "SQL Injection",
+            "CWE-94": "Code Injection",
+            "CWE-502": "Deserialization of Untrusted Data",
+            "CWE-611": "XML External Entity (XXE) Injection",
+            "CWE-200": "Information Exposure",
+            "CWE-287": "Improper Authentication",
+            "CWE-352": "Cross-Site Request Forgery (CSRF)",
+            "CWE-416": "Use After Free",
+            "CWE-119": "Buffer Overflow",
+            "CWE-190": "Integer Overflow"
+        }
+        return cwe_names.get(cwe_id, f"{cwe_id} - Unknown Vulnerability Type")
+    
+    def _calculate_severity(self, finding: Dict[str, Any]) -> str:
+        """Calculate severity based on confidence and validation"""
+        confidence = finding.get('confidence', 0)
+        pov_result = finding.get('pov_result', {}) or {}
+        triggered = pov_result.get('vulnerability_triggered', False)
+        
+        if triggered and confidence >= 0.8:
+            return "HIGH"
+        elif triggered and confidence >= 0.6:
+            return "MEDIUM"
+        elif confidence >= 0.7:
+            return "MEDIUM"
+        else:
+            return "LOW"
+    
+    def _generate_proof_summary(self, finding: Dict[str, Any], oracle: Dict[str, Any]) -> str:
+        """Generate human-readable proof summary"""
+        pov_result = finding.get('pov_result', {}) or {}
+        
+        if not pov_result.get('vulnerability_triggered'):
+            return "The PoV script did not successfully trigger the vulnerability. This may indicate a false positive or require manual verification."
+        
+        evidence = oracle.get('evidence', [])
+        method = oracle.get('method', 'unknown')
+        
+        summary_parts = ["The vulnerability was confirmed through automated testing."]
+        
+        if evidence:
+            summary_parts.append(f"Evidence detected using {method} method:")
+            for ev in evidence[:3]:
+                summary_parts.append(f"  - {ev}")
+        
+        return " ".join(summary_parts)
     
     def generate_pdf_report(self, result: ScanResult) -> str:
         """Generate professional PDF report"""

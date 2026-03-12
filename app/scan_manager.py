@@ -225,12 +225,10 @@ class ScanManager:
                 duration_s=0.0,
                 start_time=scan_info["created_at"],
                 end_time=datetime.utcnow().isoformat(),
-                findings=[],
-                logs=scan_info.get("logs", [])
+                findings=[]
             )
 
             self._save_result(result)
-            scan_info["result"] = result
             return result
 
     async def run_scan_async(
@@ -281,12 +279,35 @@ class ScanManager:
             # Get agent graph
             agent = get_agent_graph()
             
-            # Run the scan
+            # Set scan manager reference for cancellation checks
+            agent.set_scan_manager(self)
+            
+            # Detect all languages in the codebase
+            lang_info = agent._detect_all_languages(scan_info["codebase_path"])
+            detected_language = lang_info['primary']
+            
+            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Detected primary language: {detected_language}")
+            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] All languages found: {', '.join(lang_info['all_languages'])}")
+            for lang, count in sorted(lang_info['language_stats'].items(), key=lambda x: x[1], reverse=True):
+                pct = (count / lang_info['total_files']) * 100 if lang_info['total_files'] > 0 else 0
+                scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}]   - {lang}: {count} files ({pct:.1f}%)")
+            
+            # Store language info in scan state
+            scan_info["detected_language"] = detected_language
+            scan_info["language_info"] = lang_info
+            
+            # Check for cancellation before starting scan
+            if scan_info.get("status") == "cancelled":
+                self._log(state, "Scan cancelled before execution")
+                raise InterruptedError("Scan cancelled by user")
+            
+            # Run the scan with detected language
             final_state = agent.run_scan(
                 codebase_path=scan_info["codebase_path"],
                 model_name=scan_info["model_name"],
                 cwes=scan_info["cwes"],
-                scan_id=scan_id
+                scan_id=scan_id,
+                detected_language=detected_language
             )
             
             # Sync logs from agent graph state to scan_info (in case any were missed)
@@ -345,7 +366,7 @@ class ScanManager:
             scan_info["error"] = error_msg
             scan_info["logs"].append(f"ERROR: {str(e)}")
             print(f"Scan {scan_id} failed: {error_msg}")
-
+            
             result = ScanResult(
                 scan_id=scan_id,
                 status="failed",
@@ -360,20 +381,12 @@ class ScanManager:
                 duration_s=0.0,
                 start_time=scan_info["created_at"],
                 end_time=datetime.utcnow().isoformat(),
-                findings=[],
-                logs=scan_info.get("logs", [])
+                findings=[]
             )
-
+            
             self._save_result(result)
-            scan_info["result"] = result
-
-            try:
-                get_code_ingester().cleanup(scan_id)
-            except Exception:
-                pass
-
             return result
-
+    
     def _save_result(self, result: ScanResult):
         """Save scan result to file"""
         # Save as JSON

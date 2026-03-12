@@ -188,7 +188,7 @@ async def health_check():
 @app.get("/api/config")
 async def get_config(auth: tuple = Depends(verify_api_key)):
     """Get system configuration including supported CWEs"""
-    return {
+    config = {
         "supported_cwes": settings.SUPPORTED_CWES,
         "app_version": settings.APP_VERSION,
         "codeql_available": settings.is_codeql_available(),
@@ -196,8 +196,19 @@ async def get_config(auth: tuple = Depends(verify_api_key)):
         "routing_mode": settings.ROUTING_MODE,
         "auto_router_model": settings.AUTO_ROUTER_MODEL,
         "model_mode": settings.MODEL_MODE,
-        "model_name": settings.MODEL_NAME
+        "model_name": settings.MODEL_NAME,
+        "token_tracking_enabled": settings.TOKEN_TRACKING_ENABLED
     }
+    
+    # Add hierarchical config if applicable
+    if settings.ROUTING_MODE == "hierarchical":
+        config["hierarchical"] = {
+            "sifter_model": settings.HIERARCHICAL_SIFTER_MODEL,
+            "architect_model": settings.HIERARCHICAL_ARCHITECT_MODEL,
+            "confidence_threshold": settings.HIERARCHICAL_SIFTER_CONFIDENCE_THRESHOLD
+        }
+    
+    return config
 
 
 # Scan endpoints

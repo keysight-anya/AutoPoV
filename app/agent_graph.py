@@ -40,6 +40,7 @@ class ScanStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     SKIPPED = "skipped"
+    CANCELLED = "cancelled"
 
 
 class VulnerabilityState(TypedDict):
@@ -59,6 +60,9 @@ class VulnerabilityState(TypedDict):
     inference_time_s: float
     cost_usd: float
     final_status: str
+    # Language tracking
+    detected_language: Optional[str]  # Language of the file
+    source: Optional[str]  # How the finding was detected (codeql, llm, heuristic)
     # Token tracking per model
     model_used: Optional[str]
     prompt_tokens: int
@@ -100,6 +104,19 @@ class AgentGraph:
     
     def __init__(self):
         self.graph = self._build_graph()
+        self._scan_manager = None  # Reference to scan manager for cancellation checks
+    
+    def set_scan_manager(self, scan_manager):
+        """Set reference to scan manager for cancellation checks"""
+        self._scan_manager = scan_manager
+    
+    def _check_cancelled(self, state: ScanState) -> bool:
+        """Check if scan has been cancelled"""
+        if self._scan_manager and state.get("scan_id"):
+            scan_info = self._scan_manager._active_scans.get(state["scan_id"])
+            if scan_info and scan_info.get("status") == "cancelled":
+                return True
+        return False
     
     def _build_graph(self) -> StateGraph:
         """Build the LangGraph workflow"""
@@ -259,70 +276,85 @@ class AgentGraph:
         return merged
 
     def _node_run_codeql(self, state: ScanState) -> ScanState:
-        """Run CodeQL analysis"""
-        self._log(state, "Running CodeQL analysis...")
+        """
+        Run agentic discovery with resilient decision-tree:
+        1. Language Profiling
+        2. CodeQL Pre-Flight (with Semgrep fallback)
+        3. Hybrid Enforcement for high-risk languages
+        4. Cost-Benefit Triage with LLM Scout
+        """
+        self._log(state, "Running agentic discovery...")
         state["status"] = ScanStatus.RUNNING_CODEQL
+        
         if state.get("preloaded_findings"):
             self._log(state, f"Using preloaded findings: {len(state['preloaded_findings'])}")
             state["findings"] = state["preloaded_findings"]
             return state
-
-
-        state["status"] = ScanStatus.RUNNING_CODEQL
-
-        codeql_available = settings.is_codeql_available()
-        self._log(state, f"CodeQL availability check: {codeql_available}")
-
-        if not codeql_available:
-            self._log(state, "CodeQL not available, using autonomous discovery")
-            findings = self._run_llm_only_analysis(state)
-            auto_findings = self._run_autonomous_discovery(state)
-            state["findings"] = self._merge_findings(findings, auto_findings)
-            self._log(state, f"Autonomous discovery added {len(auto_findings)} candidates")
-            return state
-
+        
         try:
-            findings = []
-            detected_lang = self._detect_language(state["codebase_path"])
-            state["detected_language"] = detected_lang  # Store for later use
-            self._log(state, f"Detected language: {detected_lang}")
-
-            # Create CodeQL database once for all queries
-            db_path = os.path.join(settings.TEMP_DIR, f"codeql_db_{state['scan_id']}")
-            db_created = self._create_codeql_database(state, detected_lang, db_path)
-
-            if not db_created:
-                self._log(state, "CodeQL database creation failed, using autonomous discovery")
-                findings = self._run_llm_only_analysis(state)
-                auto_findings = self._run_autonomous_discovery(state)
-                state["findings"] = self._merge_findings(findings, auto_findings)
-                return state
-
-            # Run queries against the created database
-            for cwe in state["cwes"]:
-                self._log(state, f"Running CodeQL query for {cwe}...")
-                cwe_findings = self._run_codeql_query(state, cwe, detected_lang, db_path)
-                self._log(state, f"{cwe}: Found {len(cwe_findings)} findings")
-                findings.extend(cwe_findings)
-
-            auto_findings = self._run_autonomous_discovery(state)
-            state["findings"] = self._merge_findings(findings, auto_findings)
-            self._log(state, f"CodeQL found {len(findings)} potential vulnerabilities")
-            self._log(state, f"Autonomous discovery added {len(auto_findings)} candidates")
-
+            # Import agentic discovery
+            from agents.agentic_discovery import get_agentic_discovery
+            
+            # Run agentic discovery
+            discovery_results = get_agentic_discovery().discover(
+                codebase_path=state["codebase_path"],
+                cwes=state["cwes"],
+                scan_id=state["scan_id"],
+                state=state
+            )
+            
+            # Merge all findings from different strategies
+            all_findings: List[VulnerabilityState] = []
+            for result in discovery_results:
+                if result.success:
+                    self._log(state, f"{result.strategy.value}: Found {len(result.findings)} findings")
+                    for finding_data in result.findings:
+                        # Convert to VulnerabilityState
+                        finding = VulnerabilityState(
+                            cve_id=None,
+                            filepath=finding_data.get("filepath", ""),
+                            line_number=finding_data.get("line_number", 0),
+                            cwe_type=finding_data.get("cwe_type", "UNKNOWN"),
+                            code_chunk=finding_data.get("code_chunk", ""),
+                            llm_verdict="",
+                            llm_explanation="",
+                            confidence=finding_data.get("confidence", 0.7),
+                            pov_script=None,
+                            pov_path=None,
+                            pov_result=None,
+                            retry_count=0,
+                            inference_time_s=0.0,
+                            cost_usd=0.0,
+                            final_status="pending",
+                            detected_language=finding_data.get("detected_language", state.get("detected_language", "unknown")),
+                            source=finding_data.get("source", "unknown"),
+                            model_used=None,
+                            prompt_tokens=0,
+                            completion_tokens=0,
+                            total_tokens=0,
+                            sifter_model=None,
+                            sifter_tokens=None,
+                            architect_model=None,
+                            architect_tokens=None,
+                            validation_result=None,
+                            refinement_history=None
+                        )
+                        all_findings.append(finding)
+                else:
+                    self._log(state, f"{result.strategy.value}: Failed - {result.error}")
+            
+            # Deduplicate findings
+            state["findings"] = self._merge_findings([], all_findings)
+            self._log(state, f"Agentic discovery completed: {len(state['findings'])} total unique findings")
+            
         except Exception as e:
-            self._log(state, f"CodeQL error: {e}")
+            self._log(state, f"Agentic discovery error: {e}")
             import traceback
             self._log(state, f"Traceback: {traceback.format_exc()}")
+            # Fallback to traditional methods
             findings = self._run_llm_only_analysis(state)
             auto_findings = self._run_autonomous_discovery(state)
             state["findings"] = self._merge_findings(findings, auto_findings)
-        finally:
-            # Cleanup database after all queries are done
-            db_path = os.path.join(settings.TEMP_DIR, f"codeql_db_{state['scan_id']}")
-            if os.path.exists(db_path):
-                shutil.rmtree(db_path, ignore_errors=True)
-                self._log(state, f"Cleaned up CodeQL database at {db_path}")
 
         return state
 
@@ -359,20 +391,38 @@ class AgentGraph:
             self._log(state, f"Exception during CodeQL database creation: {e}")
             return False
     
-    def _detect_language(self, codebase_path: str) -> str:
-        """Detect the primary language of the codebase"""
+    def _detect_all_languages(self, codebase_path: str) -> Dict[str, Any]:
+        """
+        Detect all languages in the codebase with statistics.
+        
+        Returns:
+            Dict with:
+            - primary: Primary language (most files)
+            - all_languages: List of detected languages
+            - language_stats: Dict with file counts per language
+            - file_mappings: Dict mapping file paths to languages
+        """
         extensions = {}
+        file_mappings = {}
+        
         for root, _, files in os.walk(codebase_path):
             for file in files:
                 ext = os.path.splitext(file)[1].lower()
                 extensions[ext] = extensions.get(ext, 0) + 1
+                
+                # Map file to language
+                full_path = os.path.join(root, file)
+                rel_path = os.path.relpath(full_path, codebase_path)
+                lang = self._get_language_from_extension(ext)
+                if lang:
+                    file_mappings[rel_path] = lang
         
         # Map extensions to CodeQL languages
         lang_map = {
             '.py': 'python',
             '.js': 'javascript',
-            '.ts': 'javascript',  # TypeScript uses javascript extractor
-            '.tsx': 'javascript',
+            '.ts': 'typescript',
+            '.tsx': 'typescript',
             '.jsx': 'javascript',
             '.java': 'java',
             '.c': 'cpp',
@@ -381,23 +431,71 @@ class AgentGraph:
             '.h': 'cpp',
             '.go': 'go',
             '.rb': 'ruby',
-            '.php': 'javascript',  # PHP - no native CodeQL support, use JS as fallback
-            '.phtml': 'javascript',
-            '.php3': 'javascript',
-            '.php4': 'javascript',
-            '.php5': 'javascript'
+            '.php': 'php',
+            '.phtml': 'php',
+            '.php3': 'php',
+            '.php4': 'php',
+            '.php5': 'php',
+            '.cs': 'csharp',
+            '.swift': 'swift',
+            '.kt': 'kotlin',
+            '.scala': 'scala',
+            '.rs': 'rust',
         }
         
-        # Find the most common language
+        # Find all languages with counts
         lang_counts = {}
         for ext, count in extensions.items():
             lang = lang_map.get(ext)
             if lang:
                 lang_counts[lang] = lang_counts.get(lang, 0) + count
         
-        if lang_counts:
-            return max(lang_counts, key=lang_counts.get)
-        return 'python'  # Default fallback
+        # Sort by count
+        sorted_langs = sorted(lang_counts.items(), key=lambda x: x[1], reverse=True)
+        
+        primary = sorted_langs[0][0] if sorted_langs else 'python'
+        all_languages = [lang for lang, _ in sorted_langs]
+        
+        return {
+            'primary': primary,
+            'all_languages': all_languages,
+            'language_stats': lang_counts,
+            'file_mappings': file_mappings,
+            'total_files': sum(lang_counts.values())
+        }
+    
+    def _get_language_from_extension(self, ext: str) -> Optional[str]:
+        """Get language from file extension"""
+        lang_map = {
+            '.py': 'python',
+            '.js': 'javascript',
+            '.ts': 'typescript',
+            '.tsx': 'typescript',
+            '.jsx': 'javascript',
+            '.java': 'java',
+            '.c': 'cpp',
+            '.cpp': 'cpp',
+            '.cc': 'cpp',
+            '.h': 'cpp',
+            '.go': 'go',
+            '.rb': 'ruby',
+            '.php': 'php',
+            '.phtml': 'php',
+            '.php3': 'php',
+            '.php4': 'php',
+            '.php5': 'php',
+            '.cs': 'csharp',
+            '.swift': 'swift',
+            '.kt': 'kotlin',
+            '.scala': 'scala',
+            '.rs': 'rust',
+        }
+        return lang_map.get(ext)
+    
+    def _detect_language(self, codebase_path: str) -> str:
+        """Detect the primary language of the codebase (backward compatible)"""
+        result = self._detect_all_languages(codebase_path)
+        return result['primary']
     
     def _get_cwe_query(self, cwe: str, language: str) -> Optional[str]:
         """Get CodeQL query for a CWE based on language using local file paths"""
@@ -594,9 +692,16 @@ class AgentGraph:
                                     artifact = loc.get("artifactLocation", {})
                                     region = loc.get("region", {})
                                     
+                                    filepath = artifact.get("uri", "")
+                                    
+                                    # Detect language for this specific file
+                                    file_lang = self._get_language_from_extension(
+                                        os.path.splitext(filepath)[1].lower()
+                                    ) or state.get("detected_language", "unknown")
+                                    
                                     finding = VulnerabilityState(
                                         cve_id=None,
-                                        filepath=artifact.get("uri", ""),
+                                        filepath=filepath,
                                         line_number=region.get("startLine", 0),
                                         cwe_type=cwe,
                                         code_chunk=res.get("message", {}).get("text", ""),
@@ -609,7 +714,9 @@ class AgentGraph:
                                         retry_count=0,
                                         inference_time_s=0.0,
                                         cost_usd=0.0,
-                                        final_status="pending"
+                                        final_status="pending",
+                                        detected_language=file_lang,
+                                        source="codeql"
                                     )
                                     findings.append(finding)
                 except Exception as e:
@@ -710,6 +817,12 @@ class AgentGraph:
     
     def _node_investigate(self, state: ScanState) -> ScanState:
         """Investigate ONE finding with LLM (at current_finding_idx)"""
+        # Check for cancellation
+        if self._check_cancelled(state):
+            self._log(state, "Scan cancelled by user")
+            state["status"] = ScanStatus.CANCELLED
+            return state
+        
         state["status"] = ScanStatus.INVESTIGATING
         
         idx = state.get("current_finding_idx", 0)
@@ -821,6 +934,12 @@ class AgentGraph:
     
     def _node_generate_pov(self, state: ScanState) -> ScanState:
         """Generate PoV script for a finding"""
+        # Check for cancellation
+        if self._check_cancelled(state):
+            self._log(state, "Scan cancelled by user")
+            state["status"] = ScanStatus.CANCELLED
+            return state
+        
         state["status"] = ScanStatus.GENERATING_POV
         
         # Get current finding being processed
@@ -1149,6 +1268,20 @@ class AgentGraph:
             return state
 
         # Fall back to Docker-based testing for cases where validation was inconclusive
+        if not finding.get("pov_script"):
+            self._log(state, "No PoV script available, skipping Docker test")
+            finding["pov_result"] = {
+                "success": False,
+                "vulnerability_triggered": False,
+                "stdout": "",
+                "stderr": "No PoV script generated",
+                "exit_code": -1,
+                "execution_time_s": 0,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            state["findings"][idx] = finding
+            return state
+        
         self._log(state, "Running PoV in Docker (fallback)...")
 
         runner = get_docker_runner()

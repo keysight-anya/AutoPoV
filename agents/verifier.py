@@ -302,20 +302,36 @@ class VulnerabilityVerifier:
                 scan_id=f"validate_{cwe_type}_{line_number}"
             )
             
+            # Extract oracle evidence from unit test details
+            oracle_result = unit_result.details.get("oracle", {})
+            
             result["unit_test_result"] = {
                 "success": unit_result.success,
                 "vulnerability_triggered": unit_result.vulnerability_triggered,
                 "execution_time_s": unit_result.execution_time_s,
                 "exit_code": unit_result.exit_code,
                 "stdout": unit_result.stdout[:500] if unit_result.stdout else "",  # Truncate
-                "stderr": unit_result.stderr[:500] if unit_result.stderr else ""  # Truncate
+                "stderr": unit_result.stderr[:500] if unit_result.stderr else "",  # Truncate
+                "oracle": oracle_result  # Include detailed oracle evidence
             }
             
             if unit_result.vulnerability_triggered:
                 result["is_valid"] = True
                 result["will_trigger"] = "YES"
                 result["validation_method"] = "unit_test_execution"
-                result["suggestions"].append("Unit test execution confirmed vulnerability trigger")
+                
+                # Add detailed evidence to suggestions
+                evidence = oracle_result.get("evidence", [])
+                confidence = oracle_result.get("confidence", "low")
+                method = oracle_result.get("method", "unknown")
+                
+                if evidence:
+                    result["suggestions"].append(f"Vulnerability confirmed with {confidence} confidence ({method}):")
+                    for item in evidence[:3]:  # Show top 3 evidence items
+                        result["suggestions"].append(f"  - {item}")
+                else:
+                    result["suggestions"].append("Unit test execution confirmed vulnerability trigger")
+                
                 return result
             elif unit_result.success:
                 result["will_trigger"] = "MAYBE"

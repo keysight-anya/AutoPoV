@@ -41,3 +41,6 @@ httpx>=0.25.2
 # Utilities
 python-dotenv>=1.0.0
 semgrep
+
+# Live Testing & Screenshots
+playwright>=1.40.0
