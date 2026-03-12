@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { ArrowLeft, Download, FileText } from 'lucide-react'
+import { ArrowLeft, Download, FileText, RefreshCw, X, Plus, Trash2 } from 'lucide-react'
 import ResultsDashboard from '../components/ResultsDashboard'
 import FindingCard from '../components/FindingCard'
-import { getScanStatus, getReport, getConfig } from '../api/client'
+import { getScanStatus, getReport, getConfig, replayScan } from '../api/client'
 
 function Results() {
   const { scanId } = useParams()
@@ -13,6 +13,13 @@ function Results() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [activeTab, setActiveTab] = useState('all')
+  const [showReplayModal, setShowReplayModal] = useState(false)
+  const [replayModels, setReplayModels] = useState([''])
+  const [replayIncludeFailed, setReplayIncludeFailed] = useState(false)
+  const [replayMaxFindings, setReplayMaxFindings] = useState(50)
+  const [replayLoading, setReplayLoading] = useState(false)
+  const [replayResult, setReplayResult] = useState(null)
+  const [replayError, setReplayError] = useState(null)
 
   const [scanStatus, setScanStatus] = useState(null)
   const [scanError, setScanError] = useState(null)
@@ -151,6 +158,26 @@ function Results() {
   const failedFindings = result.findings?.filter(f => f.final_status === 'failed') || []
   const pendingFindings = result.findings?.filter(f => !f.final_status || f.final_status === 'pending') || []
 
+  const handleReplay = async () => {
+    const models = replayModels.filter(m => m.trim())
+    if (!models.length) return
+    setReplayLoading(true)
+    setReplayError(null)
+    setReplayResult(null)
+    try {
+      const res = await replayScan(scanId, {
+        models,
+        include_failed: replayIncludeFailed,
+        max_findings: replayMaxFindings
+      })
+      setReplayResult(res.data)
+    } catch (err) {
+      setReplayError(err.response?.data?.detail || err.message || 'Replay failed')
+    } finally {
+      setReplayLoading(false)
+    }
+  }
+
   return (
     <div className="max-w-6xl mx-auto">
       {/* Header */}
@@ -170,6 +197,13 @@ function Results() {
 
         <div className="flex space-x-3">
           <button
+            onClick={() => { setShowReplayModal(true); setReplayResult(null); setReplayError(null) }}
+            className="flex items-center space-x-2 px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg transition-colors"
+          >
+            <RefreshCw className="w-4 h-4" />
+            <span>Replay</span>
+          </button>
+          <button
             onClick={() => downloadReport('json')}
             className="flex items-center space-x-2 px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg transition-colors"
           >
@@ -185,6 +219,99 @@ function Results() {
           </button>
         </div>
       </div>
+
+      {/* Replay Modal */}
+      {showReplayModal && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
+          <div className="bg-gray-900 border border-gray-700 rounded-xl w-full max-w-lg mx-4 p-6">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-lg font-bold">Replay Against Agent Models</h2>
+              <button onClick={() => setShowReplayModal(false)} className="p-1 hover:bg-gray-800 rounded">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <p className="text-sm text-gray-400 mb-4">
+              The Investigator Agent will re-analyse existing findings using the specified models,
+              creating new scan runs you can compare via the Policy dashboard.
+            </p>
+
+            {/* Model list */}
+            <div className="space-y-2 mb-4">
+              <label className="block text-sm font-medium text-gray-400">Models to replay against</label>
+              {replayModels.map((m, i) => (
+                <div key={i} className="flex items-center space-x-2">
+                  <input
+                    type="text"
+                    value={m}
+                    onChange={e => {
+                      const next = [...replayModels]
+                      next[i] = e.target.value
+                      setReplayModels(next)
+                    }}
+                    placeholder="e.g. anthropic/claude-3-opus"
+                    className="flex-1 bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-primary-500"
+                  />
+                  {replayModels.length > 1 && (
+                    <button onClick={() => setReplayModels(replayModels.filter((_, j) => j !== i))}
+                      className="p-1 hover:bg-gray-800 rounded text-red-400">
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  )}
+                </div>
+              ))}
+              <button
+                onClick={() => setReplayModels([...replayModels, ''])}
+                className="flex items-center space-x-1 text-sm text-primary-400 hover:text-primary-300 mt-1"
+              >
+                <Plus className="w-4 h-4" /> <span>Add model</span>
+              </button>
+            </div>
+
+            {/* Options */}
+            <div className="space-y-3 mb-4">
+              <label className="flex items-center gap-2 text-sm text-gray-300">
+                <input type="checkbox" checked={replayIncludeFailed}
+                  onChange={e => setReplayIncludeFailed(e.target.checked)}
+                  className="accent-primary-500" />
+                Include unconfirmed / failed findings
+              </label>
+              <div>
+                <label className="block text-sm text-gray-400 mb-1">Max findings to replay</label>
+                <input type="number" min={1} max={200} value={replayMaxFindings}
+                  onChange={e => setReplayMaxFindings(Number(e.target.value))}
+                  className="w-24 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm text-gray-100 focus:outline-none focus:border-primary-500" />
+              </div>
+            </div>
+
+            {replayError && (
+              <div className="mb-3 p-3 bg-red-900/30 border border-red-800 rounded text-sm text-red-300">
+                {replayError}
+              </div>
+            )}
+
+            {replayResult && (
+              <div className="mb-3 p-3 bg-green-900/20 border border-green-800 rounded text-sm text-green-300">
+                Replay started! {replayResult.replay_ids?.length} scan(s) created.
+                <br />
+                <span className="text-gray-400">Track them in Scan History or the Policy dashboard.</span>
+              </div>
+            )}
+
+            <div className="flex justify-end space-x-3">
+              <button onClick={() => setShowReplayModal(false)}
+                className="px-4 py-2 text-sm bg-gray-800 hover:bg-gray-700 rounded-lg transition-colors">
+                Close
+              </button>
+              <button onClick={handleReplay} disabled={replayLoading || replayModels.every(m => !m.trim())}
+                className="flex items-center space-x-2 px-4 py-2 text-sm bg-primary-600 hover:bg-primary-700 disabled:bg-gray-700 rounded-lg transition-colors">
+                <RefreshCw className={`w-4 h-4 ${replayLoading ? 'animate-spin' : ''}`} />
+                <span>{replayLoading ? 'Starting...' : 'Start Replay'}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Dashboard */}
       <ResultsDashboard result={result} />
