@@ -11,18 +11,20 @@ import Metrics from './pages/Metrics'
 
 function App() {
   return (
-    <div className="min-h-screen bg-gray-950 text-gray-100">
+    <div className="min-h-screen bg-gray-950 text-gray-100" style={{ fontFamily: '"JetBrains Mono", monospace' }}>
       <NavBar />
-      <main className="container mx-auto px-4 py-8">
+      {/* Thin violet glow under nav */}
+      <div className="h-px bg-primary-600/10" />
+      <main className="container mx-auto max-w-7xl px-6 py-10">
         <Routes>
-          <Route path="/" element={<Home />} />
-          <Route path="/scan/:scanId" element={<ScanProgress />} />
+          <Route path="/"                element={<Home />} />
+          <Route path="/scan/:scanId"    element={<ScanProgress />} />
           <Route path="/results/:scanId" element={<Results />} />
-          <Route path="/history" element={<History />} />
-          <Route path="/settings" element={<Settings />} />
-          <Route path="/docs" element={<Docs />} />
-          <Route path="/policy" element={<Policy />} />
-          <Route path="/metrics" element={<Metrics />} />
+          <Route path="/history"         element={<History />} />
+          <Route path="/settings"        element={<Settings />} />
+          <Route path="/docs"            element={<Docs />} />
+          <Route path="/policy"          element={<Policy />} />
+          <Route path="/metrics"         element={<Metrics />} />
         </Routes>
       </main>
     </div>

@@ -1,51 +1,64 @@
 import { useEffect, useState } from 'react'
 import { getLearningSummary } from '../api/client'
 
-function StatCard({ label, value }) {
+function StatCard({ label, value, accent }) {
+  const border = {
+    safe:    'border-l-2 border-l-safe-500',
+    warn:    'border-l-2 border-l-warn-500',
+    primary: 'border-l-2 border-l-primary-600',
+  }[accent] || ''
+
   return (
-    <div className="bg-gray-900 border border-gray-800 rounded-lg p-4">
-      <div className="text-sm text-gray-400">{label}</div>
-      <div className="text-2xl font-semibold mt-1">{value}</div>
+    <div className={`card p-5 ${border}`}>
+      <p className="label-caps mb-3">{label}</p>
+      <p className="stat-num text-gray-100">{value}</p>
     </div>
   )
 }
 
-function ModelTable({ title, rows, metricKey }) {
-  return (
-    <div className="bg-gray-900 border border-gray-800 rounded-lg p-6">
-      <h3 className="text-lg font-medium mb-4">{title}</h3>
-      <div className="overflow-x-auto">
-        <table className="w-full text-sm">
-          <thead className="text-gray-400">
-            <tr>
-              <th className="text-left py-2">Model</th>
-              <th className="text-left py-2">Total</th>
-              <th className="text-left py-2">Confirmed</th>
-              <th className="text-left py-2">Rate</th>
-              <th className="text-left py-2">Cost (USD)</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((row, idx) => (
-              <tr key={idx} className="border-t border-gray-800">
-                <td className="py-2 text-gray-200">{row.model}</td>
-                <td className="py-2">{row.total}</td>
-                <td className="py-2">{row.confirmed}</td>
-                <td className="py-2">{(row[metricKey] * 100).toFixed(1)}%</td>
-                <td className="py-2">${row.cost_usd.toFixed(4)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+function ModelTable({ rows, metricKey }) {
+  if (!rows?.length) {
+    return (
+      <div className="card p-10 text-center">
+        <p className="label-caps text-gray-600">NO MODEL DATA</p>
       </div>
+    )
+  }
+
+  return (
+    <div className="card overflow-x-auto">
+      <table className="w-full text-xs">
+        <thead>
+          <tr className="border-b border-gray-850">
+            <th className="px-5 py-3 text-left label-caps">MODEL</th>
+            <th className="px-5 py-3 text-right label-caps">TOTAL</th>
+            <th className="px-5 py-3 text-right label-caps">CONFIRMED</th>
+            <th className="px-5 py-3 text-right label-caps">RATE</th>
+            <th className="px-5 py-3 text-right label-caps">COST USD</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, idx) => (
+            <tr key={idx} className="border-t border-gray-850 hover:bg-gray-850/50 transition-colors">
+              <td className="px-5 py-3 text-primary-400 font-mono">{row.model}</td>
+              <td className="px-5 py-3 text-right text-gray-400">{row.total}</td>
+              <td className="px-5 py-3 text-right text-safe-400 font-semibold">{row.confirmed}</td>
+              <td className="px-5 py-3 text-right text-gray-200 font-semibold">
+                {(row[metricKey] * 100).toFixed(1)}%
+              </td>
+              <td className="px-5 py-3 text-right text-gray-500 font-mono">${row.cost_usd.toFixed(4)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   )
 }
 
 function Policy() {
-  const [data, setData] = useState(null)
+  const [data,    setData]    = useState(null)
   const [loading, setLoading] = useState(true)
-  const [error, setError] = useState(null)
+  const [error,   setError]   = useState(null)
 
   useEffect(() => {
     const fetchData = async () => {
@@ -58,51 +71,76 @@ function Policy() {
         setLoading(false)
       }
     }
-
     fetchData()
   }, [])
 
   if (loading) {
     return (
-      <div className="flex justify-center items-center h-64">
-        <div className="w-8 h-8 border-2 border-primary-500 border-t-transparent rounded-full animate-spin" />
+      <div className="flex items-center gap-3 py-16 text-gray-600">
+        <span className="inline-block w-4 h-4 border border-primary-600 border-t-transparent animate-spin" />
+        <span className="label-caps">LOADING POLICY DATA</span>
       </div>
     )
   }
 
   if (error) {
     return (
-      <div className="max-w-4xl mx-auto">
-        <div className="p-4 bg-red-900/30 border border-red-800 rounded-lg">
-          <p className="text-red-300">Error loading policy data: {error}</p>
+      <div className="space-y-8 animate-fade-up">
+        <div>
+          <p className="label-caps mb-1">// INTELLIGENCE</p>
+          <h1 className="heading-display text-4xl text-gray-100">POLICY DASHBOARD</h1>
+        </div>
+        <div className="card-threat p-4 flex items-center gap-3">
+          <span className="label-caps text-threat-400">ERROR</span>
+          <span className="text-threat-300 text-sm">{error}</span>
         </div>
       </div>
     )
   }
 
-  const summary = data?.summary || {}
-  const modelStats = data?.models || { investigate: [], pov: [] }
+  const summary    = data?.summary || {}
+  const modelStats = data?.models  || { investigate: [], pov: [] }
 
   return (
-    <div className="max-w-6xl mx-auto space-y-8">
+    <div className="space-y-10 animate-fade-up">
+
+      {/* Header */}
       <div>
-        <h1 className="text-2xl font-bold">Policy Dashboard</h1>
-        <p className="text-sm text-gray-400">Learning and model performance overview</p>
+        <p className="label-caps mb-1">// INTELLIGENCE</p>
+        <h1 className="heading-display text-4xl text-gray-100">POLICY DASHBOARD</h1>
+        <p className="text-xs text-gray-600 mt-1 tracking-widest">MODEL PERFORMANCE & LEARNING SUMMARY</p>
       </div>
 
-      <div className="grid md:grid-cols-3 gap-4">
-        <StatCard label="Investigations" value={summary.investigations_total || 0} />
-        <StatCard label="PoV Runs" value={summary.pov_total || 0} />
-        <StatCard label="PoV Success" value={summary.pov_success_total || 0} />
+      {/* Summary stats */}
+      <div>
+        <p className="label-caps mb-3">SUMMARY</p>
+        <div className="grid grid-cols-2 md:grid-cols-3 gap-px bg-gray-850">
+          <StatCard label="INVESTIGATIONS" value={summary.investigations_total || 0} />
+          <StatCard label="POV RUNS"       value={summary.pov_total || 0} />
+          <StatCard label="POV SUCCESS"    value={summary.pov_success_total || 0} accent="safe" />
+        </div>
       </div>
 
-      <div className="grid md:grid-cols-2 gap-4">
-        <StatCard label="Investigation Cost" value={`$${(summary.investigations_cost_usd || 0).toFixed(4)}`} />
-        <StatCard label="PoV Cost" value={`$${(summary.pov_cost_usd || 0).toFixed(4)}`} />
+      {/* Cost */}
+      <div>
+        <p className="label-caps mb-3">COST BREAKDOWN</p>
+        <div className="grid grid-cols-2 gap-px bg-gray-850">
+          <StatCard label="INVESTIGATION COST" value={`$${(summary.investigations_cost_usd || 0).toFixed(4)}`} />
+          <StatCard label="POV COST"           value={`$${(summary.pov_cost_usd || 0).toFixed(4)}`} />
+        </div>
       </div>
 
-      <ModelTable title="Investigation Models" rows={modelStats.investigate} metricKey="confirm_rate" />
-      <ModelTable title="PoV Models" rows={modelStats.pov} metricKey="success_rate" />
+      {/* Model performance tables */}
+      <div>
+        <p className="label-caps mb-3">INVESTIGATION MODELS</p>
+        <ModelTable rows={modelStats.investigate} metricKey="confirm_rate" />
+      </div>
+
+      <div>
+        <p className="label-caps mb-3">POV GENERATION MODELS</p>
+        <ModelTable rows={modelStats.pov} metricKey="success_rate" />
+      </div>
+
     </div>
   )
 }
