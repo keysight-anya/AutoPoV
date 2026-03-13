@@ -1,5 +1,5 @@
 // frontend/src/pages/Settings.jsx
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import WebhookSetup from '../components/WebhookSetup'
 
 function Panel({ title, children }) {
@@ -24,15 +24,19 @@ export default function Settings() {
   const [saved,   setSaved]   = useState(false)
   const [show,    setShow]    = useState(false)
   const [tab,     setTab]     = useState('api')
+  const savedTimerRef = useRef(null)
 
   useEffect(() => {
     setApiKey(localStorage.getItem('autopov_api_key') || '')
   }, [])
 
+  useEffect(() => () => clearTimeout(savedTimerRef.current), [])
+
   const saveApiKey = () => {
     localStorage.setItem('autopov_api_key', apiKey)
     setSaved(true)
-    setTimeout(() => setSaved(false), 2000)
+    clearTimeout(savedTimerRef.current)
+    savedTimerRef.current = setTimeout(() => setSaved(false), 2000)
   }
 
   const inputStyle = {
@@ -105,7 +109,7 @@ export default function Settings() {
               </button>
             </div>
 
-            <button onClick={saveApiKey} style={btnStyle(true)}>
+            <button type="button" onClick={saveApiKey} style={btnStyle(true)}>
               {saved ? '✓ SAVED' : 'SAVE KEY'}
             </button>
           </Panel>

@@ -1,6 +1,7 @@
 // frontend/src/pages/Docs.jsx
+const apiBase = (import.meta.env.VITE_API_URL || 'http://localhost:8000/api').replace(/\/$/, '')
+
 export default function Docs() {
-  const apiBase = (import.meta.env.VITE_API_URL || 'http://localhost:8000/api').replace(/\/$/, '')
 
   const monoStyle = { fontFamily: '"JetBrains Mono", monospace' }
 

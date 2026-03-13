@@ -90,13 +90,13 @@ export default function Policy() {
               </tr>
             </thead>
             <tbody>
-              {investigationRows.map((row, i) => (
-                <tr key={i} style={{ borderBottom: '1px solid var(--border1)' }}>
+              {investigationRows.map((row) => (
+                <tr key={row.model} style={{ borderBottom: '1px solid var(--border1)' }}>
                   <td style={{ padding: '8px 10px', fontSize: 11, color: 'var(--text2)' }}>{row.model}</td>
                   <td style={{ padding: '8px 10px', fontSize: 11, color: 'var(--text1)' }}>{row.total}</td>
                   <td style={{ padding: '8px 10px', fontSize: 11, color: '#22c55e' }}>{row.confirmed}</td>
-                  <td style={{ padding: '8px 10px', fontSize: 11, color: 'var(--accent)' }}>{(row.confirmation_rate * 100).toFixed(1)}%</td>
-                  <td style={{ padding: '8px 10px', fontSize: 11, color: 'var(--text3)' }}>${row.cost_usd.toFixed(4)}</td>
+                  <td style={{ padding: '8px 10px', fontSize: 11, color: 'var(--accent)' }}>{((row.confirmation_rate ?? 0) * 100).toFixed(1)}%</td>
+                  <td style={{ padding: '8px 10px', fontSize: 11, color: 'var(--text3)' }}>${(row.cost_usd ?? 0).toFixed(4)}</td>
                 </tr>
               ))}
             </tbody>
@@ -116,13 +116,13 @@ export default function Policy() {
               </tr>
             </thead>
             <tbody>
-              {povRows.map((row, i) => (
-                <tr key={i} style={{ borderBottom: '1px solid var(--border1)' }}>
+              {povRows.map((row) => (
+                <tr key={row.model} style={{ borderBottom: '1px solid var(--border1)' }}>
                   <td style={{ padding: '8px 10px', fontSize: 11, color: 'var(--text2)' }}>{row.model}</td>
                   <td style={{ padding: '8px 10px', fontSize: 11, color: 'var(--text1)' }}>{row.total}</td>
                   <td style={{ padding: '8px 10px', fontSize: 11, color: '#22c55e' }}>{row.pov_success}</td>
-                  <td style={{ padding: '8px 10px', fontSize: 11, color: 'var(--accent)' }}>{(row.pov_success_rate * 100).toFixed(1)}%</td>
-                  <td style={{ padding: '8px 10px', fontSize: 11, color: 'var(--text3)' }}>${row.cost_usd.toFixed(4)}</td>
+                  <td style={{ padding: '8px 10px', fontSize: 11, color: 'var(--accent)' }}>{((row.pov_success_rate ?? 0) * 100).toFixed(1)}%</td>
+                  <td style={{ padding: '8px 10px', fontSize: 11, color: 'var(--text3)' }}>${(row.cost_usd ?? 0).toFixed(4)}</td>
                 </tr>
               ))}
             </tbody>
