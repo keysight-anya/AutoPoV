@@ -40,6 +40,7 @@ class ScanStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     SKIPPED = "skipped"
+    CANCELLED = "cancelled"
 
 
 class VulnerabilityState(TypedDict):
@@ -59,6 +60,22 @@ class VulnerabilityState(TypedDict):
     inference_time_s: float
     cost_usd: float
     final_status: str
+    # Language tracking
+    detected_language: Optional[str]  # Language of the file
+    source: Optional[str]  # How the finding was detected (codeql, llm, heuristic)
+    # Token tracking per model
+    model_used: Optional[str]
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    # Hierarchical LLM tracking
+    sifter_model: Optional[str]
+    sifter_tokens: Optional[Dict[str, int]]  # {prompt, completion, total}
+    architect_model: Optional[str]
+    architect_tokens: Optional[Dict[str, int]]  # {prompt, completion, total}
+    # Validation and refinement tracking
+    validation_result: Optional[Dict[str, Any]]
+    refinement_history: Optional[List[Dict[str, Any]]]
 
 
 class ScanState(TypedDict):
@@ -75,6 +92,9 @@ class ScanState(TypedDict):
     start_time: str
     end_time: Optional[str]
     total_cost_usd: float
+    # Token tracking per model
+    total_tokens: int
+    tokens_by_model: Dict[str, Dict[str, int]]  # {model_name: {prompt, completion, total}}
     logs: List[str]
     error: Optional[str]
 
@@ -84,6 +104,19 @@ class AgentGraph:
     
     def __init__(self):
         self.graph = self._build_graph()
+        self._scan_manager = None  # Reference to scan manager for cancellation checks
+    
+    def set_scan_manager(self, scan_manager):
+        """Set reference to scan manager for cancellation checks"""
+        self._scan_manager = scan_manager
+    
+    def _check_cancelled(self, state: ScanState) -> bool:
+        """Check if scan has been cancelled"""
+        if self._scan_manager and state.get("scan_id"):
+            scan_info = self._scan_manager._active_scans.get(state["scan_id"])
+            if scan_info and scan_info.get("status") == "cancelled":
+                return True
+        return False
     
     def _build_graph(self) -> StateGraph:
         """Build the LangGraph workflow"""
@@ -97,6 +130,7 @@ class AgentGraph:
         workflow.add_node("investigate", self._node_investigate)
         workflow.add_node("generate_pov", self._node_generate_pov)
         workflow.add_node("validate_pov", self._node_validate_pov)
+        workflow.add_node("refine_pov", self._node_refine_pov)  # Self-healing refiner
         workflow.add_node("run_in_docker", self._node_run_in_docker)
         workflow.add_node("log_confirmed", self._node_log_confirmed)
         workflow.add_node("log_skip", self._node_log_skip)
@@ -129,10 +163,13 @@ class AgentGraph:
             self._should_run_pov,
             {
                 "run_in_docker": "run_in_docker",
-                "generate_pov": "generate_pov",  # Retry
+                "refine_pov": "refine_pov",  # Self-healing refinement
                 "log_failure": "log_failure"
             }
         )
+        
+        # Refiner loop: refinement goes back to validation
+        workflow.add_edge("refine_pov", "validate_pov")
         
         workflow.add_edge("run_in_docker", "log_confirmed")
         
@@ -239,70 +276,85 @@ class AgentGraph:
         return merged
 
     def _node_run_codeql(self, state: ScanState) -> ScanState:
-        """Run CodeQL analysis"""
-        self._log(state, "Running CodeQL analysis...")
+        """
+        Run agentic discovery with resilient decision-tree:
+        1. Language Profiling
+        2. CodeQL Pre-Flight (with Semgrep fallback)
+        3. Hybrid Enforcement for high-risk languages
+        4. Cost-Benefit Triage with LLM Scout
+        """
+        self._log(state, "Running agentic discovery...")
         state["status"] = ScanStatus.RUNNING_CODEQL
+        
         if state.get("preloaded_findings"):
             self._log(state, f"Using preloaded findings: {len(state['preloaded_findings'])}")
             state["findings"] = state["preloaded_findings"]
             return state
-
-
-        state["status"] = ScanStatus.RUNNING_CODEQL
-
-        codeql_available = settings.is_codeql_available()
-        self._log(state, f"CodeQL availability check: {codeql_available}")
-
-        if not codeql_available:
-            self._log(state, "CodeQL not available, using autonomous discovery")
-            findings = self._run_llm_only_analysis(state)
-            auto_findings = self._run_autonomous_discovery(state)
-            state["findings"] = self._merge_findings(findings, auto_findings)
-            self._log(state, f"Autonomous discovery added {len(auto_findings)} candidates")
-            return state
-
+        
         try:
-            findings = []
-            detected_lang = self._detect_language(state["codebase_path"])
-            state["detected_language"] = detected_lang  # Store for later use
-            self._log(state, f"Detected language: {detected_lang}")
-
-            # Create CodeQL database once for all queries
-            db_path = os.path.join(settings.TEMP_DIR, f"codeql_db_{state['scan_id']}")
-            db_created = self._create_codeql_database(state, detected_lang, db_path)
-
-            if not db_created:
-                self._log(state, "CodeQL database creation failed, using autonomous discovery")
-                findings = self._run_llm_only_analysis(state)
-                auto_findings = self._run_autonomous_discovery(state)
-                state["findings"] = self._merge_findings(findings, auto_findings)
-                return state
-
-            # Run queries against the created database
-            for cwe in state["cwes"]:
-                self._log(state, f"Running CodeQL query for {cwe}...")
-                cwe_findings = self._run_codeql_query(state, cwe, detected_lang, db_path)
-                self._log(state, f"{cwe}: Found {len(cwe_findings)} findings")
-                findings.extend(cwe_findings)
-
-            auto_findings = self._run_autonomous_discovery(state)
-            state["findings"] = self._merge_findings(findings, auto_findings)
-            self._log(state, f"CodeQL found {len(findings)} potential vulnerabilities")
-            self._log(state, f"Autonomous discovery added {len(auto_findings)} candidates")
-
+            # Import agentic discovery
+            from agents.agentic_discovery import get_agentic_discovery
+            
+            # Run agentic discovery
+            discovery_results = get_agentic_discovery().discover(
+                codebase_path=state["codebase_path"],
+                cwes=state["cwes"],
+                scan_id=state["scan_id"],
+                state=state
+            )
+            
+            # Merge all findings from different strategies
+            all_findings: List[VulnerabilityState] = []
+            for result in discovery_results:
+                if result.success:
+                    self._log(state, f"{result.strategy.value}: Found {len(result.findings)} findings")
+                    for finding_data in result.findings:
+                        # Convert to VulnerabilityState
+                        finding = VulnerabilityState(
+                            cve_id=None,
+                            filepath=finding_data.get("filepath", ""),
+                            line_number=finding_data.get("line_number", 0),
+                            cwe_type=finding_data.get("cwe_type", "UNKNOWN"),
+                            code_chunk=finding_data.get("code_chunk", ""),
+                            llm_verdict="",
+                            llm_explanation="",
+                            confidence=finding_data.get("confidence", 0.7),
+                            pov_script=None,
+                            pov_path=None,
+                            pov_result=None,
+                            retry_count=0,
+                            inference_time_s=0.0,
+                            cost_usd=0.0,
+                            final_status="pending",
+                            detected_language=finding_data.get("detected_language", state.get("detected_language", "unknown")),
+                            source=finding_data.get("source", "unknown"),
+                            model_used=None,
+                            prompt_tokens=0,
+                            completion_tokens=0,
+                            total_tokens=0,
+                            sifter_model=None,
+                            sifter_tokens=None,
+                            architect_model=None,
+                            architect_tokens=None,
+                            validation_result=None,
+                            refinement_history=None
+                        )
+                        all_findings.append(finding)
+                else:
+                    self._log(state, f"{result.strategy.value}: Failed - {result.error}")
+            
+            # Deduplicate findings
+            state["findings"] = self._merge_findings([], all_findings)
+            self._log(state, f"Agentic discovery completed: {len(state['findings'])} total unique findings")
+            
         except Exception as e:
-            self._log(state, f"CodeQL error: {e}")
+            self._log(state, f"Agentic discovery error: {e}")
             import traceback
             self._log(state, f"Traceback: {traceback.format_exc()}")
+            # Fallback to traditional methods
             findings = self._run_llm_only_analysis(state)
             auto_findings = self._run_autonomous_discovery(state)
             state["findings"] = self._merge_findings(findings, auto_findings)
-        finally:
-            # Cleanup database after all queries are done
-            db_path = os.path.join(settings.TEMP_DIR, f"codeql_db_{state['scan_id']}")
-            if os.path.exists(db_path):
-                shutil.rmtree(db_path, ignore_errors=True)
-                self._log(state, f"Cleaned up CodeQL database at {db_path}")
 
         return state
 
@@ -339,20 +391,38 @@ class AgentGraph:
             self._log(state, f"Exception during CodeQL database creation: {e}")
             return False
     
-    def _detect_language(self, codebase_path: str) -> str:
-        """Detect the primary language of the codebase"""
+    def _detect_all_languages(self, codebase_path: str) -> Dict[str, Any]:
+        """
+        Detect all languages in the codebase with statistics.
+        
+        Returns:
+            Dict with:
+            - primary: Primary language (most files)
+            - all_languages: List of detected languages
+            - language_stats: Dict with file counts per language
+            - file_mappings: Dict mapping file paths to languages
+        """
         extensions = {}
+        file_mappings = {}
+        
         for root, _, files in os.walk(codebase_path):
             for file in files:
                 ext = os.path.splitext(file)[1].lower()
                 extensions[ext] = extensions.get(ext, 0) + 1
+                
+                # Map file to language
+                full_path = os.path.join(root, file)
+                rel_path = os.path.relpath(full_path, codebase_path)
+                lang = self._get_language_from_extension(ext)
+                if lang:
+                    file_mappings[rel_path] = lang
         
         # Map extensions to CodeQL languages
         lang_map = {
             '.py': 'python',
             '.js': 'javascript',
-            '.ts': 'javascript',  # TypeScript uses javascript extractor
-            '.tsx': 'javascript',
+            '.ts': 'typescript',
+            '.tsx': 'typescript',
             '.jsx': 'javascript',
             '.java': 'java',
             '.c': 'cpp',
@@ -361,23 +431,71 @@ class AgentGraph:
             '.h': 'cpp',
             '.go': 'go',
             '.rb': 'ruby',
-            '.php': 'javascript',  # PHP - no native CodeQL support, use JS as fallback
-            '.phtml': 'javascript',
-            '.php3': 'javascript',
-            '.php4': 'javascript',
-            '.php5': 'javascript'
+            '.php': 'php',
+            '.phtml': 'php',
+            '.php3': 'php',
+            '.php4': 'php',
+            '.php5': 'php',
+            '.cs': 'csharp',
+            '.swift': 'swift',
+            '.kt': 'kotlin',
+            '.scala': 'scala',
+            '.rs': 'rust',
         }
         
-        # Find the most common language
+        # Find all languages with counts
         lang_counts = {}
         for ext, count in extensions.items():
             lang = lang_map.get(ext)
             if lang:
                 lang_counts[lang] = lang_counts.get(lang, 0) + count
         
-        if lang_counts:
-            return max(lang_counts, key=lang_counts.get)
-        return 'python'  # Default fallback
+        # Sort by count
+        sorted_langs = sorted(lang_counts.items(), key=lambda x: x[1], reverse=True)
+        
+        primary = sorted_langs[0][0] if sorted_langs else 'python'
+        all_languages = [lang for lang, _ in sorted_langs]
+        
+        return {
+            'primary': primary,
+            'all_languages': all_languages,
+            'language_stats': lang_counts,
+            'file_mappings': file_mappings,
+            'total_files': sum(lang_counts.values())
+        }
+    
+    def _get_language_from_extension(self, ext: str) -> Optional[str]:
+        """Get language from file extension"""
+        lang_map = {
+            '.py': 'python',
+            '.js': 'javascript',
+            '.ts': 'typescript',
+            '.tsx': 'typescript',
+            '.jsx': 'javascript',
+            '.java': 'java',
+            '.c': 'cpp',
+            '.cpp': 'cpp',
+            '.cc': 'cpp',
+            '.h': 'cpp',
+            '.go': 'go',
+            '.rb': 'ruby',
+            '.php': 'php',
+            '.phtml': 'php',
+            '.php3': 'php',
+            '.php4': 'php',
+            '.php5': 'php',
+            '.cs': 'csharp',
+            '.swift': 'swift',
+            '.kt': 'kotlin',
+            '.scala': 'scala',
+            '.rs': 'rust',
+        }
+        return lang_map.get(ext)
+    
+    def _detect_language(self, codebase_path: str) -> str:
+        """Detect the primary language of the codebase (backward compatible)"""
+        result = self._detect_all_languages(codebase_path)
+        return result['primary']
     
     def _get_cwe_query(self, cwe: str, language: str) -> Optional[str]:
         """Get CodeQL query for a CWE based on language using local file paths"""
@@ -574,9 +692,16 @@ class AgentGraph:
                                     artifact = loc.get("artifactLocation", {})
                                     region = loc.get("region", {})
                                     
+                                    filepath = artifact.get("uri", "")
+                                    
+                                    # Detect language for this specific file
+                                    file_lang = self._get_language_from_extension(
+                                        os.path.splitext(filepath)[1].lower()
+                                    ) or state.get("detected_language", "unknown")
+                                    
                                     finding = VulnerabilityState(
                                         cve_id=None,
-                                        filepath=artifact.get("uri", ""),
+                                        filepath=filepath,
                                         line_number=region.get("startLine", 0),
                                         cwe_type=cwe,
                                         code_chunk=res.get("message", {}).get("text", ""),
@@ -589,7 +714,9 @@ class AgentGraph:
                                         retry_count=0,
                                         inference_time_s=0.0,
                                         cost_usd=0.0,
-                                        final_status="pending"
+                                        final_status="pending",
+                                        detected_language=file_lang,
+                                        source="codeql"
                                     )
                                     findings.append(finding)
                 except Exception as e:
@@ -690,6 +817,12 @@ class AgentGraph:
     
     def _node_investigate(self, state: ScanState) -> ScanState:
         """Investigate ONE finding with LLM (at current_finding_idx)"""
+        # Check for cancellation
+        if self._check_cancelled(state):
+            self._log(state, "Scan cancelled by user")
+            state["status"] = ScanStatus.CANCELLED
+            return state
+        
         state["status"] = ScanStatus.INVESTIGATING
         
         idx = state.get("current_finding_idx", 0)
@@ -743,21 +876,44 @@ class AgentGraph:
         finding["inference_time_s"] = result.get("inference_time_s", 0.0)
         finding["code_chunk"] = result.get("vulnerable_code", "")
         
-        # Use actual cost from API response, or estimate if not available
+        # Track tokens per model
+        token_usage = result.get("token_usage", {})
+        model_used = result.get("model_used", model_to_use)
+        
+        finding["model_used"] = model_used
+        finding["prompt_tokens"] = token_usage.get("prompt_tokens", 0)
+        finding["completion_tokens"] = token_usage.get("completion_tokens", 0)
+        finding["total_tokens"] = token_usage.get("total_tokens", 0)
+        
+        # Update scan-level token tracking
+        if finding["total_tokens"] > 0:
+            state["total_tokens"] = state.get("total_tokens", 0) + finding["total_tokens"]
+            
+            # Track tokens by model
+            if "tokens_by_model" not in state or state["tokens_by_model"] is None:
+                state["tokens_by_model"] = {}
+            
+            if model_used not in state["tokens_by_model"]:
+                state["tokens_by_model"][model_used] = {"prompt": 0, "completion": 0, "total": 0}
+            
+            state["tokens_by_model"][model_used]["prompt"] += finding["prompt_tokens"]
+            state["tokens_by_model"][model_used]["completion"] += finding["completion_tokens"]
+            state["tokens_by_model"][model_used]["total"] += finding["total_tokens"]
+        
+        # Track cost (optional, for backward compatibility)
         actual_cost = result.get("cost_usd", 0.0)
         if actual_cost > 0:
             finding["cost_usd"] = actual_cost
-            finding["model_used"] = result.get("model_used", model_to_use)
-            finding["token_usage"] = result.get("token_usage", {})
         else:
-            # Fallback to estimation
-            finding["cost_usd"] = self._estimate_cost(finding["inference_time_s"])
+            finding["cost_usd"] = 0.0
         
         state["total_cost_usd"] += finding["cost_usd"]
         
         state["findings"][idx] = finding
         
         self._log(state, f"  Verdict: {finding['llm_verdict']} (confidence: {finding['confidence']:.2f})")
+        if finding["total_tokens"] > 0:
+            self._log(state, f"  Tokens: {finding['total_tokens']} (prompt: {finding['prompt_tokens']}, completion: {finding['completion_tokens']})")
 
         try:
             get_learning_store().record_investigation(
@@ -778,6 +934,12 @@ class AgentGraph:
     
     def _node_generate_pov(self, state: ScanState) -> ScanState:
         """Generate PoV script for a finding"""
+        # Check for cancellation
+        if self._check_cancelled(state):
+            self._log(state, "Scan cancelled by user")
+            state["status"] = ScanStatus.CANCELLED
+            return state
+        
         state["status"] = ScanStatus.GENERATING_POV
         
         # Get current finding being processed
@@ -818,16 +980,43 @@ class AgentGraph:
             model_name=model_to_use
         )
         
-        # Log model and cost info
-        if result.get("model_used"):
-            self._log(state, f"  Model: {result['model_used']}")
+        # Log model and token info
+        model_used = result.get("model_used", model_to_use)
+        token_usage = result.get("token_usage", {})
+        
+        if model_used:
+            self._log(state, f"  Model: {model_used}")
+        
+        # Track tokens
+        prompt_tokens = token_usage.get("prompt_tokens", 0)
+        completion_tokens = token_usage.get("completion_tokens", 0)
+        total_tokens = token_usage.get("total_tokens", 0)
+        
+        if total_tokens > 0:
+            self._log(state, f"  Tokens: {total_tokens} (prompt: {prompt_tokens}, completion: {completion_tokens})")
+            state["total_tokens"] = state.get("total_tokens", 0) + total_tokens
+            
+            # Track tokens by model
+            if "tokens_by_model" not in state or state["tokens_by_model"] is None:
+                state["tokens_by_model"] = {}
+            
+            if model_used not in state["tokens_by_model"]:
+                state["tokens_by_model"][model_used] = {"prompt": 0, "completion": 0, "total": 0}
+            
+            state["tokens_by_model"][model_used]["prompt"] += prompt_tokens
+            state["tokens_by_model"][model_used]["completion"] += completion_tokens
+            state["tokens_by_model"][model_used]["total"] += total_tokens
+        
+        # Track cost for backward compatibility
         if result.get("cost_usd", 0) > 0:
-            self._log(state, f"  Cost: ${result['cost_usd']:.6f}")
             state["total_cost_usd"] += result["cost_usd"]
         
         if result["success"]:
             finding["pov_script"] = result["pov_script"]
-            finding["pov_model_used"] = result.get("model_used", model_to_use)
+            finding["pov_model_used"] = model_used
+            finding["pov_prompt_tokens"] = prompt_tokens
+            finding["pov_completion_tokens"] = completion_tokens
+            finding["pov_total_tokens"] = total_tokens
             # Cost already added above, just store it in finding
             if "cost_usd" not in finding:
                 finding["cost_usd"] = result.get("cost_usd", 0)
@@ -902,6 +1091,113 @@ class AgentGraph:
         state["findings"][idx] = finding
         return state
 
+    def _node_refine_pov(self, state: ScanState) -> ScanState:
+        """Refine PoV script based on validation errors (Self-Healing)"""
+        state["status"] = ScanStatus.GENERATING_POV  # Still generating
+        
+        idx = state.get("current_finding_idx", 0)
+        if idx >= len(state["findings"]):
+            return state
+        
+        finding = state["findings"][idx]
+        
+        if not finding.get("pov_script"):
+            return state
+        
+        # Get validation errors
+        validation_result = finding.get("validation_result", {})
+        validation_errors = validation_result.get("issues", [])
+        
+        if not validation_errors:
+            self._log(state, "No validation errors to refine, skipping refinement")
+            return state
+        
+        self._log(state, f"Refining PoV for {finding['cwe_type']} (attempt {finding['retry_count'] + 1})...")
+        self._log(state, f"  Errors: {validation_errors[:2]}")
+        
+        # Get code context
+        code_context = get_code_ingester().get_file_content(
+            finding["filepath"], state["scan_id"]
+        ) or ""
+        
+        # Get target language
+        target_language = state.get("detected_language", "python")
+        
+        # Select model for refinement (use architect model in hierarchical mode)
+        policy = get_policy_router()
+        model_to_use = policy.select_model("pov", cwe=finding["cwe_type"], language=target_language)
+        
+        # Initialize refinement history
+        if "refinement_history" not in finding:
+            finding["refinement_history"] = []
+        
+        # Call verifier to refine the PoV
+        verifier = get_verifier()
+        result = verifier.refine_pov(
+            cwe_type=finding["cwe_type"],
+            filepath=finding["filepath"],
+            line_number=finding["line_number"],
+            vulnerable_code=finding.get("code_chunk", ""),
+            explanation=finding["llm_explanation"],
+            code_context=code_context,
+            failed_pov=finding["pov_script"],
+            validation_errors=validation_errors,
+            attempt_number=finding["retry_count"] + 1,
+            target_language=target_language,
+            model_name=model_to_use
+        )
+        
+        # Track refinement in history with tokens
+        model_used = result.get("model_used", model_to_use)
+        token_usage = result.get("token_usage", {})
+        
+        finding["refinement_history"].append({
+            "attempt": finding["retry_count"] + 1,
+            "errors": validation_errors,
+            "success": result.get("success", False),
+            "timestamp": result.get("timestamp", ""),
+            "model_used": model_used,
+            "tokens": token_usage,
+            "cost_usd": result.get("cost_usd", 0.0)
+        })
+        
+        # Track tokens
+        prompt_tokens = token_usage.get("prompt_tokens", 0)
+        completion_tokens = token_usage.get("completion_tokens", 0)
+        total_tokens = token_usage.get("total_tokens", 0)
+        
+        if total_tokens > 0:
+            state["total_tokens"] = state.get("total_tokens", 0) + total_tokens
+            
+            # Track tokens by model
+            if "tokens_by_model" not in state or state["tokens_by_model"] is None:
+                state["tokens_by_model"] = {}
+            
+            if model_used not in state["tokens_by_model"]:
+                state["tokens_by_model"][model_used] = {"prompt": 0, "completion": 0, "total": 0}
+            
+            state["tokens_by_model"][model_used]["prompt"] += prompt_tokens
+            state["tokens_by_model"][model_used]["completion"] += completion_tokens
+            state["tokens_by_model"][model_used]["total"] += total_tokens
+        
+        # Update cost tracking (for backward compatibility)
+        if result.get("cost_usd", 0) > 0:
+            state["total_cost_usd"] += result["cost_usd"]
+            finding["cost_usd"] = finding.get("cost_usd", 0) + result["cost_usd"]
+        
+        if result["success"]:
+            finding["pov_script"] = result["pov_script"]
+            finding["retry_count"] += 1
+            self._log(state, f"  PoV refined successfully (attempt {finding['retry_count']})")
+            if total_tokens > 0:
+                self._log(state, f"  Tokens: {total_tokens} (prompt: {prompt_tokens}, completion: {completion_tokens})")
+        else:
+            self._log(state, f"  PoV refinement failed: {result.get('error')}")
+            finding["retry_count"] += 1
+        
+        state["findings"][idx] = finding
+        return state
+
     def _node_run_in_docker(self, state: ScanState) -> ScanState:
         """Run PoV - uses validation results instead of Docker execution"""
         state["status"] = ScanStatus.RUNNING_POV
@@ -972,6 +1268,20 @@ class AgentGraph:
             return state
 
         # Fall back to Docker-based testing for cases where validation was inconclusive
+        if not finding.get("pov_script"):
+            self._log(state, "No PoV script available, skipping Docker test")
+            finding["pov_result"] = {
+                "success": False,
+                "vulnerability_triggered": False,
+                "stdout": "",
+                "stderr": "No PoV script generated",
+                "exit_code": -1,
+                "execution_time_s": 0,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            state["findings"][idx] = finding
+            return state
+        
         self._log(state, "Running PoV in Docker (fallback)...")
 
         runner = get_docker_runner()
@@ -1077,18 +1387,24 @@ class AgentGraph:
             return "log_skip"
     
     def _should_run_pov(self, state: ScanState) -> str:
-        """Determine if we should run PoV or retry"""
+        """Determine if we should run PoV, refine, or fail"""
         idx = state.get("current_finding_idx", 0)
         if idx >= len(state["findings"]):
             return "log_failure"
         
         finding = state["findings"][idx]
+        validation_result = finding.get("validation_result", {})
         
-        if finding.get("pov_script") and finding["retry_count"] < settings.MAX_RETRIES:
+        # Check if validation passed
+        if validation_result.get("is_valid"):
             return "run_in_docker"
-        elif finding["retry_count"] < settings.MAX_RETRIES:
-            return "generate_pov"  # Retry generation
+        
+        # Check if we can retry with refinement
+        if finding["retry_count"] < settings.MAX_RETRIES:
+            self._log(state, f"PoV validation failed, attempting refinement (attempt {finding['retry_count'] + 1}/{settings.MAX_RETRIES})")
+            return "refine_pov"
         else:
+            self._log(state, f"PoV validation failed after {settings.MAX_RETRIES} attempts")
             return "log_failure"
     
     def _has_more_findings(self, state: ScanState) -> str:
@@ -1182,6 +1498,8 @@ class AgentGraph:
             start_time=datetime.utcnow().isoformat(),
             end_time=None,
             total_cost_usd=0.0,
+            total_tokens=0,
+            tokens_by_model={},
             logs=[],
             error=None
         )

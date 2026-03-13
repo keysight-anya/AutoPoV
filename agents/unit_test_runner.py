@@ -28,6 +28,45 @@ class TestResult:
 class UnitTestRunner:
     """Runs PoV scripts against isolated code in unit test style"""
     
+    # CWE-specific validation oracles with side-effect detection
+    CWE_ORACLES = {
+        "CWE-22": {  # Path Traversal
+            "side_effect_files": ["/tmp/autopov_traversal_test", "/tmp/autopov_path_test"],
+            "expected_content_patterns": ["root:x:0:0:", "etc/passwd", "windows/system32", "boot.ini"],
+            "expected_output_patterns": ["root:", "administrator", "system32", "passwd"],
+            "description": "File content from outside intended directory"
+        },
+        "CWE-78": {  # Command Injection
+            "side_effect_files": ["/tmp/autopov_rce", "/tmp/autopov_cmd_injection"],
+            "expected_output_patterns": ["uid=", "gid=", "root", "bin/bash", "cmd.exe", "whoami", "hostname"],
+            "description": "Command execution output"
+        },
+        "CWE-89": {  # SQL Injection
+            "expected_output_patterns": ["MariaDB", "MySQL", "SQLite", "PostgreSQL", "version", "@@version", "table_schema", "information_schema"],
+            "timing_threshold_s": 5.0,  # Time-based detection
+            "error_patterns": ["sql syntax", "mysql_fetch", "pg_query", "sqlite3"],
+            "description": "Database information disclosure or error"
+        },
+        "CWE-94": {  # Code Injection
+            "side_effect_files": ["/tmp/autopov_code_exec"],
+            "expected_output_patterns": ["eval executed", "exec completed", "code injected", "system("],
+            "description": "Code execution evidence"
+        },
+        "CWE-79": {  # XSS (Cross-Site Scripting)
+            "expected_output_patterns": ["<script>", "alert(", "javascript:", "onerror=", "onload=", "document.cookie", "window.location"],
+            "dom_patterns": ["innerHTML", "document.write", "eval(", "setTimeout", "setInterval"],
+            "description": "JavaScript execution in output"
+        },
+        "CWE-502": {  # Deserialization
+            "expected_output_patterns": ["pickle", "unserialize", "ObjectInputStream", "yaml.load", "json.loads"],
+            "description": "Unsafe deserialization"
+        },
+        "CWE-611": {  # XXE (XML External Entity)
+            "expected_output_patterns": ["<!ENTITY", "SYSTEM", "file://", "http://", "xml version"],
+            "description": "XML external entity processing"
+        },
+    }
+    
     def __init__(self):
         self.test_history = []
     
@@ -80,15 +119,17 @@ class UnitTestRunner:
             end_time = datetime.utcnow()
             execution_time = (end_time - start_time).total_seconds()
             
-            # Check if vulnerability was triggered
-            vuln_triggered = (
-                "VULNERABILITY TRIGGERED" in result.get("stdout", "") or
-                result.get("vulnerability_triggered", False)
+            # Check if vulnerability was triggered using CWE-specific oracles
+            oracle_result = self._check_cwe_oracle(
+                cwe_type=cwe_type,
+                stdout=result.get("stdout", ""),
+                stderr=result.get("stderr", ""),
+                execution_time=execution_time
             )
             
             test_result = TestResult(
                 success=result.get("success", False),
-                vulnerability_triggered=vuln_triggered,
+                vulnerability_triggered=oracle_result["triggered"],
                 execution_time_s=execution_time,
                 stdout=result.get("stdout", ""),
                 stderr=result.get("stderr", ""),
@@ -96,7 +137,8 @@ class UnitTestRunner:
                 details={
                     "cwe_type": cwe_type,
                     "extraction_success": True,
-                    "test_method": "isolated_function"
+                    "test_method": "isolated_function",
+                    "oracle": oracle_result
                 }
             )
             
@@ -316,6 +358,96 @@ sys.stdin = io.StringIO("""{mock_input}""")
             ))
         
         return results
+    
+    def _check_cwe_oracle(
+        self,
+        cwe_type: str,
+        stdout: str,
+        stderr: str,
+        execution_time: float
+    ) -> Dict[str, Any]:
+        """
+        Check if vulnerability was triggered using CWE-specific oracles.
+        
+        Returns a dict with:
+        - triggered: bool - Whether vulnerability was triggered
+        - confidence: str - "high", "medium", "low"
+        - evidence: list - What evidence was found
+        - method: str - Which detection method succeeded
+        """
+        combined_output = (stdout + stderr).lower()
+        evidence = []
+        confidence = "low"
+        method = None
+        
+        # Check for the basic indicator first (low confidence)
+        if "VULNERABILITY TRIGGERED" in stdout:
+            evidence.append("PoV printed 'VULNERABILITY TRIGGERED'")
+            confidence = "low"
+            method = "string_match"
+        
+        # Get oracle config for this CWE
+        oracle = self.CWE_ORACLES.get(cwe_type, {})
+        
+        # Check for expected output patterns (medium-high confidence)
+        expected_patterns = oracle.get("expected_output_patterns", [])
+        for pattern in expected_patterns:
+            if pattern.lower() in combined_output:
+                evidence.append(f"Expected pattern found: '{pattern}'")
+                confidence = "high"
+                method = "output_pattern"
+        
+        # Check for content patterns in side-effect files (high confidence)
+        content_patterns = oracle.get("expected_content_patterns", [])
+        side_effect_files = oracle.get("side_effect_files", [])
+        for file_path in side_effect_files:
+            try:
+                if os.path.exists(file_path):
+                    with open(file_path, 'r') as f:
+                        file_content = f.read()
+                    for pattern in content_patterns:
+                        if pattern.lower() in file_content.lower():
+                            evidence.append(f"Sensitive content in {file_path}: '{pattern}'")
+                            confidence = "high"
+                            method = "file_content"
+                    # Clean up the file after checking
+                    os.remove(file_path)
+            except Exception:
+                pass
+        
+        # Check for error patterns (medium confidence)
+        error_patterns = oracle.get("error_patterns", [])
+        for pattern in error_patterns:
+            if pattern.lower() in combined_output:
+                evidence.append(f"Error pattern found: '{pattern}'")
+                if confidence == "low":
+                    confidence = "medium"
+                    method = "error_pattern"
+        
+        # Check for DOM patterns (for XSS)
+        dom_patterns = oracle.get("dom_patterns", [])
+        for pattern in dom_patterns:
+            if pattern.lower() in combined_output:
+                evidence.append(f"DOM manipulation found: '{pattern}'")
+                confidence = "high"
+                method = "dom_pattern"
+        
+        # Check timing for time-based detection (SQL injection)
+        timing_threshold = oracle.get("timing_threshold_s")
+        if timing_threshold and execution_time >= timing_threshold:
+            evidence.append(f"Time-based detection: {execution_time:.2f}s >= {timing_threshold}s")
+            confidence = "medium"
+            method = "timing"
+        
+        triggered = len(evidence) > 0
+        
+        return {
+            "triggered": triggered,
+            "confidence": confidence,
+            "evidence": evidence,
+            "method": method,
+            "cwe_description": oracle.get("description", "Unknown")
+        }
     
     def validate_syntax(self, pov_script: str) -> Dict[str, Any]:
         """Validate PoV script syntax without execution"""

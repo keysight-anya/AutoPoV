@@ -7,7 +7,7 @@ import json
 import re
 import ast
 import os
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List
 from datetime import datetime
 
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -302,20 +302,36 @@ class VulnerabilityVerifier:
                 scan_id=f"validate_{cwe_type}_{line_number}"
             )
             
+            # Extract oracle evidence from unit test details
+            oracle_result = unit_result.details.get("oracle", {})
+            
             result["unit_test_result"] = {
                 "success": unit_result.success,
                 "vulnerability_triggered": unit_result.vulnerability_triggered,
                 "execution_time_s": unit_result.execution_time_s,
                 "exit_code": unit_result.exit_code,
                 "stdout": unit_result.stdout[:500] if unit_result.stdout else "",  # Truncate
-                "stderr": unit_result.stderr[:500] if unit_result.stderr else ""  # Truncate
+                "stderr": unit_result.stderr[:500] if unit_result.stderr else "",  # Truncate
+                "oracle": oracle_result  # Include detailed oracle evidence
             }
             
             if unit_result.vulnerability_triggered:
                 result["is_valid"] = True
                 result["will_trigger"] = "YES"
                 result["validation_method"] = "unit_test_execution"
-                result["suggestions"].append("Unit test execution confirmed vulnerability trigger")
+                
+                # Add detailed evidence to suggestions
+                evidence = oracle_result.get("evidence", [])
+                confidence = oracle_result.get("confidence", "low")
+                method = oracle_result.get("method", "unknown")
+                
+                if evidence:
+                    result["suggestions"].append(f"Vulnerability confirmed with {confidence} confidence ({method}):")
+                    for item in evidence[:3]:  # Show top 3 evidence items
+                        result["suggestions"].append(f"  - {item}")
+                else:
+                    result["suggestions"].append("Unit test execution confirmed vulnerability trigger")
+                
                 return result
             elif unit_result.success:
                 result["will_trigger"] = "MAYBE"
@@ -548,6 +564,140 @@ class VulnerabilityVerifier:
                 "failure_reason": "Could not parse analysis",
                 "suggested_changes": "Review execution output manually",
                 "different_approach": attempt_number >= max_retries
+            }
+    
+    def refine_pov(
+        self,
+        cwe_type: str,
+        filepath: str,
+        line_number: int,
+        vulnerable_code: str,
+        explanation: str,
+        code_context: str,
+        failed_pov: str,
+        validation_errors: List[str],
+        attempt_number: int,
+        target_language: str = "python",
+        model_name: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Refine a failed PoV script based on validation errors
+        
+        Args:
+            cwe_type: CWE type
+            filepath: File path
+            line_number: Line number
+            vulnerable_code: The vulnerable code snippet
+            explanation: Vulnerability explanation
+            code_context: Surrounding code context
+            failed_pov: The failed PoV script
+            validation_errors: List of validation error messages
+            attempt_number: Current retry attempt number
+            target_language: Language of the target codebase
+            model_name: Optional model name to use
+        
+        Returns:
+            Dictionary with refined PoV script and metadata
+        """
+        from prompts import format_pov_refinement_prompt
+        
+        start_time = datetime.utcnow()
+        
+        try:
+            # Format refinement prompt
+            prompt = format_pov_refinement_prompt(
+                cwe_type=cwe_type,
+                filepath=filepath,
+                line_number=line_number,
+                vulnerable_code=vulnerable_code,
+                explanation=explanation,
+                code_context=code_context,
+                failed_pov=failed_pov,
+                validation_errors=validation_errors,
+                attempt_number=attempt_number,
+                target_language=target_language
+            )
+            
+            # Call LLM with specified model
+            llm = self._get_llm(model_name)
+            messages = [
+                SystemMessage(content="You are a security researcher fixing a failed Proof-of-Vulnerability script."),
+                HumanMessage(content=prompt)
+            ]
+            
+            response = llm.invoke(messages)
+            pov_script = response.content.strip()
+            
+            # Get actual cost from response
+            actual_cost = 0.0
+            token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            
+            try:
+                if hasattr(response, 'usage_metadata') and response.usage_metadata:
+                    um = response.usage_metadata
+                    token_usage = {
+                        "prompt_tokens": um.get('input_tokens', 0) or um.get('prompt_tokens', 0),
+                        "completion_tokens": um.get('output_tokens', 0) or um.get('completion_tokens', 0),
+                        "total_tokens": um.get('total_tokens', 0)
+                    }
+                elif hasattr(response, 'response_metadata') and response.response_metadata:
+                    rm = response.response_metadata
+                    if 'token_usage' in rm:
+                        usage = rm['token_usage']
+                        token_usage = {
+                            "prompt_tokens": usage.get('prompt_tokens', 0),
+                            "completion_tokens": usage.get('completion_tokens', 0),
+                            "total_tokens": usage.get('total_tokens', 0)
+                        }
+                    elif 'usage' in rm:
+                        usage = rm['usage']
+                        token_usage = {
+                            "prompt_tokens": usage.get('prompt_tokens', 0) or usage.get('input_tokens', 0),
+                            "completion_tokens": usage.get('completion_tokens', 0) or usage.get('output_tokens', 0),
+                            "total_tokens": usage.get('total_tokens', 0)
+                        }
+                
+                if token_usage["total_tokens"] > 0:
+                    from agents.investigator import get_investigator
+                    inv = get_investigator()
+                    actual_cost = inv._calculate_actual_cost(
+                        model_name or llm._autopov_model_name,
+                        token_usage["prompt_tokens"],
+                        token_usage["completion_tokens"]
+                    )
+            except Exception as e:
+                print(f"[CostTracking] Error extracting token usage in refine_pov: {e}")
+            
+            # Clean up markdown code blocks if present
+            if "```python" in pov_script:
+                pov_script = pov_script.split("```python")[1].split("```")[0].strip()
+            elif "```javascript" in pov_script:
+                pov_script = pov_script.split("```javascript")[1].split("```")[0].strip()
+            elif "```" in pov_script:
+                pov_script = pov_script.split("```")[1].split("```")[0].strip()
+            
+            end_time = datetime.utcnow()
+            generation_time = (end_time - start_time).total_seconds()
+            
+            return {
+                "success": True,
+                "pov_script": pov_script,
+                "refinement_time_s": generation_time,
+                "timestamp": end_time.isoformat(),
+                "model_used": model_name or llm._autopov_model_name,
+                "cost_usd": actual_cost,
+                "token_usage": token_usage,
+                "attempt_number": attempt_number
+            }
+            
+        except Exception as e:
+            end_time = datetime.utcnow()
+            return {
+                "success": False,
+                "error": str(e),
+                "pov_script": failed_pov,  # Return original on failure
+                "refinement_time_s": (end_time - start_time).total_seconds(),
+                "timestamp": end_time.isoformat()
             }
 
 

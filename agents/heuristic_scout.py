@@ -10,194 +10,150 @@ from typing import List, Dict, Any
 from app.config import settings
 
 
-def _p(pattern: str, flags: int = re.IGNORECASE) -> re.Pattern:
-    """Compile a regex pattern."""
-    return re.compile(pattern, flags)
-
-
 class HeuristicScout:
     """Lightweight heuristics for candidate discovery."""
 
     def __init__(self):
         self.max_findings = settings.SCOUT_MAX_FINDINGS
-        # Note: some patterns are built via concatenation to avoid triggering
-        # security scanners that flag on certain literal strings in source code.
-        # The resulting compiled patterns match exactly what is described by the CWE.
-        _react_xss = _p("dangerously" + "SetInner" + "HTML")
-        _deser_py = _p("pick" + "le\\.loads?\\s*\\(")
-        _deser_java = _p("Object" + "Input" + "Stream\\s*\\(")
-
         self._patterns = {
-            # SQL Injection
             "CWE-89": [
-                _p(r"(SELECT|INSERT|UPDATE|DELETE).*\+"),
-                _p(r"(SELECT|INSERT|UPDATE|DELETE).*%s"),
-                _p(r"(SELECT|INSERT|UPDATE|DELETE).*format\("),
-                _p(r"f[\"'].*(SELECT|INSERT|UPDATE|DELETE).*\{.*\}"),
-                _p(r"execute\s*\(\s*f[\"']"),
-                _p(r"cursor\.execute\s*\(\s*[^\"']*\+"),
-                _p(r"\.execute\s*\(\s*f[\"'].*SELECT"),
-                # JS/TS: template literal SQL
-                _p(r"`\s*(SELECT|INSERT|UPDATE|DELETE)[^`]*\$\{"),
-                # Sequelize/knex raw queries
-                _p(r"sequelize\.query\s*\("),
-                _p(r"\.raw\s*\([^)]*\$\{"),
+                re.compile(r"(SELECT|INSERT|UPDATE|DELETE).*\+", re.IGNORECASE),
+                re.compile(r"(SELECT|INSERT|UPDATE|DELETE).*%s", re.IGNORECASE),
+                re.compile(r"(SELECT|INSERT|UPDATE|DELETE).*format\(", re.IGNORECASE),
+                re.compile(r"f[\"'].*(SELECT|INSERT|UPDATE|DELETE).*\{.*\}", re.IGNORECASE),
+                re.compile(r"execute\s*\(\s*f[\"']", re.IGNORECASE),
+                re.compile(r"cursor\.execute\s*\(\s*[^\"']*\+", re.IGNORECASE),
+                re.compile(r"\.execute\s*\(\s*f[\"'].*SELECT", re.IGNORECASE),
             ],
-            # XSS
             "CWE-79": [
-                _p(r"innerHTML\s*=\s*(?!['\"]\s*['\"])"),
-                _p(r"outerHTML\s*=\s*(?!['\"]\s*['\"])"),
-                _p(r"document\.write\s*\("),
-                _p(r"\.insertAdjacentHTML\s*\("),
-                _p(r"res\.send\s*\([^)]*req\.(body|query|params)"),
-                _p(r"res\.json\s*\([^)]*req\.(body|query|params)"),
-                _p(r"mark_safe\s*\("),
-                _p(r"render_template_string\s*\("),
-                _react_xss,
+                re.compile(r"innerHTML\s*=\s*[^\"']", re.IGNORECASE),
+                re.compile(r"document\.write\s*\(", re.IGNORECASE),
+                re.compile(r"\.html\s*\(\s*[^\"']", re.IGNORECASE),
+                re.compile(r"dangerouslySetInnerHTML", re.IGNORECASE),
+                re.compile(r"render_template_string\s*\(.*request\.", re.IGNORECASE),
             ],
-            # Path Traversal
             "CWE-22": [
-                _p(r"path\.join\s*\([^)]*req\.(body|query|params)"),
-                _p(r"path\.resolve\s*\([^)]*req\.(body|query|params)"),
-                _p(r"fs\.(readFile|writeFile|readFileSync|createReadStream)\s*\([^)]*req\."),
-                _p(r"__dirname.*\+.*req\."),
-                _p(r"open\s*\([^)]*request\.(GET|POST|args|form|data)"),
-                _p(r"new\s+File\s*\([^)]*request\.getParameter"),
-                _p(r"(readFile|readFileSync)\s*\(\s*(?!['\"\/])\w+"),
+                re.compile(r"os\.path\.join\s*\(.*request\.", re.IGNORECASE),
+                re.compile(r"open\s*\(.*request\.", re.IGNORECASE),
+                re.compile(r"\.\.[\\/]", re.IGNORECASE),
+                re.compile(r"path\.join\s*\(.*\.\.", re.IGNORECASE),
+                re.compile(r"readFile\s*\(.*req\.", re.IGNORECASE),
             ],
-            # Command Injection
             "CWE-78": [
-                _p(r"(exec|execSync|spawn|spawnSync)\s*\([^)]*req\."),
-                _p(r"(exec|execSync|spawn)\s*\(\s*['\"`][^'\"]+\$\{"),
-                _p(r"(exec|execSync|spawn)\s*\([^)]*\+"),
-                _p(r"(subprocess\.(run|call|Popen)|os\.system)\s*\([^)]*request\."),
-                _p(r"subprocess\.[^\(]+\([^)]*shell\s*=\s*True"),
-                _p(r"os\.popen\s*\("),
+                re.compile(r"os\.system\s*\(", re.IGNORECASE),
+                re.compile(r"subprocess\.(run|Popen|call|check_output)\s*\(.*shell\s*=\s*True", re.IGNORECASE),
+                re.compile(r"exec\s*\(.*request\.", re.IGNORECASE),
+                re.compile(r"child_process\.(exec|spawn)\s*\(.*req\.", re.IGNORECASE),
+                re.compile(r"Runtime\.exec\s*\(", re.IGNORECASE),
             ],
-            # Code Injection / eval
             "CWE-94": [
-                _p(r"\beval\s*\("),
-                _p(r"new\s+Function\s*\("),
-                _p(r"vm\.runInNewContext\s*\("),
-                _p(r"vm\.runInThisContext\s*\("),
-                _p(r"exec\s*\(\s*[^)]*request\."),
-                _p(r"yaml\.load\s*\([^)]*(?!Loader)"),
+                re.compile(r"\beval\s*\(", re.IGNORECASE),
+                re.compile(r"\bexec\s*\(.*request\.", re.IGNORECASE),
+                re.compile(r"compile\s*\(.*request\.", re.IGNORECASE),
+                re.compile(r"__import__\s*\(.*request\.", re.IGNORECASE),
             ],
-            # Hardcoded Credentials
-            "CWE-798": [
-                _p(r"(password|passwd|secret|api_key|apikey)\s*=\s*['\"][^'\"]{4,}"),
-                _p(r"(password|passwd|secret|api_key|apikey)\s*:\s*['\"][^'\"]{4,}"),
-                _p(r"Authorization\s*:\s*['\"]?(Bearer|Basic)\s+[A-Za-z0-9+/]{10,}"),
-                _p(r"password\s*[=:]\s*['\"](?:admin|password|123456|secret|test|default)['\"]"),
-            ],
-            # Insecure Deserialization
             "CWE-502": [
-                _deser_py,
-                _p(r"marshal\.loads?\s*\("),
-                _p(r"unserialize\s*\("),
-                _deser_java,
-                _p(r"JSON\.parse\s*\([^)]*req\."),
+                re.compile(r"pickle\.loads\s*\(", re.IGNORECASE),
+                re.compile(r"yaml\.load\s*\((?!.*Loader)", re.IGNORECASE),
+                re.compile(r"marshal\.loads\s*\(", re.IGNORECASE),
+                re.compile(r"ObjectInputStream\s*\(", re.IGNORECASE),
+                re.compile(r"unserialize\s*\(", re.IGNORECASE),
             ],
-            # Open Redirect
-            "CWE-601": [
-                _p(r"res\.redirect\s*\([^)]*req\.(body|query|params)"),
-                _p(r"HttpResponseRedirect\s*\([^)]*request\.(GET|POST)"),
-                _p(r"redirect\s*\([^)]*request\.(GET|POST|args)"),
+            "CWE-798": [
+                re.compile(r"password\s*=\s*[\"'][^\"']{4,}[\"']", re.IGNORECASE),
+                re.compile(r"api_key\s*=\s*[\"'][^\"']{8,}[\"']", re.IGNORECASE),
+                re.compile(r"secret\s*=\s*[\"'][^\"']{4,}[\"']", re.IGNORECASE),
+                re.compile(r"AWS_SECRET_ACCESS_KEY\s*=\s*[\"'][^\"']{8,}[\"']", re.IGNORECASE),
             ],
-            # Cleartext Storage
             "CWE-312": [
-                _p(r"(localStorage|sessionStorage)\.setItem\s*\([^)]*(?:password|token|secret)"),
-                _p(r"console\.(log|info|debug)\s*\([^)]*(?:password|token|secret)"),
+                re.compile(r"(password|secret|token|key)\s*=\s*[\"']", re.IGNORECASE),
+                re.compile(r"log(ger)?\..*password", re.IGNORECASE),
+                re.compile(r"print\s*\(.*password", re.IGNORECASE),
             ],
-            # CSRF
-            "CWE-352": [
-                _p(r"app\.(post|put|delete|patch)\s*\("),
-                _p(r"@(app|router|blueprint)\.(post|put|delete|patch)\s*\("),
-            ],
-            # Use of Broken Crypto
             "CWE-327": [
                 re.compile(r"MD5\s*\(", re.IGNORECASE),
                 re.compile(r"SHA1\s*\(", re.IGNORECASE),
                 re.compile(r"hashlib\.md5", re.IGNORECASE),
                 re.compile(r"hashlib\.sha1\b", re.IGNORECASE),
-                re.compile(r"\bDES\b", re.IGNORECASE),
-                re.compile(r"\bRC4\b", re.IGNORECASE),
+                re.compile(r"DES\b", re.IGNORECASE),
+                re.compile(r"RC4\b", re.IGNORECASE),
             ],
-            # Improper Authentication
+            "CWE-352": [
+                re.compile(r"@csrf_exempt", re.IGNORECASE),
+                re.compile(r"csrf_token.*false", re.IGNORECASE),
+                re.compile(r"CSRFMiddleware.*False", re.IGNORECASE),
+                re.compile(r"disable.*csrf", re.IGNORECASE),
+            ],
             "CWE-287": [
                 re.compile(r"if\s+username\s*==\s*[\"']admin[\"']", re.IGNORECASE),
                 re.compile(r"authenticate\s*\(.*skip", re.IGNORECASE),
                 re.compile(r"auth\s*=\s*False", re.IGNORECASE),
                 re.compile(r"bypass.*auth", re.IGNORECASE),
             ],
-            # Missing Auth for Critical Function
             "CWE-306": [
+                re.compile(r"@app\.route.*methods.*POST.*\n(?!.*login_required)", re.IGNORECASE),
                 re.compile(r"allow_anonymous\s*=\s*True", re.IGNORECASE),
                 re.compile(r"authentication_classes\s*=\s*\[\s*\]", re.IGNORECASE),
                 re.compile(r"permission_classes\s*=\s*\[\s*\]", re.IGNORECASE),
             ],
-            # SSRF
+            "CWE-601": [
+                re.compile(r"redirect\s*\(.*request\.", re.IGNORECASE),
+                re.compile(r"HttpResponseRedirect\s*\(.*request\.", re.IGNORECASE),
+                re.compile(r"res\.redirect\s*\(.*req\.", re.IGNORECASE),
+                re.compile(r"Location.*request\.(GET|POST|args|params)", re.IGNORECASE),
+            ],
             "CWE-918": [
                 re.compile(r"requests\.(get|post)\s*\(.*request\.", re.IGNORECASE),
                 re.compile(r"urllib.*urlopen\s*\(.*request\.", re.IGNORECASE),
                 re.compile(r"fetch\s*\(.*req\.", re.IGNORECASE),
                 re.compile(r"http\.get\s*\(.*req\.", re.IGNORECASE),
             ],
-            # Unrestricted Upload
             "CWE-434": [
                 re.compile(r"filename\s*=\s*file\.(filename|name)", re.IGNORECASE),
                 re.compile(r"\.save\s*\(.*upload", re.IGNORECASE),
                 re.compile(r"move_uploaded_file\s*\(", re.IGNORECASE),
                 re.compile(r"MultipartFile.*transfer", re.IGNORECASE),
             ],
-            # XXE
             "CWE-611": [
                 re.compile(r"XMLParser\s*\(.*resolve_entities\s*=\s*True", re.IGNORECASE),
                 re.compile(r"etree\.parse\s*\(", re.IGNORECASE),
                 re.compile(r"DocumentBuilderFactory\s*\.", re.IGNORECASE),
                 re.compile(r"FEATURE_EXTERNAL_GENERAL_ENTITIES", re.IGNORECASE),
             ],
-            # Resource Exhaustion
             "CWE-400": [
+                re.compile(r"while\s+True\s*:", re.IGNORECASE),
                 re.compile(r"re\.compile\s*\(.*request\.", re.IGNORECASE),
                 re.compile(r"time\.sleep\s*\(.*request\.", re.IGNORECASE),
             ],
-            # Session Fixation
             "CWE-384": [
+                re.compile(r"session\[.*\]\s*=.*request\.", re.IGNORECASE),
                 re.compile(r"SESSION_ID\s*=.*request\.", re.IGNORECASE),
                 re.compile(r"setSession\s*\(.*request\.", re.IGNORECASE),
             ],
-            # Info Exposure
             "CWE-200": [
                 re.compile(r"traceback\.print_exc\s*\(", re.IGNORECASE),
                 re.compile(r"printStackTrace\s*\(", re.IGNORECASE),
                 re.compile(r"DEBUG\s*=\s*True", re.IGNORECASE),
                 re.compile(r"e\.getMessage\s*\(\)\s*\+", re.IGNORECASE),
             ],
-            # Improper Input Validation
             "CWE-20": [
                 re.compile(r"int\s*\(\s*request\.", re.IGNORECASE),
                 re.compile(r"float\s*\(\s*request\.", re.IGNORECASE),
                 re.compile(r"request\.(GET|POST|args|params|body)\s*\[.*\]", re.IGNORECASE),
             ],
-            # Buffer Overflow (C/C++)
             "CWE-119": [
-                _p(r"\bstrcpy\s*\("),
-                _p(r"\bgets\s*\("),
-                _p(r"\bsprintf\s*\("),
-                _p(r"\bmemcpy\s*\("),
-                _p(r"\bstrcat\s*\("),
-                _p(r"\bscanf\s*\([^)]*%s"),
+                re.compile(r"\bstrcpy\s*\(", re.IGNORECASE),
+                re.compile(r"\bgets\s*\(", re.IGNORECASE),
+                re.compile(r"\bsprintf\s*\(", re.IGNORECASE),
+                re.compile(r"\bmemcpy\s*\(", re.IGNORECASE),
             ],
-            # Integer Overflow (C/C++)
             "CWE-190": [
-                _p(r"\bint\s+\w+\s*=\s*\w+\s*\+\s*\w+"),
-                _p(r"\bsize_t\s+\w+\s*=\s*\w+\s*\*\s*\w+"),
+                re.compile(r"\bint\s+\w+\s*=\s*\w+\s*\+\s*\w+", re.IGNORECASE),
+                re.compile(r"\bsize_t\s+\w+\s*=\s*\w+\s*\*\s*\w+", re.IGNORECASE),
             ],
-            # Use After Free (C/C++)
             "CWE-416": [
-                _p(r"\bfree\s*\(\s*\w+\s*\)"),
-            ],
+                re.compile(r"\bfree\s*\(\s*\w+\s*\)", re.IGNORECASE),
+            ]
         }
 
     def _is_code_file(self, filepath: str) -> bool:
@@ -283,3 +239,7 @@ heuristic_scout = HeuristicScout()
 
 def get_heuristic_scout() -> HeuristicScout:
     return heuristic_scout
+
+
+# Export for agentic discovery
+__all__ = ['HeuristicScout', 'get_heuristic_scout']
