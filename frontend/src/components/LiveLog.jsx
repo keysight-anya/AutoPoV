@@ -1,69 +1,75 @@
+// frontend/src/components/LiveLog.jsx
 import { useEffect, useRef } from 'react'
-import { Terminal } from 'lucide-react'
 
-const LINE_COLOR = (msg) => {
-  if (/VULNERABILITY TRIGGERED/i.test(msg)) return 'text-threat-400 font-semibold'
-  if (/error|failed|exception/i.test(msg)) return 'text-red-400'
-  if (/success|confirmed|complete/i.test(msg)) return 'text-safe-400'
-  if (/warning|warn/i.test(msg)) return 'text-warn-400'
-  if (/\[INFO\]|→|✓/i.test(msg)) return 'text-primary-400'
-  return 'text-gray-400'
+const LOG_COLOR = (msg) => {
+  if (/error|failed|exception/i.test(msg))               return '#fca5a5'  // red
+  if (/success|confirmed|completed/i.test(msg))          return '#86efac'  // green
+  if (/vulnerability triggered/i.test(msg))              return '#f87171'  // bright red
+  if (/warning|skipped/i.test(msg))                      return '#fde047'  // yellow
+  return 'var(--text2)'
 }
 
-function LiveLog({ logs }) {
-  const logEndRef = useRef(null)
+export default function LiveLog({ logs = [] }) {
+  const bottomRef = useRef(null)
 
   useEffect(() => {
-    logEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [logs])
 
-  const parseLine = (log) => {
-    const match = log.match(/^\[(.*?)\]\s(.*)$/)
-    if (match) return { ts: match[1], msg: match[2] }
-    return { ts: null, msg: log }
+  const parse = (line) => {
+    const m = line.match(/^\[(.*?)\] (.*)$/)
+    return m ? { ts: m[1], msg: m[2] } : { ts: null, msg: line }
   }
 
   return (
-    <div className="bg-gray-950 rounded-xl border border-gray-800/60 overflow-hidden">
-      {/* Header */}
-      <div className="flex items-center gap-2 px-4 py-2.5 border-b border-gray-800/60 bg-gray-900/60">
-        <div className="flex gap-1.5">
-          <div className="w-2.5 h-2.5 rounded-full bg-red-500/60" />
-          <div className="w-2.5 h-2.5 rounded-full bg-warn-500/60" />
-          <div className="w-2.5 h-2.5 rounded-full bg-safe-500/60" />
-        </div>
-        <div className="flex items-center gap-1.5 text-xs text-gray-500 ml-2">
-          <Terminal className="w-3.5 h-3.5 text-primary-500/70" />
-          <span>scan log</span>
-        </div>
-        <span className="ml-auto text-xs text-gray-700">{logs.length} lines</span>
+    <div style={{
+      flex: 1,
+      display: 'flex',
+      flexDirection: 'column',
+      overflow: 'hidden',
+    }}>
+      {/* Terminal header */}
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 8,
+        padding: '8px 14px',
+        background: 'var(--surface2)',
+        borderBottom: '1px solid var(--border1)',
+        fontFamily: '"JetBrains Mono", monospace',
+        fontSize: 9, letterSpacing: '.12em', color: 'var(--text3)',
+      }}>
+        <span style={{ color: 'var(--accent)' }}>●</span>
+        LIVE LOG
+        <span style={{ marginLeft: 'auto' }}>{logs.length} lines</span>
       </div>
 
-      {/* Log body */}
-      <div className="h-96 overflow-y-auto p-4 font-mono text-xs leading-relaxed">
+      {/* Log content */}
+      <div style={{
+        flex: 1,
+        overflowY: 'auto',
+        padding: '12px 14px',
+        background: 'var(--bg)',
+        fontFamily: '"JetBrains Mono", monospace',
+        fontSize: 11,
+      }}>
         {logs.length === 0 ? (
-          <span className="text-gray-600 italic">Waiting for scan output…</span>
+          <span style={{ color: 'var(--text3)' }}>Waiting for scan to start…</span>
         ) : (
-          <div className="space-y-0.5">
-            {logs.map((log, i) => {
-              const { ts, msg } = parseLine(log)
-              return (
-                <div key={i} className="log-entry flex gap-3 group">
-                  {ts && (
-                    <span className="text-gray-700 shrink-0 group-hover:text-gray-500 transition-colors">
-                      {new Date(ts).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}
-                    </span>
-                  )}
-                  <span className={LINE_COLOR(msg)}>{msg}</span>
-                </div>
-              )
-            })}
-            <div ref={logEndRef} />
-          </div>
+          logs.map((line, i) => {
+            const { ts, msg } = parse(line)
+            return (
+              <div key={i} className="log-entry" style={{ display: 'flex', gap: 10, marginBottom: 2 }}>
+                {ts && (
+                  <span style={{ color: 'var(--text3)', flexShrink: 0, fontSize: 10 }}>
+                    {new Date(ts).toLocaleTimeString()}
+                  </span>
+                )}
+                <span style={{ color: LOG_COLOR(msg) }}>{msg}</span>
+              </div>
+            )
+          })
         )}
+        <div ref={bottomRef} />
       </div>
     </div>
   )
 }
-
-export default LiveLog
