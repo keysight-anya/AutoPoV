@@ -190,3 +190,6 @@
 .agent-row.failed {
   border-left-color: rgba(239,68,68,0.5);
 }
+
+/* ── Spinner Animation ─────────────────────────────── */
+@keyframes spin { to { transform: rotate(360deg); } }

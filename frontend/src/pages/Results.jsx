@@ -34,7 +34,7 @@ export default function Results() {
 
   const counts = useMemo(() => {
     const c = { ALL: findings.length, CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0, INFO: 0 }
-    findings.forEach(f => { c[getSeverity(f.cwe_type)] = (c[getSeverity(f.cwe_type)] || 0) + 1 })
+    findings.forEach(f => { const s = getSeverity(f.cwe_type); c[s] = (c[s] || 0) + 1 })
     return c
   }, [findings])
 
@@ -61,7 +61,6 @@ export default function Results() {
   if (loading) return (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
       <div style={{ width: 24, height: 24, border: '2px solid var(--border2)', borderTopColor: 'var(--accent)', borderRadius: '50%', animation: 'spin 0.8s linear infinite' }} />
-      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
     </div>
   )
 
@@ -120,7 +119,7 @@ export default function Results() {
               [ NO FINDINGS FOR THIS FILTER ]
             </div>
           ) : (
-            filtered.map((f, i) => <FindingCard key={i} finding={f} />)
+            filtered.map(f => <FindingCard key={`${f.filepath}:${f.line_number}:${f.cwe_type}`} finding={f} />)
           )}
         </div>
       </div>
