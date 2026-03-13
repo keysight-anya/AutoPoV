@@ -158,7 +158,7 @@ export default function AppShell() {
   const topbarStyle = {
     position: 'fixed', top: 0, left: 0, right: 0,
     height: 'var(--topbar-h)',
-    background: 'var(--surface1)',
+    background: 'transparent',
     borderBottom: '1px solid var(--border1)',
     display: 'flex', alignItems: 'center',
     justifyContent: 'space-between',
@@ -180,7 +180,7 @@ export default function AppShell() {
     left: 0,
     bottom: 'var(--statusbar-h)',
     width: 'var(--sidebar-w)',
-    background: 'var(--surface1)',
+    background: 'transparent',
     borderRight: '1px solid var(--border1)',
     display: 'flex', flexDirection: 'column',
     alignItems: 'center',
@@ -200,7 +200,7 @@ export default function AppShell() {
   const statusbarStyle = {
     position: 'fixed', bottom: 0, left: 0, right: 0,
     height: 'var(--statusbar-h)',
-    background: 'var(--surface1)',
+    background: 'transparent',
     borderTop: '1px solid var(--border1)',
     display: 'flex', alignItems: 'center',
     padding: '0 16px',
@@ -241,12 +241,14 @@ export default function AppShell() {
       <header style={topbarStyle}>
         {/* Logo */}
         <div style={logoAreaStyle}>
-          <div style={{
-            width: 20, height: 20,
-            border: '1.5px solid var(--accent)',
-            borderRadius: 3,
-            background: 'rgba(254,127,45,0.1)',
-          }} />
+          <svg width="22" height="22" viewBox="0 0 22 22" fill="none">
+            <rect x="1.5" y="1.5" width="19" height="19" stroke="#fe7f2d" strokeWidth="1.5"/>
+            <circle cx="11" cy="11" r="3.5" fill="#fe7f2d"/>
+            <line x1="11" y1="1.5"  x2="11"   y2="7"    stroke="#fe7f2d" strokeWidth="1"/>
+            <line x1="11" y1="15"   x2="11"   y2="20.5" stroke="#fe7f2d" strokeWidth="1"/>
+            <line x1="1.5" y1="11"  x2="7"    y2="11"   stroke="#fe7f2d" strokeWidth="1"/>
+            <line x1="15"  y1="11"  x2="20.5" y2="11"   stroke="#fe7f2d" strokeWidth="1"/>
+          </svg>
         </div>
 
         {/* Brand name */}

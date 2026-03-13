@@ -49,9 +49,9 @@ export default function ParallaxBg() {
   return (
     <div className="parallax-bg">
       <div ref={gridRef}  className="grid-lines" />
-      <div ref={ring1Ref} className="ring ring-1" />
-      <div ref={ring2Ref} className="ring ring-2" />
-      <div ref={ring3Ref} className="ring ring-3" />
+      <div ref={ring1Ref} className="orbit orbit-1" />
+      <div ref={ring2Ref} className="orbit orbit-2" />
+      <div ref={ring3Ref} className="orbit orbit-3" />
     </div>
   )
 }

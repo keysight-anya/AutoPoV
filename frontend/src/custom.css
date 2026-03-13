@@ -136,7 +136,7 @@
   z-index: 0;
 }
 
-.ring {
+.orbit {
   position: absolute;
   top: 50%; left: 50%;
   border-radius: 50%;
@@ -144,29 +144,136 @@
   transform: translate(-50%, -50%);
 }
 
-.ring-1 {
-  width: 420px; height: 420px;
-  border: 1px solid rgba(254,127,45,0.06);
+.orbit-1 {
+  width: 240px; height: 240px;
+  border: 1px solid rgba(254,127,45,0.22);
+  opacity: 0.40;
 }
 
-.ring-2 {
-  width: 640px; height: 640px;
+.orbit-2 {
+  width: 380px; height: 380px;
+  border: 1px solid rgba(254,127,45,0.10);
+  opacity: 0.20;
+}
+
+.orbit-3 {
+  width: 520px; height: 520px;
   border: 1px solid rgba(254,127,45,0.04);
-}
-
-.ring-3 {
-  width: 860px; height: 860px;
-  border: 1px solid rgba(254,127,45,0.025);
+  opacity: 0.10;
 }
 
 .grid-lines {
   position: absolute;
   inset: -100px;
   background-image:
-    linear-gradient(rgba(254,127,45,0.03) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(254,127,45,0.03) 1px, transparent 1px);
+    linear-gradient(rgba(255,255,255,0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.05) 1px, transparent 1px);
   background-size: 40px 40px;
   will-change: transform;
+}
+
+/* ── Vignette overlay (darker edges → lighter centre) ─ */
+.parallax-bg::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(
+    ellipse 70% 60% at 50% 48%,
+    transparent 0%,
+    rgba(20,30,40,0.30) 40%,
+    rgba(20,30,40,0.68) 65%,
+    rgba(20,30,40,0.92) 100%
+  );
+  pointer-events: none;
+  z-index: 2;
+}
+
+/* ── Glowing input wrapper ─────────────────────────── */
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: 0 0 0 0 transparent,   0 0 8px  rgba(254,127,45,0.06); }
+  50%       { box-shadow: 0 0 0 2px rgba(254,127,45,0.10), 0 0 18px rgba(254,127,45,0.14); }
+}
+
+.input-glow-wrap {
+  display: flex;
+  align-items: center;
+  background: var(--surface2);
+  border: 1px solid var(--border2);
+  transition: border-color .2s;
+  animation: pulse-glow 3s ease-in-out infinite;
+}
+
+.input-glow-wrap:focus-within {
+  border-color: rgba(254,127,45,0.45);
+}
+
+/* ── Scan / Analyse button ─────────────────────────── */
+@keyframes btn-pulse {
+  0%   { box-shadow: 0 0 0 0   rgba(254,127,45,0.55); }
+  60%  { box-shadow: 0 0 0 14px rgba(254,127,45,0);   }
+  100% { box-shadow: 0 0 0 0   rgba(254,127,45,0);   }
+}
+
+.scan-btn {
+  width: 100%;
+  padding: 13px 20px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  letter-spacing: .16em;
+  text-transform: uppercase;
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  transition: background .18s, color .18s;
+}
+
+.scan-btn:hover:not(:disabled) {
+  background: var(--accent);
+  color: #000;
+}
+
+.scan-btn.pulsing {
+  animation: btn-pulse 0.6s ease-out forwards;
+}
+
+/* ── Status line — sequential dot animation ────────── */
+@keyframes dot-wave {
+  0%, 70%, 100% { opacity: 0.12; }
+  35%            { opacity: 0.9;  }
+}
+
+.status-dots {
+  display: inline-block;
+  margin-left: 4px;
+  letter-spacing: .05em;
+}
+
+.status-dots .dot {
+  display: inline-block;
+  animation: dot-wave 1.4s ease-in-out infinite;
+  color: var(--accent);
+}
+
+.status-dots .dot:nth-child(1) { animation-delay: 0s;    }
+.status-dots .dot:nth-child(2) { animation-delay: 0.2s;  }
+.status-dots .dot:nth-child(3) { animation-delay: 0.4s;  }
+.status-dots .dot:nth-child(4) { animation-delay: 0.6s;  }
+
+/* ── Loading spin ring ─────────────────────────────── */
+.spin-ring {
+  display: inline-block;
+  width: 13px;
+  height: 13px;
+  border: 1.5px solid rgba(254,127,45,0.3);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin .7s linear infinite;
+  flex-shrink: 0;
 }
 
 /* ── Agent Pipeline ────────────────────────────────── */

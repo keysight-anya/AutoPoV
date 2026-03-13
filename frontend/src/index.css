@@ -6,15 +6,15 @@
 @tailwind utilities;
 
 :root {
-  --bg:          #1a2330;
-  --surface1:    #1f2d3d;
-  --surface2:    #253545;
+  --bg:          #141e28;
+  --surface1:    #141e28;
+  --surface2:    #1a2c3c;
   --accent:      #fe7f2d;
   --text1:       #e8edf2;
   --text2:       #8ba3b8;
   --text3:       #4d6478;
-  --border1:     #2a3a4a;
-  --border2:     #334455;
+  --border1:     #1e2e3e;
+  --border2:     #253545;
   --topbar-h:    48px;
   --sidebar-w:   48px;
   --statusbar-h: 28px;
