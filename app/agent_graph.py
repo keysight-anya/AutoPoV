@@ -97,6 +97,7 @@ class ScanState(TypedDict):
     tokens_by_model: Dict[str, Dict[str, int]]  # {model_name: {prompt, completion, total}}
     logs: List[str]
     error: Optional[str]
+    openrouter_api_key: Optional[str]
 
 
 class AgentGraph:
@@ -844,8 +845,8 @@ class AgentGraph:
         model_to_use = policy.select_model("investigate", cwe=finding["cwe_type"], language=state.get("detected_language"))
         self._log(state, f"Using model (policy): {model_to_use}")
         investigator = get_investigator()
-        
-        # Pass the model name from scan state
+
+        # Pass the model name and optional per-request API key from scan state
         try:
             result = investigator.investigate(
                 scan_id=state["scan_id"],
@@ -854,7 +855,8 @@ class AgentGraph:
                 filepath=finding["filepath"],
                 line_number=finding["line_number"],
                 alert_message=finding.get("alert_message", ""),
-                model_name=model_to_use
+                model_name=model_to_use,
+                api_key_override=state.get("openrouter_api_key")
             )
             self._log(state, f"Investigation completed with verdict: {result.get('verdict', 'UNKNOWN')}")
         except Exception as e:
@@ -1466,7 +1468,8 @@ class AgentGraph:
         cwes: List[str],
         scan_id: Optional[str] = None,
         preloaded_findings: Optional[List[VulnerabilityState]] = None,
-        detected_language: Optional[str] = None
+        detected_language: Optional[str] = None,
+        openrouter_api_key: Optional[str] = None
     ) -> ScanState:
         """
         Run a complete vulnerability scan
@@ -1501,7 +1504,8 @@ class AgentGraph:
             total_tokens=0,
             tokens_by_model={},
             logs=[],
-            error=None
+            error=None,
+            openrouter_api_key=openrouter_api_key
         )
         
         # Run the graph

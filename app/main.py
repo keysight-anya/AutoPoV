@@ -34,6 +34,7 @@ class ScanGitRequest(BaseModel):
     branch: Optional[str] = None
     model: str = Field(default="openai/gpt-4o")
     cwes: List[str] = Field(default=["CWE-89", "CWE-119", "CWE-190", "CWE-416"])
+    openrouter_api_key: Optional[str] = None
 
 
 class ScanPasteRequest(BaseModel):
@@ -42,6 +43,7 @@ class ScanPasteRequest(BaseModel):
     filename: Optional[str] = None
     model: str = Field(default="openai/gpt-4o")
     cwes: List[str] = Field(default=["CWE-89", "CWE-119", "CWE-190", "CWE-416"])
+    openrouter_api_key: Optional[str] = None
 
 
 
@@ -222,7 +224,8 @@ async def scan_git(
     scan_id = get_scan_manager().create_scan(
         codebase_path="",  # Will be set after clone
         model_name=settings.MODEL_NAME if settings.ROUTING_MODE == "fixed" else settings.AUTO_ROUTER_MODEL,
-        cwes=request.cwes
+        cwes=request.cwes,
+        openrouter_api_key=request.openrouter_api_key or None
     )
     
     def run_scan():
@@ -368,7 +371,8 @@ async def scan_paste(
     scan_id = get_scan_manager().create_scan(
         codebase_path="",
         model_name=settings.MODEL_NAME if settings.ROUTING_MODE == "fixed" else settings.AUTO_ROUTER_MODEL,
-        cwes=request.cwes
+        cwes=request.cwes,
+        openrouter_api_key=request.openrouter_api_key or None
     )
     
     def run_scan():

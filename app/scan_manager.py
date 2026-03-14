@@ -77,7 +77,8 @@ class ScanManager:
         model_name: str,
         cwes: List[str],
         triggered_by: Optional[str] = None,
-        lite: bool = False
+        lite: bool = False,
+        openrouter_api_key: Optional[str] = None
     ) -> str:
         """
         Create a new scan
@@ -105,7 +106,8 @@ class ScanManager:
             "created_at": datetime.utcnow().isoformat(),
             "logs": [],
             "progress": 0,
-            "result": None
+            "result": None,
+            "openrouter_api_key": openrouter_api_key
         }
         
         # Create a lock for this scan to ensure thread-safe log updates
@@ -301,13 +303,14 @@ class ScanManager:
                 self._log(state, "Scan cancelled before execution")
                 raise InterruptedError("Scan cancelled by user")
             
-            # Run the scan with detected language
+            # Run the scan with detected language and optional API key override
             final_state = agent.run_scan(
                 codebase_path=scan_info["codebase_path"],
                 model_name=scan_info["model_name"],
                 cwes=scan_info["cwes"],
                 scan_id=scan_id,
-                detected_language=detected_language
+                detected_language=detected_language,
+                openrouter_api_key=scan_info.get("openrouter_api_key")
             )
             
             # Sync logs from agent graph state to scan_info (in case any were missed)

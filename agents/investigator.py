@@ -47,22 +47,23 @@ class VulnerabilityInvestigator:
                 project_name=settings.LANGCHAIN_PROJECT
             )
     
-    def _get_llm(self, model_name: Optional[str] = None):
+    def _get_llm(self, model_name: Optional[str] = None, api_key_override: Optional[str] = None):
         """Get LLM instance based on configuration"""
-        # Always create new instance if model_name is specified
-        if model_name is None and self._llm is not None:
+        # Always create new instance if model_name or key override is specified
+        if model_name is None and api_key_override is None and self._llm is not None:
             return self._llm
-        
+
         llm_config = settings.get_llm_config()
-        
+
         # Use provided model_name or fall back to config
         actual_model = model_name or llm_config["model"]
-        
+
         if llm_config["mode"] == "online":
             if not OPENAI_AVAILABLE:
                 raise InvestigationError("OpenAI not available. Install langchain-openai")
-            
-            api_key = llm_config.get("api_key")
+
+            # Use per-request override key if provided, else fall back to env config
+            api_key = api_key_override or llm_config.get("api_key")
             
             if not api_key:
                 raise InvestigationError("OpenRouter API key not configured. Set OPENROUTER_API_KEY environment variable.")
@@ -275,7 +276,8 @@ class VulnerabilityInvestigator:
         filepath: str,
         line_number: int,
         alert_message: str,
-        model_name: Optional[str] = None
+        model_name: Optional[str] = None,
+        api_key_override: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Investigate a potential vulnerability
@@ -320,8 +322,8 @@ class VulnerabilityInvestigator:
                 joern_context=joern_context
             )
             
-            # Call LLM with specified model
-            llm = self._get_llm(model_name)
+            # Call LLM with specified model and optional key override
+            llm = self._get_llm(model_name, api_key_override=api_key_override)
             messages = [
                 SystemMessage(content="You are a security expert analyzing code for vulnerabilities."),
                 HumanMessage(content=prompt)
