@@ -8,7 +8,8 @@ import shutil
 import tempfile
 import zipfile
 import tarfile
-from pathlib import Path
+import stat
+from pathlib import Path, PurePosixPath
 from typing import Optional, Tuple, List
 import uuid
 
@@ -28,6 +29,20 @@ class SourceHandler:
         os.makedirs(scan_dir, exist_ok=True)
         return scan_dir
     
+    def _is_within_dir(self, base: Path, target: Path) -> bool:
+        try:
+            target.relative_to(base)
+            return True
+        except Exception:
+            return False
+
+    def _check_archive_limits(self, total_size: int, file_count: int):
+        max_size = settings.MAX_ARCHIVE_UNCOMPRESSED_MB * 1024 * 1024
+        if total_size > max_size:
+            raise ValueError(f"Archive too large after decompression ({total_size / (1024*1024):.1f} MB)")
+        if file_count > settings.MAX_ARCHIVE_FILES:
+            raise ValueError(f"Archive contains too many files ({file_count})")
+
     def handle_zip_upload(
         self,
         zip_path: str,
@@ -43,6 +58,11 @@ class SourceHandler:
         Returns:
             Path to extracted directory
         """
+        # Size limit on uploaded archive
+        max_upload = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
+        if os.path.getsize(zip_path) > max_upload:
+            raise ValueError(f"ZIP upload too large (> {settings.MAX_UPLOAD_SIZE_MB} MB)")
+
         scan_dir = self._get_scan_dir(scan_id)
         extract_dir = os.path.join(scan_dir, "source")
         
@@ -51,17 +71,45 @@ class SourceHandler:
             shutil.rmtree(extract_dir)
         
         os.makedirs(extract_dir)
-        
-        # Extract ZIP
+
+        extract_base = Path(extract_dir).resolve()
+        total_size = 0
+        file_count = 0
+
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            # Security: Check for path traversal
-            for member in zip_ref.namelist():
-                member_path = os.path.join(extract_dir, member)
-                if not member_path.startswith(os.path.abspath(extract_dir)):
-                    raise ValueError(f"Path traversal detected in ZIP: {member}")
-            
+            for info in zip_ref.infolist():
+                name = info.filename
+                # Skip directories
+                if name.endswith('/'):
+                    continue
+
+                # Reject absolute paths or traversal
+                p = PurePosixPath(name)
+                if p.is_absolute() or '..' in p.parts:
+                    raise ValueError(f"Path traversal detected in ZIP: {name}")
+
+                # Reject symlinks
+                is_symlink = stat.S_IFMT(info.external_attr >> 16) == stat.S_IFLNK
+                if is_symlink:
+                    raise ValueError(f"Symlink detected in ZIP: {name}")
+
+                # Enforce compression ratio
+                if info.compress_size and info.file_size:
+                    ratio = info.file_size / max(info.compress_size, 1)
+                    if ratio > settings.MAX_ARCHIVE_COMPRESSION_RATIO:
+                        raise ValueError(f"Suspicious compression ratio in ZIP: {name}")
+
+                # Enforce size limits
+                total_size += info.file_size
+                file_count += 1
+                self._check_archive_limits(total_size, file_count)
+
+                dest = (extract_base / name).resolve()
+                if not self._is_within_dir(extract_base, dest):
+                    raise ValueError(f"Path traversal detected in ZIP: {name}")
+
             zip_ref.extractall(extract_dir)
-        
+
         # Handle single directory at root
         items = os.listdir(extract_dir)
         if len(items) == 1:
@@ -94,6 +142,10 @@ class SourceHandler:
         Returns:
             Path to extracted directory
         """
+        max_upload = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
+        if os.path.getsize(tar_path) > max_upload:
+            raise ValueError(f"TAR upload too large (> {settings.MAX_UPLOAD_SIZE_MB} MB)")
+
         scan_dir = self._get_scan_dir(scan_id)
         extract_dir = os.path.join(scan_dir, "source")
         
@@ -102,7 +154,11 @@ class SourceHandler:
             shutil.rmtree(extract_dir)
         
         os.makedirs(extract_dir)
-        
+
+        extract_base = Path(extract_dir).resolve()
+        total_size = 0
+        file_count = 0
+
         # Open TAR with appropriate compression
         mode = 'r'
         if compression == 'gz':
@@ -113,12 +169,24 @@ class SourceHandler:
             mode = 'r:xz'
         
         with tarfile.open(tar_path, mode) as tar_ref:
-            # Security: Check for path traversal
             for member in tar_ref.getmembers():
-                member_path = os.path.join(extract_dir, member.name)
-                if not member_path.startswith(os.path.abspath(extract_dir)):
-                    raise ValueError(f"Path traversal detected in TAR: {member.name}")
-            
+                name = member.name
+                p = PurePosixPath(name)
+                if p.is_absolute() or '..' in p.parts:
+                    raise ValueError(f"Path traversal detected in TAR: {name}")
+
+                if member.issym() or member.islnk():
+                    raise ValueError(f"Symlink detected in TAR: {name}")
+
+                if member.isfile():
+                    total_size += member.size
+                    file_count += 1
+                    self._check_archive_limits(total_size, file_count)
+
+                dest = (extract_base / name).resolve()
+                if not self._is_within_dir(extract_base, dest):
+                    raise ValueError(f"Path traversal detected in TAR: {name}")
+
             tar_ref.extractall(extract_dir)
         
         return extract_dir
@@ -148,18 +216,31 @@ class SourceHandler:
             shutil.rmtree(source_dir)
         
         os.makedirs(source_dir)
-        
+
+        base_dir = None
+        abs_paths = [os.path.abspath(p) for p in file_paths]
+        if abs_paths:
+            try:
+                base_dir = os.path.commonpath(abs_paths)
+            except Exception:
+                base_dir = None
+
+        source_base = Path(source_dir).resolve()
+
         for file_path in file_paths:
             if os.path.isfile(file_path):
-                if preserve_structure:
-                    # Preserve relative path structure under source_dir
-                    rel = os.path.relpath(file_path)
-                    dest_path = os.path.join(source_dir, rel)
-                    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                abs_path = os.path.abspath(file_path)
+                if preserve_structure and base_dir and abs_path.startswith(base_dir + os.sep):
+                    rel = os.path.relpath(abs_path, base_dir)
                 else:
-                    dest_path = os.path.join(source_dir, os.path.basename(file_path))
+                    rel = os.path.basename(abs_path)
 
-                shutil.copy2(file_path, dest_path)
+                dest_path = (source_base / rel).resolve()
+                if not self._is_within_dir(source_base, dest_path):
+                    dest_path = (source_base / os.path.basename(abs_path)).resolve()
+
+                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                shutil.copy2(abs_path, dest_path)
         
         return source_dir
     

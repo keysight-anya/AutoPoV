@@ -126,7 +126,8 @@ class StaticValidator:
         cwe_type: str,
         vulnerable_code: str,
         filepath: str,
-        line_number: int
+        line_number: int,
+        exploit_contract: Dict[str, Any] | None = None
     ) -> ValidationResult:
         """
         Validate a PoV script using static analysis
@@ -150,18 +151,8 @@ class StaticValidator:
             "pov_length": len(pov_script),
             "has_vulnerability_check": False
         }
-        
-        # Get CWE-specific patterns
+        exploit_contract = exploit_contract or {}
         patterns = self.CWE_PATTERNS.get(cwe_type, {})
-        
-        if not patterns:
-            return ValidationResult(
-                is_valid=True,  # Unknown CWE, assume valid
-                confidence=0.5,
-                matched_patterns=[],
-                issues=[f"No specific patterns for {cwe_type}"],
-                details=details
-            )
         
         # Check for vulnerability trigger indicator
         if "VULNERABILITY TRIGGERED" in pov_script:
@@ -170,6 +161,16 @@ class StaticValidator:
         else:
             issues.append("PoV script missing 'VULNERABILITY TRIGGERED' indicator")
         
+        # Check generic exploit-contract alignment
+        contract_signals = []
+        for item in exploit_contract.get("success_indicators", []) + exploit_contract.get("inputs", []) + exploit_contract.get("side_effects", []):
+            if item and str(item).lower() in pov_script.lower():
+                contract_signals.append(str(item))
+        if contract_signals:
+            matched_patterns.append(f"contract_signals: {', '.join(contract_signals[:4])}")
+        elif exploit_contract:
+            issues.append("PoV does not clearly encode the exploit contract indicators")
+
         # Check required imports
         found_imports = []
         for imp in patterns.get("required_imports", []):
@@ -218,7 +219,7 @@ class StaticValidator:
         is_valid = (
             details["has_vulnerability_check"] and
             len(matched_patterns) >= 2 and
-            confidence >= 0.6
+            confidence >= 0.55
         )
         
         result = ValidationResult(

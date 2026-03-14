@@ -27,7 +27,7 @@ function ScanProgress() {
         setStatus(data.status)
         setLogs(data.logs || [])
 
-        if (data.status === 'completed' || data.status === 'failed') {
+        if (data.status === 'completed' || data.status === 'failed' || data.status === 'cancelled') {
           try {
             const raw = localStorage.getItem('autopov_active_scans')
             const list = raw ? JSON.parse(raw) : []
@@ -37,7 +37,13 @@ function ScanProgress() {
           setTimeout(() => navigate(`/results/${scanId}`), 3000)
         }
       } catch (err) {
-        setError(err.message)
+        const detail = err.response?.data?.detail
+        if (err.response?.status === 404) {
+          setStatus('interrupted')
+          setError('Scan state is no longer active in memory. If the backend restarted, reopen the latest saved run from History.')
+          return
+        }
+        setError(detail || err.message)
       }
     }
 
@@ -50,7 +56,8 @@ function ScanProgress() {
       eventSource.onmessage = (event) => {
         const data = JSON.parse(event.data)
         if (data.type === 'log') setLogs(prev => [...prev, data.message])
-        else if (data.type === 'complete') setStatus('completed')
+        else if (data.type === 'complete') setStatus(data.result?.status || 'completed')
+        else if (data.type === 'error') setError(data.message)
       }
       eventSource.onerror = () => {}
     } catch {}
@@ -93,7 +100,7 @@ function ScanProgress() {
         </div>
 
         {/* Cancel button — only shown while scan is running */}
-        {status === 'running' && (
+        {['created', 'checking', 'cloning', 'ingesting', 'running_codeql', 'investigating', 'generating_pov', 'validating_pov', 'running_pov', 'running'].includes(status) && (
           <button
             onClick={handleCancel}
             disabled={cancelling}
@@ -107,7 +114,7 @@ function ScanProgress() {
 
       {/* Status card */}
       <div className={`flex items-center gap-4 p-5 rounded-xl border mb-5 ${cfg.border} ${cfg.bg}`}>
-        {status === 'running' ? (
+        {['created', 'checking', 'cloning', 'ingesting', 'running_codeql', 'investigating', 'generating_pov', 'validating_pov', 'running_pov', 'running'].includes(status) ? (
           <div className="relative w-8 h-8 shrink-0">
             <Shield className="w-8 h-8 text-primary-500/30" />
             <div className="absolute inset-0 flex items-center justify-center">

@@ -4,6 +4,8 @@ Handles code chunking, embedding, and ChromaDB storage for RAG
 """
 
 import os
+import re
+import math
 import hashlib
 from typing import List, Dict, Optional, Iterator, Callable
 from pathlib import Path
@@ -30,6 +32,12 @@ try:
 except ImportError:
     HUGGINGFACE_AVAILABLE = False
 
+try:
+    from sentence_transformers import SentenceTransformer
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
+
 from app.config import settings
 
 
@@ -37,6 +45,50 @@ class CodeIngestionError(Exception):
     """Exception raised during code ingestion"""
     pass
 
+
+
+class _SentenceTransformerEmbeddings:
+    """Minimal embeddings wrapper backed by sentence-transformers."""
+
+    def __init__(self, model_name: str):
+        if not SENTENCE_TRANSFORMERS_AVAILABLE:
+            raise CodeIngestionError("sentence-transformers not available for local embedding fallback")
+        self._model = SentenceTransformer(model_name)
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return self._model.encode(texts, convert_to_numpy=False, show_progress_bar=False)
+
+    def embed_query(self, text: str) -> List[float]:
+        return self._model.encode(text, convert_to_numpy=False, show_progress_bar=False)
+
+
+class _HashEmbeddings:
+    """Lightweight local embeddings backend with no external model downloads."""
+
+    def __init__(self, dimensions: int = 256):
+        self.dimensions = dimensions
+
+    def _tokenize(self, text: str) -> List[str]:
+        return re.findall(r"[A-Za-z_][A-Za-z0-9_]{1,63}", text.lower())
+
+    def _embed(self, text: str) -> List[float]:
+        vector = [0.0] * self.dimensions
+        tokens = self._tokenize(text)
+        if not tokens:
+            return vector
+        for token in tokens:
+            digest = hashlib.sha256(token.encode()).digest()
+            bucket = int.from_bytes(digest[:4], 'big') % self.dimensions
+            sign = 1.0 if digest[4] % 2 == 0 else -1.0
+            vector[bucket] += sign
+        norm = math.sqrt(sum(value * value for value in vector)) or 1.0
+        return [value / norm for value in vector]
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return [self._embed(text) for text in texts]
+
+    def embed_query(self, text: str) -> List[float]:
+        return self._embed(text)
 
 class CodeIngester:
     """Handles ingestion of codebases into vector store"""
@@ -57,6 +109,28 @@ class CodeIngester:
         self._collection = None
         self._embeddings = None
     
+    def _build_local_embeddings(self):
+        """Build a local embeddings backend for offline use or online fallback."""
+        backend = (settings.LOCAL_EMBEDDING_BACKEND or "hash").lower()
+        model_name = settings.EMBEDDING_MODEL_OFFLINE
+
+        if backend == "hash":
+            return _HashEmbeddings()
+
+        if backend == "huggingface" and HUGGINGFACE_AVAILABLE:
+            return HuggingFaceEmbeddings(model_name=model_name)
+
+        if backend in {"sentence-transformers", "sentence_transformers"} and SENTENCE_TRANSFORMERS_AVAILABLE:
+            return _SentenceTransformerEmbeddings(model_name)
+
+        if HUGGINGFACE_AVAILABLE:
+            return HuggingFaceEmbeddings(model_name=model_name)
+
+        if SENTENCE_TRANSFORMERS_AVAILABLE:
+            return _SentenceTransformerEmbeddings(model_name)
+
+        return _HashEmbeddings()
+
     def _get_embeddings(self):
         """Get embeddings model based on configuration"""
         if self._embeddings is not None:
@@ -64,32 +138,40 @@ class CodeIngester:
         
         llm_config = settings.get_llm_config()
         
+        if settings.PREFER_LOCAL_EMBEDDINGS:
+            print(f"Info: Using local embeddings backend ({settings.LOCAL_EMBEDDING_BACKEND}) for ingestion.")
+            self._embeddings = self._build_local_embeddings()
+            return self._embeddings
+
         if llm_config["mode"] == "online":
             if not OPENAI_AVAILABLE:
-                raise CodeIngestionError("OpenAI embeddings not available. Install langchain-openai")
-            
+                self._embeddings = self._build_local_embeddings()
+                return self._embeddings
+
             api_key = llm_config.get("api_key")
             if not api_key:
-                raise CodeIngestionError("OpenRouter API key not configured")
-            
+                self._embeddings = self._build_local_embeddings()
+                return self._embeddings
+
             embedding_model = llm_config["embedding_model"]
-            
-            # text-embedding-3-small is an OpenAI-native model.
-            # OpenRouter proxies it but requires different auth handling.
-            # Use OpenRouter base URL with the key as-is; it should work.
-            # If OpenRouter returns 401, fall back to a simpler approach.
-            self._embeddings = OpenAIEmbeddings(
-                model=embedding_model,
-                api_key=api_key,
-                base_url=llm_config["base_url"]
-            )
+
+            try:
+                self._embeddings = OpenAIEmbeddings(
+                    model=embedding_model,
+                    api_key=api_key,
+                    base_url=llm_config["base_url"],
+                    default_headers={
+                        "HTTP-Referer": "https://autopov.local",
+                        "X-OpenRouter-Title": "AutoPoV"
+                    }
+                )
+                self._embeddings.embed_query("autopov")
+            except Exception as exc:
+                print(f"Warning: Online embeddings unavailable ({exc}). Falling back to local embeddings.")
+                self._embeddings = self._build_local_embeddings()
         else:
-            if not HUGGINGFACE_AVAILABLE:
-                raise CodeIngestionError("HuggingFace embeddings not available. Install langchain-huggingface")
-            
-            self._embeddings = HuggingFaceEmbeddings(
-                model_name=llm_config["embedding_model"]
-            )
+            print(f"Info: Using local embeddings backend ({settings.LOCAL_EMBEDDING_BACKEND}) for ingestion.")
+            self._embeddings = self._build_local_embeddings()
         
         return self._embeddings
     

@@ -29,15 +29,16 @@ class UnitTestRunner:
     """Runs PoV scripts against isolated code in unit test style"""
     
     # CWE-specific validation oracles with side-effect detection
+    # Side-effect files use settings.TEMP_DIR for Docker compatibility
     CWE_ORACLES = {
         "CWE-22": {  # Path Traversal
-            "side_effect_files": ["/tmp/autopov_traversal_test", "/tmp/autopov_path_test"],
+            "side_effect_files": ["autopov_traversal_test", "autopov_path_test"],
             "expected_content_patterns": ["root:x:0:0:", "etc/passwd", "windows/system32", "boot.ini"],
             "expected_output_patterns": ["root:", "administrator", "system32", "passwd"],
             "description": "File content from outside intended directory"
         },
         "CWE-78": {  # Command Injection
-            "side_effect_files": ["/tmp/autopov_rce", "/tmp/autopov_cmd_injection"],
+            "side_effect_files": ["autopov_rce", "autopov_cmd_injection"],
             "expected_output_patterns": ["uid=", "gid=", "root", "bin/bash", "cmd.exe", "whoami", "hostname"],
             "description": "Command execution output"
         },
@@ -48,7 +49,7 @@ class UnitTestRunner:
             "description": "Database information disclosure or error"
         },
         "CWE-94": {  # Code Injection
-            "side_effect_files": ["/tmp/autopov_code_exec"],
+            "side_effect_files": ["autopov_code_exec"],
             "expected_output_patterns": ["eval executed", "exec completed", "code injected", "system("],
             "description": "Code execution evidence"
         },
@@ -75,7 +76,8 @@ class UnitTestRunner:
         pov_script: str,
         vulnerable_code: str,
         cwe_type: str,
-        scan_id: str
+        scan_id: str,
+        exploit_contract: Dict[str, Any] | None = None
     ) -> TestResult:
         """
         Test PoV against isolated vulnerable function
@@ -120,11 +122,12 @@ class UnitTestRunner:
             execution_time = (end_time - start_time).total_seconds()
             
             # Check if vulnerability was triggered using CWE-specific oracles
-            oracle_result = self._check_cwe_oracle(
+            oracle_result = self._evaluate_exploit_oracle(
                 cwe_type=cwe_type,
                 stdout=result.get("stdout", ""),
                 stderr=result.get("stderr", ""),
-                execution_time=execution_time
+                execution_time=execution_time,
+                exploit_contract=exploit_contract or {}
             )
             
             test_result = TestResult(
@@ -359,12 +362,13 @@ sys.stdin = io.StringIO("""{mock_input}""")
         
         return results
     
-    def _check_cwe_oracle(
+    def _evaluate_exploit_oracle(
         self,
         cwe_type: str,
         stdout: str,
         stderr: str,
-        execution_time: float
+        execution_time: float,
+        exploit_contract: Dict[str, Any] | None = None
     ) -> Dict[str, Any]:
         """
         Check if vulnerability was triggered using CWE-specific oracles.
@@ -386,8 +390,15 @@ sys.stdin = io.StringIO("""{mock_input}""")
             confidence = "low"
             method = "string_match"
         
-        # Get oracle config for this CWE
+        exploit_contract = exploit_contract or {}
         oracle = self.CWE_ORACLES.get(cwe_type, {})
+
+        # Generic contract-based indicators
+        for pattern in exploit_contract.get("success_indicators", []):
+            if str(pattern).lower() in combined_output:
+                evidence.append(f"Contract success indicator found: '{pattern}'")
+                confidence = "high"
+                method = "contract_output"
         
         # Check for expected output patterns (medium-high confidence)
         expected_patterns = oracle.get("expected_output_patterns", [])
@@ -398,9 +409,16 @@ sys.stdin = io.StringIO("""{mock_input}""")
                 method = "output_pattern"
         
         # Check for content patterns in side-effect files (high confidence)
-        content_patterns = oracle.get("expected_content_patterns", [])
-        side_effect_files = oracle.get("side_effect_files", [])
-        for file_path in side_effect_files:
+        # Files are relative to settings.TEMP_DIR for Docker compatibility
+        from app.config import settings
+        temp_dir = settings.TEMP_DIR
+        
+        content_patterns = list(oracle.get("expected_content_patterns", []))
+        content_patterns.extend([str(x) for x in exploit_contract.get("success_indicators", [])])
+        side_effect_files = list(oracle.get("side_effect_files", []))
+        side_effect_files.extend([str(x) for x in exploit_contract.get("side_effects", []) if x])
+        for filename in side_effect_files:
+            file_path = os.path.join(temp_dir, filename)
             try:
                 if os.path.exists(file_path):
                     with open(file_path, 'r') as f:
@@ -446,7 +464,8 @@ sys.stdin = io.StringIO("""{mock_input}""")
             "confidence": confidence,
             "evidence": evidence,
             "method": method,
-            "cwe_description": oracle.get("description", "Unknown")
+            "cwe_description": oracle.get("description", "Unknown"),
+            "exploit_goal": exploit_contract.get("goal", "")
         }
     
     def validate_syntax(self, pov_script: str) -> Dict[str, Any]:

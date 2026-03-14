@@ -74,7 +74,11 @@ class VulnerabilityInvestigator:
                 api_key=api_key,
                 base_url=llm_config["base_url"],
                 temperature=0.1,
-                callbacks=callbacks
+                callbacks=callbacks,
+                default_headers={
+                    "HTTP-Referer": "https://autopov.local",
+                    "X-OpenRouter-Title": "AutoPoV"
+                }
             )
             
             # Store model info for cost tracking

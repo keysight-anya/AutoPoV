@@ -6,7 +6,7 @@ Executes PoV scripts in isolated Docker containers
 import os
 import tempfile
 import shutil
-from typing import Dict, Optional, Any, List
+from typing import Dict, Optional, Any, List, Tuple
 from datetime import datetime
 
 try:
@@ -34,6 +34,17 @@ class DockerRunner:
         self.memory_limit = settings.DOCKER_MEMORY_LIMIT
         self.cpu_limit = settings.DOCKER_CPU_LIMIT
     
+    def _resolve_runtime(self, execution_profile: Optional[str], target_language: Optional[str]) -> Tuple[str, List[str], str]:
+        """Resolve the container image, command, and filename for a PoV runtime."""
+        profile = (execution_profile or "").strip().lower()
+        language = (target_language or "").strip().lower()
+
+        if profile in {"javascript", "node"} or language in {"javascript", "typescript", "jsx", "tsx"}:
+            return ("node:22-slim", ["node"], "pov.js")
+        if profile in {"shell", "bash", "sh"}:
+            return ("ubuntu:24.04", ["bash"], "pov.sh")
+        return (self.image, ["python"], "pov.py")
+
     def _get_client(self):
         """Get Docker client"""
         if not DOCKER_AVAILABLE:
@@ -64,7 +75,10 @@ class DockerRunner:
         pov_script: str,
         scan_id: str,
         pov_id: str,
-        extra_files: Optional[Dict[str, str]] = None
+        extra_files: Optional[Dict[str, str]] = None,
+        execution_profile: Optional[str] = None,
+        target_language: Optional[str] = None,
+        exploit_contract: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Run a PoV script in Docker
@@ -93,8 +107,9 @@ class DockerRunner:
         temp_dir = tempfile.mkdtemp(prefix=f"autopov_{scan_id}_")
         
         try:
+            image, runtime_command, pov_filename = self._resolve_runtime(execution_profile, target_language)
+
             # Write PoV script
-            pov_filename = f"pov_{pov_id}.py"
             pov_path = os.path.join(temp_dir, pov_filename)
             
             with open(pov_path, 'w') as f:
@@ -112,16 +127,16 @@ class DockerRunner:
             
             # Ensure image exists
             try:
-                client.images.get(self.image)
+                client.images.get(image)
             except ImageNotFound:
-                client.images.pull(self.image)
+                client.images.pull(image)
             
             start_time = datetime.utcnow()
             
             # Run container
             container = client.containers.run(
-                image=self.image,
-                command=["python", pov_filename],
+                image=image,
+                command=runtime_command + [pov_filename],
                 volumes={temp_dir: {'bind': '/pov', 'mode': 'ro'}},
                 working_dir='/pov',
                 mem_limit=self.memory_limit,
@@ -162,7 +177,9 @@ class DockerRunner:
                 "stderr": stderr,
                 "exit_code": exit_code,
                 "execution_time_s": execution_time,
-                "timestamp": end_time.isoformat()
+                "timestamp": end_time.isoformat(),
+                "execution_profile": execution_profile or target_language or "python",
+                "runtime_image": image
             }
             
         except ContainerError as e:
@@ -189,6 +206,89 @@ class DockerRunner:
             # Cleanup temp directory
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
+            
+            # Cleanup Docker resources used by this PoV
+            self._cleanup_pov_resources(scan_id, pov_id)
+    
+    def _cleanup_pov_resources(self, scan_id: str, pov_id: str):
+        """
+        Clean up Docker resources after PoV execution.
+        Removes containers and images specific to this PoV.
+        """
+        try:
+            client = self._get_client()
+            
+            # Find and remove containers with this scan/pov ID
+            container_pattern = f"autopov_{scan_id}_{pov_id}"
+            
+            # Remove stopped containers with autopov prefix
+            containers = client.containers.list(
+                all=True,
+                filters={"name": container_pattern}
+            )
+            for container in containers:
+                try:
+                    container.remove(force=True)
+                except Exception:
+                    pass
+            
+            # Clean up dangling images created during this run
+            # This removes intermediate build layers
+            try:
+                client.images.prune(filters={"dangling": True})
+            except Exception:
+                pass
+            
+            # Clean up unused volumes created during this run
+            try:
+                client.volumes.prune()
+            except Exception:
+                pass
+                
+        except Exception:
+            # Don't fail if cleanup fails
+            pass
+    
+    def cleanup_all_pov_resources(self, scan_id: Optional[str] = None):
+        """
+        Clean up all Docker resources used by PoV testing.
+        
+        Args:
+            scan_id: Optional scan ID to cleanup specific scan, or None for all
+        """
+        try:
+            client = self._get_client()
+            
+            # Pattern for containers
+            pattern = f"autopov_{scan_id}" if scan_id else "autopov_"
+            
+            # Stop and remove containers
+            containers = client.containers.list(
+                all=True,
+                filters={"name": pattern}
+            )
+            
+            for container in containers:
+                try:
+                    container.stop(timeout=5)
+                    container.remove(force=True)
+                except Exception:
+                    pass
+            
+            # Remove dangling images
+            try:
+                client.images.prune(filters={"dangling": True})
+            except Exception:
+                pass
+            
+            # Clean up build cache
+            try:
+                client.api.prune_builds()
+            except Exception:
+                pass
+                
+        except Exception as e:
+            print(f"Warning: Docker cleanup failed: {e}")
     
     def run_with_input(
         self,
@@ -292,7 +392,12 @@ exec(open('/pov/pov_script.py').read())
             end_time = datetime.utcnow()
             execution_time = (end_time - start_time).total_seconds()
             
-            vulnerability_triggered = "VULNERABILITY TRIGGERED" in stdout
+            indicators = ["VULNERABILITY TRIGGERED"]
+            if exploit_contract:
+                indicators.extend(exploit_contract.get("success_indicators", []) or [])
+                indicators.extend(exploit_contract.get("side_effects", []) or [])
+            haystack = (stdout + "\n" + stderr).lower()
+            vulnerability_triggered = any(str(ind).strip().lower() in haystack for ind in indicators if str(ind).strip())
             
             return {
                 "success": exit_code == 0 or vulnerability_triggered,
@@ -307,6 +412,9 @@ exec(open('/pov/pov_script.py').read())
         finally:
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
+            
+            # Cleanup Docker resources
+            self._cleanup_pov_resources(scan_id, pov_id)
     
     def batch_run(
         self,

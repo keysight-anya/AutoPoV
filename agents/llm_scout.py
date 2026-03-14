@@ -46,7 +46,11 @@ class LLMScout:
                 model=actual_model,
                 api_key=api_key,
                 base_url=llm_config["base_url"],
-                temperature=0.1
+                temperature=0.1,
+                default_headers={
+                    "HTTP-Referer": "https://autopov.local",
+                    "X-OpenRouter-Title": "AutoPoV"
+                }
             )
         if not OLLAMA_AVAILABLE:
             raise LLMScoutError("Ollama not available. Install langchain-ollama")
@@ -172,10 +176,11 @@ class LLMScout:
 
         findings: List[Dict[str, Any]] = []
         for item in data.get("findings", []):
-            cwe = item.get("cwe")
-            if cwe not in cwes:
+            cwe = item.get("cwe") or "UNCLASSIFIED"
+            if cwes and cwe not in cwes:
                 continue
             findings.append({
+                "cve_id": item.get("cve_id"),
                 "cwe_type": cwe,
                 "filepath": item.get("filepath", ""),
                 "line_number": int(item.get("line", 0) or 0),

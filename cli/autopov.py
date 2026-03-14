@@ -7,7 +7,7 @@ import os
 import sys
 import json
 import time
-from typing import Optional, List
+from typing import Optional
 
 import click
 import requests
@@ -97,40 +97,6 @@ def cli():
     pass
 
 
-def get_supported_cwes(api_key: str) -> List[str]:
-    """Fetch supported CWEs from backend"""
-    try:
-        response = make_api_request("GET", "/config", api_key)
-        return response.get("supported_cwes", ["CWE-89", "CWE-119", "CWE-190", "CWE-416"])
-    except:
-        return ["CWE-89", "CWE-119", "CWE-190", "CWE-416"]
-
-
-# Model provider mapping for OpenRouter
-MODEL_PROVIDERS = {
-    "1": ("OpenAI", "openai/gpt-5.4-pro"),
-    "2": ("Claude", "anthropic/claude-sonnet-4.6"),
-    "3": ("Gemini", "google/gemini-3.1-flash-lite-preview"),
-    "4": ("Grok", "x-ai/grok-4.1-fast")
-}
-
-
-def select_model() -> str:
-    """Display model selection menu and return selected model ID"""
-    console.print("\n[bold cyan]Select AI Model Provider:[/bold cyan]")
-    console.print("-" * 40)
-    for key, (name, model_id) in MODEL_PROVIDERS.items():
-        console.print(f"  [{key}] {name}")
-    console.print("-" * 40)
-
-    while True:
-        choice = console.input("[bold]Enter choice (1-4): [/bold]").strip()
-        if choice in MODEL_PROVIDERS:
-            provider_name, model_id = MODEL_PROVIDERS[choice]
-            console.print(f"[green]✓ Selected: {provider_name} ({model_id})[/green]\n")
-            return model_id
-        console.print("[red]Invalid choice. Please enter 1, 2, 3, or 4.[/red]")
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # scan command  (git / zip / directory)
@@ -138,21 +104,17 @@ def select_model() -> str:
 
 @cli.command()
 @click.argument("source")
-@click.option("--model", "-m", default=None, help="Model to use (overrides interactive selection)")
-@click.option("--cwe", "-c", multiple=True, default=None, help="CWEs to check (default: all supported)")
+@click.option("--model", "-m", default=None, help="Override the backend-configured model for this scan")
 @click.option("--output", "-o", type=click.Choice(["json", "table", "pdf"]), default="table", help="Output format")
 @click.option("--api-key", "-k", help="API key")
 @click.option("--branch", "-b", help="Git branch")
-@click.option("--lite", is_flag=True, default=False, help="Lite scan (static analysis only, faster)")
 @click.option("--wait/--no-wait", default=True, help="Wait for scan completion")
 def scan(
     source: str,
     model: str,
-    cwe: tuple,
     output: str,
     api_key: Optional[str],
     branch: Optional[str],
-    lite: bool,
     wait: bool
 ):
     """Scan a Git repository, ZIP file, or local directory for vulnerabilities"""
@@ -165,16 +127,13 @@ def scan(
         console.print("[red]Error: API key required. Set AUTOPOV_API_KEY or use --api-key[/red]")
         sys.exit(1)
 
-    # Select model if not provided via --model
-    if model is None:
-        model = select_model()
-
-    # Use provided CWEs or fetch all supported from backend
-    if cwe:
-        cwes = list(cwe)
+    if model:
+        console.print(f"[blue]Using explicit scan model override: {model}[/blue]")
     else:
-        cwes = get_supported_cwes(api_key)
-        console.print(f"[blue]Scanning with {len(cwes)} CWE categories[/blue]")
+        model = get_effective_backend_model(api_key)
+        console.print(f"[blue]Using backend-configured model: {model}[/blue]")
+
+    console.print("[blue]Scanning with open-ended vulnerability discovery[/blue]")
 
     # Determine source type
     if source.startswith(("http://", "https://", "git@")):
@@ -189,8 +148,6 @@ def scan(
                 "url": source,
                 "branch": branch,
                 "model": model,
-                "cwes": cwes,
-                "lite": lite
             }
         )
 
@@ -203,7 +160,7 @@ def scan(
                 "POST",
                 "/scan/zip",
                 api_key,
-                data={"model": model, "cwes": ",".join(cwes), "lite": "true" if lite else "false"},
+                data={"model": model},
                 files={"file": f}
             )
 
@@ -220,7 +177,7 @@ def scan(
                 "POST",
                 "/scan/zip",
                 api_key,
-                data={"model": model, "cwes": ",".join(cwes), "lite": "true" if lite else "false"},
+                data={"model": model},
                 files={"file": f}
             )
 
@@ -248,20 +205,16 @@ def scan(
               type=click.Choice(["python", "javascript", "c", "cpp", "java", "go", "rust"]),
               help="Language of the pasted code")
 @click.option("--filename", "-f", default=None, help="Virtual filename (e.g. main.py)")
-@click.option("--model", "-m", default=None, help="Model to use (overrides interactive selection)")
-@click.option("--cwe", "-c", multiple=True, default=None, help="CWEs to check (default: all supported)")
+@click.option("--model", "-m", default=None, help="Override the backend-configured model for this scan")
 @click.option("--output", "-o", type=click.Choice(["json", "table", "pdf"]), default="table")
 @click.option("--api-key", "-k", help="API key")
-@click.option("--lite", is_flag=True, default=False, help="Lite scan (static only, faster)")
 @click.option("--wait/--no-wait", default=True, help="Wait for scan completion")
 def paste(
     language: str,
     filename: Optional[str],
     model: str,
-    cwe: tuple,
     output: str,
     api_key: Optional[str],
-    lite: bool,
     wait: bool
 ):
     """Scan code pasted from stdin
@@ -288,13 +241,13 @@ def paste(
         console.print("[red]Error: No code provided on stdin[/red]")
         sys.exit(1)
 
-    if model is None:
-        model = select_model()
-
-    if cwe:
-        cwes = list(cwe)
+    if model:
+        console.print(f"[blue]Using explicit scan model override: {model}[/blue]")
     else:
-        cwes = get_supported_cwes(api_key)
+        model = get_effective_backend_model(api_key)
+        console.print(f"[blue]Using backend-configured model: {model}[/blue]")
+
+    console.print("[blue]Scanning with open-ended vulnerability discovery[/blue]")
 
     console.print(f"[blue]Scanning pasted {language} code ({len(code)} bytes)...[/blue]")
 
@@ -307,8 +260,6 @@ def paste(
             "language": language,
             "filename": filename or f"stdin.{language}",
             "model": model,
-            "cwes": cwes,
-            "lite": lite
         }
     )
 
@@ -683,23 +634,12 @@ def keys():
 
 
 @keys.command("generate")
-@click.option("--admin-key", "-a", help="Admin API key")
 @click.option("--name", "-n", default="cli", help="Key name")
-def generate_key(admin_key: Optional[str], name: str):
-    """Generate a new API key (admin only)"""
-
-    if not admin_key:
-        admin_key = os.getenv("AUTOPOV_ADMIN_KEY")
-
-    if not admin_key:
-        console.print("[red]Error: Admin key required. Set AUTOPOV_ADMIN_KEY or use --admin-key[/red]")
-        sys.exit(1)
+def generate_key(name: str):
+    """Generate a new API key"""
 
     url = f"{API_BASE_URL}/keys/generate"
-    headers = {
-        "Authorization": f"Bearer {admin_key}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Content-Type": "application/json"}
 
     try:
         response = requests.post(url, headers=headers, params={"name": name})
@@ -723,19 +663,11 @@ def generate_key(admin_key: Optional[str], name: str):
 
 
 @keys.command("list")
-@click.option("--admin-key", "-a", help="Admin API key")
-def list_keys(admin_key: Optional[str]):
-    """List all API keys (admin only)"""
-
-    if not admin_key:
-        admin_key = os.getenv("AUTOPOV_ADMIN_KEY")
-
-    if not admin_key:
-        console.print("[red]Error: Admin key required[/red]")
-        sys.exit(1)
+def list_keys():
+    """List all API keys"""
 
     url = f"{API_BASE_URL}/keys"
-    headers = {"Authorization": f"Bearer {admin_key}"}
+    headers = {}
 
     try:
         response = requests.get(url, headers=headers)
@@ -767,20 +699,12 @@ def list_keys(admin_key: Optional[str]):
 
 @keys.command("revoke")
 @click.argument("key_id")
-@click.option("--admin-key", "-a", help="Admin API key")
 @click.confirmation_option(prompt="Are you sure you want to revoke this key?")
-def revoke_key(key_id: str, admin_key: Optional[str]):
-    """Revoke an API key by its ID (admin only)"""
-
-    if not admin_key:
-        admin_key = os.getenv("AUTOPOV_ADMIN_KEY")
-
-    if not admin_key:
-        console.print("[red]Error: Admin key required[/red]")
-        sys.exit(1)
+def revoke_key(key_id: str):
+    """Revoke an API key by its ID"""
 
     url = f"{API_BASE_URL}/keys/{key_id}"
-    headers = {"Authorization": f"Bearer {admin_key}"}
+    headers = {}
 
     try:
         response = requests.delete(url, headers=headers)
@@ -803,22 +727,14 @@ def admin():
 
 
 @admin.command("cleanup")
-@click.option("--admin-key", "-a", help="Admin API key")
 @click.option("--max-age-days", default=30, help="Remove results older than N days (default: 30)")
 @click.option("--max-results", default=500, help="Keep only the N most recent results (default: 500)")
 @click.confirmation_option(prompt="This will permanently delete old scan result files. Continue?")
-def admin_cleanup(admin_key: Optional[str], max_age_days: int, max_results: int):
-    """Clean up old scan result files on the server (admin only)"""
-
-    if not admin_key:
-        admin_key = os.getenv("AUTOPOV_ADMIN_KEY")
-
-    if not admin_key:
-        console.print("[red]Error: Admin key required. Set AUTOPOV_ADMIN_KEY or use --admin-key[/red]")
-        sys.exit(1)
+def admin_cleanup(max_age_days: int, max_results: int):
+    """Clean up old scan result files on the server"""
 
     url = f"{API_BASE_URL}/admin/cleanup"
-    headers = {"Authorization": f"Bearer {admin_key}"}
+    headers = {}
 
     try:
         response = requests.post(
@@ -874,7 +790,8 @@ def config(api_key: Optional[str]):
                 f"Auto model   : {srv.get('auto_router_model', 'N/A')}\n"
                 f"CodeQL       : {'available' if srv.get('codeql_available') else 'not found'}\n"
                 f"Docker       : {'available' if srv.get('docker_available') else 'not found'}\n"
-                f"CWEs         : {len(srv.get('supported_cwes', []))} supported"
+                f"Discovery    : {srv.get('discovery_mode', 'open-ended')}\n"
+                f"Static rules : {srv.get('internal_static_ruleset_size', 0)} internal checks"
             )
             console.print(Panel(srv_text, title="Server Configuration"))
         except Exception:
@@ -1022,7 +939,7 @@ def display_results(scan_id: str, api_key: str, output: str):
             confirmed_findings = [f for f in result["findings"] if f.get("final_status") == "confirmed"]
             if confirmed_findings:
                 table = Table(title="Confirmed Vulnerabilities")
-                table.add_column("CWE", style="cyan")
+                table.add_column("Type", style="cyan")
                 table.add_column("File", style="green")
                 table.add_column("Line", style="yellow")
                 table.add_column("Confidence", style="magenta")

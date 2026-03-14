@@ -24,46 +24,56 @@ class Settings(BaseSettings):
     API_PREFIX: str = "/api"
     
     # Security
-    ADMIN_API_KEY: str = Field(default="", env="ADMIN_API_KEY")
     WEBHOOK_SECRET: str = Field(default="", env="WEBHOOK_SECRET")
     
     # LLM Configuration - Online (OpenRouter)
     OPENROUTER_API_KEY: str = Field(default="", env="OPENROUTER_API_KEY")
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
     
+    # UI-configured OpenRouter key (stored in learning.db, overrides env if set)
+    OPENROUTER_API_KEY_UI: str = ""
+    
     # LLM Configuration - Offline (Ollama)
     OLLAMA_BASE_URL: str = Field(default="http://localhost:11434", env="OLLAMA_BASE_URL")
     
-    # Model Selection
+    # Model Selection - NO DEFAULTS: Must be configured in Settings
     MODEL_MODE: str = Field(default="online", env="MODEL_MODE")  # 'online' or 'offline'
-    MODEL_NAME: str = Field(default="openai/gpt-4o", env="MODEL_NAME")
+    MODEL_NAME: str = Field(default="", env="MODEL_NAME")  # Must be set in Settings
 
     # Routing / Policy
-    ROUTING_MODE: str = Field(default="auto", env="ROUTING_MODE")  # auto|fixed|learning|hierarchical
-    AUTO_ROUTER_MODEL: str = Field(default="openrouter/auto", env="AUTO_ROUTER_MODEL")
+    ROUTING_MODE: str = Field(default="hierarchical", env="ROUTING_MODE")  # auto|fixed|learning|hierarchical
+    AUTO_ROUTER_MODEL: str = Field(default="", env="AUTO_ROUTER_MODEL")  # Must be set in Settings
     LEARNING_DB_PATH: str = Field(default="./data/learning.db", env="LEARNING_DB_PATH")
     
-    # Hierarchical LLM Configuration (Sifter + Architect pattern)
-    HIERARCHICAL_SIFTER_MODEL: str = Field(default="google/gemini-2.0-flash-001", env="HIERARCHICAL_SIFTER_MODEL")
-    HIERARCHICAL_SIFTER_CONFIDENCE_THRESHOLD: float = Field(default=0.7, env="HIERARCHICAL_SIFTER_CONFIDENCE_THRESHOLD")
-    HIERARCHICAL_ARCHITECT_MODEL: str = Field(default="anthropic/claude-3.5-sonnet", env="HIERARCHICAL_ARCHITECT_MODEL")
+    # Hierarchical LLM Configuration - NO DEFAULTS: Must be configured in Settings
+    HIERARCHICAL_SIFTER_MODEL: str = Field(default="", env="HIERARCHICAL_SIFTER_MODEL")  # Must be set in Settings
+    HIERARCHICAL_SIFTER_CONFIDENCE_THRESHOLD: float = Field(default=0.8, env="HIERARCHICAL_SIFTER_CONFIDENCE_THRESHOLD")
+    HIERARCHICAL_ARCHITECT_MODEL: str = Field(default="", env="HIERARCHICAL_ARCHITECT_MODEL")  # Must be set in Settings
+    
+    # Per-Agent Model Configuration - NO DEFAULTS: Must be configured in Settings
+    AGENT_INVESTIGATOR_MODEL: str = Field(default="", env="AGENT_INVESTIGATOR_MODEL")  # Must be set in Settings
+    AGENT_POV_GENERATOR_MODEL: str = Field(default="", env="AGENT_POV_GENERATOR_MODEL")  # Must be set in Settings
+    AGENT_VERIFIER_MODEL: str = Field(default="", env="AGENT_VERIFIER_MODEL")  # Must be set in Settings
+    AGENT_REFINER_MODEL: str = Field(default="", env="AGENT_REFINER_MODEL")  # Must be set in Settings
+    AGENT_LLM_SCOUT_MODEL: str = Field(default="", env="AGENT_LLM_SCOUT_MODEL")  # Must be set in Settings
 
     # Scout Settings
     SCOUT_ENABLED: bool = Field(default=True, env="SCOUT_ENABLED")
-    SCOUT_LLM_ENABLED: bool = Field(default=True, env="SCOUT_LLM_ENABLED")
+    SCOUT_LLM_ENABLED: bool = Field(default=False, env="SCOUT_LLM_ENABLED")
     SCOUT_MAX_FILES: int = Field(default=25, env="SCOUT_MAX_FILES")
     SCOUT_MAX_CHARS_PER_FILE: int = Field(default=4000, env="SCOUT_MAX_CHARS_PER_FILE")
     SCOUT_MAX_FINDINGS: int = Field(default=200, env="SCOUT_MAX_FINDINGS")
     SCOUT_MAX_COST_USD: float = Field(default=0.10, env="SCOUT_MAX_COST_USD")
     
-    # Available Models
+    # Available Models - Only these models are supported
     ONLINE_MODELS: List[str] = [
-        "openai/gpt-4o",
-        "anthropic/claude-3.5-sonnet"
+        "openai/gpt-5.2",
+        "anthropic/claude-opus-4.6"
     ]
     OFFLINE_MODELS: List[str] = [
-        "llama3:70b",
-        "mixtral:8x7b"
+        "llama4",
+        "glm-4.7-flash",
+        "qwen3"
     ]
     
     # Git Provider Tokens
@@ -82,6 +92,8 @@ class Settings(BaseSettings):
     # Embeddings
     EMBEDDING_MODEL_ONLINE: str = "openai/text-embedding-3-small"  # Must be prefixed for OpenRouter
     EMBEDDING_MODEL_OFFLINE: str = "sentence-transformers/all-MiniLM-L6-v2"
+    PREFER_LOCAL_EMBEDDINGS: bool = Field(default=True, env="PREFER_LOCAL_EMBEDDINGS")
+    LOCAL_EMBEDDING_BACKEND: str = Field(default="hash", env="LOCAL_EMBEDDING_BACKEND")
     
     # LangSmith Tracing
     LANGCHAIN_TRACING_V2: bool = Field(default=False, env="LANGCHAIN_TRACING_V2")
@@ -112,15 +124,21 @@ class Settings(BaseSettings):
     MAX_CHUNK_SIZE: int = 4000
     CHUNK_OVERLAP: int = 200
     MAX_RETRIES: int = 3  # Increased for self-healing refiner
+    DISCOVERY_MAX_FINDINGS: int = Field(default=75, env="DISCOVERY_MAX_FINDINGS")
+    PROOF_MAX_FINDINGS: int = Field(default=12, env="PROOF_MAX_FINDINGS")
+    CODEQL_TIMEOUT_S: int = Field(default=90, env="CODEQL_TIMEOUT_S")
+    CODEQL_QUERY_TIMEOUT_S: int = Field(default=90, env="CODEQL_QUERY_TIMEOUT_S")
+    SEMGREP_TIMEOUT_S: int = Field(default=180, env="SEMGREP_TIMEOUT_S")
     
     # Parallel Processing Configuration
     PARALLEL_PROCESSING_ENABLED: bool = Field(default=False, env="PARALLEL_PROCESSING_ENABLED")
     PARALLEL_MAX_WORKERS: int = Field(default=5, env="PARALLEL_MAX_WORKERS")
     PARALLEL_RATE_LIMIT_RPS: int = Field(default=10, env="PARALLEL_RATE_LIMIT_RPS")  # Requests per second
     
-    # Supported CWEs - Focused list for faster scanning (high-impact web vulnerabilities)
-    # Top 20 most common web vulnerabilities (OWASP Top 10 + extras)
-    SUPPORTED_CWES: List[str] = [
+    # Internal static analysis ruleset used for broad discovery coverage.
+    # This is not a user-input contract; it is the fallback coverage set for
+    # CodeQL, Semgrep, and heuristic scouts when scans run in open discovery mode.
+    INTERNAL_STATIC_RULESET: List[str] = [
         # OWASP Top 10 2021
         "CWE-89",   # A01:2021 - Broken Access Control (SQL Injection)
         "CWE-79",   # A03:2021 - Injection (XSS)
@@ -145,12 +163,18 @@ class Settings(BaseSettings):
         "CWE-400",  # Uncontrolled Resource Consumption (DoS)
         "CWE-384",  # Session Fixation
     ]
-    
+
+    @property
+    def SUPPORTED_CWES(self) -> List[str]:
+        """Backward-compatible alias for older code paths."""
+        return self.INTERNAL_STATIC_RULESET
+
     # File Paths
     DATA_DIR: str = "./data"
     RESULTS_DIR: str = "./results"
     POVS_DIR: str = "./results/povs"
     RUNS_DIR: str = "./results/runs"
+    ACTIVE_RUNS_DIR: str = "./results/runs/active"
     TEMP_DIR: str = "/tmp/autopov"
     SNAPSHOT_DIR: str = Field(default="./results/snapshots", env="SNAPSHOT_DIR")
     
@@ -198,6 +222,18 @@ class Settings(BaseSettings):
         except (subprocess.TimeoutExpired, FileNotFoundError):
             return False
     
+    def get_openrouter_api_key(self) -> str:
+        """Get the effective OpenRouter API key (env var takes precedence)"""
+        # Environment variable always takes precedence
+        if self.OPENROUTER_API_KEY:
+            return self.OPENROUTER_API_KEY
+        # Fall back to UI-configured key
+        return self.OPENROUTER_API_KEY_UI
+    
+    def is_openrouter_key_from_env(self) -> bool:
+        """Check if OpenRouter key is set via environment variable"""
+        return bool(self.OPENROUTER_API_KEY)
+    
     def is_joern_available(self) -> bool:
         """Check if Joern is available"""
         try:
@@ -228,8 +264,8 @@ class Settings(BaseSettings):
             # Use OpenRouter for all online models
             return {
                 "mode": "online",
-                "model": self.MODEL_NAME,
-                "api_key": self.OPENROUTER_API_KEY,
+                "model": self.MODEL_NAME or self.AUTO_ROUTER_MODEL or "openrouter/auto",
+                "api_key": self.get_openrouter_api_key(),
                 "base_url": self.OPENROUTER_BASE_URL,
                 "embedding_model": self.EMBEDDING_MODEL_ONLINE,
                 "provider": "openrouter"
@@ -250,6 +286,7 @@ class Settings(BaseSettings):
             self.RESULTS_DIR,
             self.POVS_DIR,
             self.RUNS_DIR,
+            self.ACTIVE_RUNS_DIR,
             self.CHROMA_PERSIST_DIR,
             self.TEMP_DIR,
             self.SNAPSHOT_DIR

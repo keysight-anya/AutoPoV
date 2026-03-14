@@ -1,7 +1,26 @@
+# Secrets and local environments
 .env
 venv/
-results/
-__pycache__/
-*.pyc
-.docker
 node_modules/
+
+# Python build/runtime artifacts
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+
+# Frontend build artifacts
+frontend/dist/
+
+# Runtime outputs and generated reports
+results/
+*_report.json
+*_report.pdf
+.cache_bust
+
+# Local runtime state
+.docker
+data/chroma/
+data/api_keys.json
+data/*.db

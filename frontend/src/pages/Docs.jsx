@@ -41,8 +41,7 @@ function Docs() {
 {`{
   "url": "https://github.com/user/repo.git",
   "branch": "main",
-  "model": "openai/gpt-4o",
-  "cwes": ["CWE-89", "CWE-119"]
+  "model": "openrouter/auto"
 }`}
                 </code>
               </pre>
@@ -51,7 +50,7 @@ function Docs() {
             <div>
               <h3 className="font-medium text-green-400 mb-2">POST /api/scan/zip</h3>
               <p className="text-sm text-gray-400 mb-2">Upload and scan a ZIP file</p>
-              <p className="text-sm text-gray-500">Multipart form data with file, model, and cwes fields</p>
+              <p className="text-sm text-gray-500">Multipart form data with file and optional model override</p>
             </div>
 
             <div>
@@ -62,8 +61,7 @@ function Docs() {
 {`{
   "code": "def vulnerable(): ...",
   "language": "python",
-  "model": "openai/gpt-4o",
-  "cwes": ["CWE-89"]
+  "model": "openrouter/auto"
 }`}
                 </code>
               </pre>
@@ -103,7 +101,7 @@ function Docs() {
               <h3 className="font-medium mb-2">Scan a repository</h3>
               <pre className="bg-gray-950 p-3 rounded-lg overflow-x-auto">
                 <code className="text-sm text-green-400">
-                  autopov scan https://github.com/user/repo.git --model openai/gpt-4o
+                  autopov scan https://github.com/user/repo.git
                 </code>
               </pre>
             </div>
@@ -112,7 +110,7 @@ function Docs() {
               <h3 className="font-medium mb-2">Scan a local directory</h3>
               <pre className="bg-gray-950 p-3 rounded-lg overflow-x-auto">
                 <code className="text-sm text-green-400">
-                  autopov scan /path/to/code --model anthropic/claude-3.5-sonnet
+                  autopov scan /path/to/code --model anthropic/claude-opus-4.6
                 </code>
               </pre>
             </div>
@@ -137,42 +135,11 @@ function Docs() {
           </div>
         </section>
 
-        {/* Supported CWEs */}
         <section className="bg-gray-900 rounded-lg border border-gray-800 p-6">
-          <h2 className="text-lg font-medium mb-4">Supported CWE Classes</h2>
-          
-          <div className="grid md:grid-cols-2 gap-4">
-            <div className="p-4 bg-gray-850 rounded-lg">
-              <h3 className="font-medium text-red-400 mb-2">CWE-119</h3>
-              <p className="text-sm text-gray-400">Buffer Overflow</p>
-              <p className="text-xs text-gray-500 mt-1">
-                Improper restriction of operations within the bounds of a memory buffer
-              </p>
-            </div>
-
-            <div className="p-4 bg-gray-850 rounded-lg">
-              <h3 className="font-medium text-red-400 mb-2">CWE-89</h3>
-              <p className="text-sm text-gray-400">SQL Injection</p>
-              <p className="text-xs text-gray-500 mt-1">
-                Improper neutralization of special elements in SQL commands
-              </p>
-            </div>
-
-            <div className="p-4 bg-gray-850 rounded-lg">
-              <h3 className="font-medium text-orange-400 mb-2">CWE-416</h3>
-              <p className="text-sm text-gray-400">Use After Free</p>
-              <p className="text-xs text-gray-500 mt-1">
-                Use of memory after it has been freed
-              </p>
-            </div>
-
-            <div className="p-4 bg-gray-850 rounded-lg">
-              <h3 className="font-medium text-yellow-400 mb-2">CWE-190</h3>
-              <p className="text-sm text-gray-400">Integer Overflow</p>
-              <p className="text-xs text-gray-500 mt-1">
-                Integer overflow or wraparound
-              </p>
-            </div>
+          <h2 className="text-lg font-medium mb-4">Discovery and Classification</h2>
+          <div className="space-y-3 text-sm text-gray-400">
+            <p>The scanner does not require predefined CWE input. It performs open-ended discovery, investigates candidate issues, and then maps them to a known CWE/CVE only when the evidence supports that classification.</p>
+            <p>If a real vulnerability does not cleanly match an existing taxonomy entry, it is preserved as an unclassified finding and the system can still attempt to generate and validate proof for it.</p>
           </div>
         </section>
 

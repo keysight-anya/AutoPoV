@@ -187,6 +187,7 @@ class HeuristicScout:
 
     def scan_directory(self, codebase_path: str, cwes: List[str]) -> List[Dict[str, Any]]:
         findings: List[Dict[str, Any]] = []
+        active_cwes = cwes or list(self._patterns.keys())
 
         for root, dirs, files in os.walk(codebase_path):
             dirs[:] = [d for d in dirs if not d.startswith(".")]
@@ -205,7 +206,7 @@ class HeuristicScout:
                 language = self._detect_language(rel_path)
 
                 for line_idx, line in enumerate(lines, start=1):
-                    for cwe in cwes:
+                    for cwe in active_cwes:
                         patterns = self._patterns.get(cwe, [])
                         for pattern in patterns:
                             if pattern.search(line):

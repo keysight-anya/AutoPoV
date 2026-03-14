@@ -229,7 +229,7 @@ class ReportGenerator:
         self.results_dir = settings.RESULTS_DIR
         self.povs_dir = settings.POVS_DIR
         os.makedirs(self.povs_dir, exist_ok=True)
-        self.activity_tracker = OpenRouterActivityTracker(settings.OPENROUTER_API_KEY)
+        self.activity_tracker = OpenRouterActivityTracker(settings.get_openrouter_api_key())
     
     def generate_json_report(self, result: ScanResult) -> str:
         """Generate comprehensive JSON report"""
@@ -237,6 +237,8 @@ class ReportGenerator:
         pov_summary = self._summarize_pov(result)
         models_used = self._collect_models_used(result)
         openrouter_activity = self._get_openrouter_activity(result)
+        language_info = getattr(result, "language_info", {}) or {}
+        detected_language = getattr(result, "detected_language", None) or language_info.get("primary", "unknown")
         
         report_data = {
             "report_metadata": {
@@ -253,7 +255,7 @@ class ReportGenerator:
                 "scan_completed": result.end_time if hasattr(result, 'end_time') else None,
                 "duration_seconds": result.duration_s,
                 "language_analysis": {
-                    "primary_language": result.detected_language or language_info.get('primary', 'unknown'),
+                    "primary_language": detected_language,
                     "all_languages_detected": language_info.get('all_languages', []),
                     "language_distribution": language_info.get('language_stats', {}),
                     "total_source_files": language_info.get('total_files', 0)
@@ -263,6 +265,7 @@ class ReportGenerator:
                     "routing_mode": settings.ROUTING_MODE,
                     "auto_router_model": settings.AUTO_ROUTER_MODEL,
                     "cwes_checked": result.cwes,
+            "discovery_scope": result.cwes if result.cwes else 'open-ended',
                     "scout_enabled": settings.SCOUT_ENABLED,
                     "codeql_enabled": settings.is_codeql_available(),
                 }
@@ -296,8 +299,7 @@ class ReportGenerator:
     def _format_detailed_findings(self, findings: List[Dict[str, Any]], result: ScanResult) -> List[Dict[str, Any]]:
         """Format detailed findings with full evidence and proof"""
         detailed = []
-        scan_info = getattr(result, 'scan_info', {}) or {}
-        language_info = scan_info.get('language_info', {})
+        language_info = getattr(result, "language_info", {}) or {}
         
         for idx, finding in enumerate(findings or []):
             if not finding:
@@ -334,11 +336,15 @@ class ReportGenerator:
                 "finding_id": f"{finding.get('cwe_type', 'UNKNOWN')}-{idx+1:03d}",
                 
                 "vulnerability": {
-                    "cwe_id": finding.get('cwe_type', 'Unknown'),
+                    "cwe_id": finding.get('cwe_type', 'UNCLASSIFIED'),
                     "cwe_name": self._get_cwe_name(finding.get('cwe_type', '')),
+                    "cve_id": finding.get('cve_id'),
                     "description": finding.get('llm_explanation', 'No description available'),
+                    "root_cause": finding.get('root_cause', ''),
+                    "impact": finding.get('impact', ''),
                     "severity": self._calculate_severity(finding),
                     "confidence": finding.get('confidence', 0.0),
+                    "classification_status": 'mapped' if finding.get('cwe_type') and finding.get('cwe_type') != 'UNCLASSIFIED' else 'unclassified',
                     "final_status": finding.get('final_status', 'unknown')
                 },
                 
@@ -356,6 +362,7 @@ class ReportGenerator:
                     "investigation_model": finding.get('model_used', 'unknown'),
                     "investigation_verdict": finding.get('llm_verdict', 'UNKNOWN'),
                     "investigation_time_seconds": finding.get('inference_time_s', 0),
+                    "classification_summary": self._build_classification_summary(finding),
                     "token_usage": {
                         "prompt_tokens": finding.get('prompt_tokens', 0),
                         "completion_tokens": finding.get('completion_tokens', 0),
@@ -365,6 +372,7 @@ class ReportGenerator:
                 
                 "proof_of_vulnerability": {
                     "pov_script": finding.get('pov_script', ''),
+                    "exploit_contract": finding.get('exploit_contract', {}),
                     "pov_generation_model": finding.get('pov_model_used', ''),
                     "pov_token_usage": {
                         "prompt_tokens": finding.get('pov_prompt_tokens', 0),
@@ -376,7 +384,8 @@ class ReportGenerator:
                 },
                 
                 "validation": {
-                    "validation_method": validation.get('validation_method', 'unknown'),
+                    "validation_method": validation.get('validation_method') or pov_result.get('validation_method', 'unknown'),
+                    "validation_summary": self._build_validation_summary(finding),
                     "static_validation": validation.get('static_result', {}),
                     "unit_test_result": {
                         "success": unit_test.get('success', False),
@@ -396,10 +405,10 @@ class ReportGenerator:
                 },
                 
                 "impact_assessment": {
-                    "what_was_tested": f"The {finding.get('cwe_type', 'vulnerability')} vulnerability at {filepath}:{finding.get('line_number', 0)}",
-                    "how_it_was_tested": f"An automated Proof-of-Vulnerability (PoV) script was generated and executed to trigger the vulnerability",
-                    "outcome": "VULNERABILITY CONFIRMED" if pov_result.get('vulnerability_triggered') else "VULNERABILITY NOT TRIGGERED",
-                    "proof_summary": self._generate_proof_summary(finding, oracle)
+                    "what_was_tested": f"The candidate vulnerability at {filepath}:{finding.get('line_number', 0)}",
+                    "how_it_was_tested": "The system generated a proof, validated it statically, attempted unit-style execution, and used runtime execution where needed.",
+                    "outcome": "VULNERABILITY CONFIRMED" if pov_result.get('vulnerability_triggered') else "PROOF NOT ESTABLISHED",
+                    "proof_summary": self._build_proof_summary(finding)
                 },
                 
                 "resource_usage": {
@@ -430,6 +439,8 @@ class ReportGenerator:
             "CWE-119": "Buffer Overflow",
             "CWE-190": "Integer Overflow"
         }
+        if not cwe_id or cwe_id == 'UNCLASSIFIED':
+            return 'Unclassified / novel vulnerability'
         return cwe_names.get(cwe_id, f"{cwe_id} - Unknown Vulnerability Type")
     
     def _calculate_severity(self, finding: Dict[str, Any]) -> str:
@@ -450,22 +461,72 @@ class ReportGenerator:
     def _generate_proof_summary(self, finding: Dict[str, Any], oracle: Dict[str, Any]) -> str:
         """Generate human-readable proof summary"""
         pov_result = finding.get('pov_result', {}) or {}
-        
+
         if not pov_result.get('vulnerability_triggered'):
-            return "The PoV script did not successfully trigger the vulnerability. This may indicate a false positive or require manual verification."
-        
+            return "The PoV script did not successfully trigger the vulnerability. This may indicate a false positive, missing runtime prerequisites, or a candidate that needs manual review."
+
         evidence = oracle.get('evidence', [])
         method = oracle.get('method', 'unknown')
-        
+
         summary_parts = ["The vulnerability was confirmed through automated testing."]
-        
+
         if evidence:
             summary_parts.append(f"Evidence detected using {method} method:")
             for ev in evidence[:3]:
                 summary_parts.append(f"  - {ev}")
-        
+
         return " ".join(summary_parts)
-    
+
+    def _build_classification_summary(self, finding: Dict[str, Any]) -> str:
+        cwe = finding.get('cwe_type') or 'UNCLASSIFIED'
+        cve = finding.get('cve_id')
+        verdict = finding.get('llm_verdict', 'UNKNOWN')
+        if cwe == 'UNCLASSIFIED':
+            summary = f"{verdict} candidate kept as unclassified because no precise CWE mapping was justified."
+        else:
+            summary = f"{verdict} candidate mapped to {cwe}."
+        if cve:
+            summary += f" Related CVE: {cve}."
+        return summary
+
+    def _get_proof_status(self, finding: Dict[str, Any]) -> str:
+        pov_result = finding.get('pov_result') or {}
+        validation = finding.get('validation_result') or {}
+        if pov_result.get('vulnerability_triggered'):
+            return 'confirmed'
+        if finding.get('pov_script'):
+            method = validation.get('validation_method') or pov_result.get('validation_method')
+            if method:
+                return f'proof_attempted_via_{method}'
+            return 'proof_attempted'
+        if finding.get('final_status') == 'skipped':
+            return 'false_positive'
+        return 'not_proven'
+
+    def _build_validation_summary(self, finding: Dict[str, Any]) -> str:
+        validation = finding.get('validation_result') or {}
+        pov_result = finding.get('pov_result') or {}
+        unit_test = (validation.get('unit_test_result') or {})
+        method = validation.get('validation_method') or pov_result.get('validation_method') or 'unknown'
+        if pov_result.get('vulnerability_triggered'):
+            return f"Proof established using {method}."
+        if unit_test.get('success'):
+            return f"Validation executed using {method}, but the vulnerability was not triggered."
+        return f"Validation did not establish proof using {method}."
+
+    def _build_proof_summary(self, finding: Dict[str, Any]) -> str:
+        validation = finding.get('validation_result') or {}
+        pov_result = finding.get('pov_result') or {}
+        unit_test = validation.get('unit_test_result') or {}
+        oracle = unit_test.get('oracle') or {}
+        proof_parts = [self._generate_proof_summary(finding, oracle)]
+        if validation.get('validation_method') or pov_result.get('validation_method'):
+            proof_parts.append(f"Validation path: {validation.get('validation_method') or pov_result.get('validation_method')}.")
+        stdout = unit_test.get('stdout') or pov_result.get('stdout')
+        if stdout:
+            proof_parts.append(f"Observed stdout: {str(stdout)[:240]}")
+        return ' '.join(proof_parts)
+
     def generate_pdf_report(self, result: ScanResult) -> str:
         """Generate professional PDF report"""
         if not FPDF_AVAILABLE:
@@ -524,7 +585,7 @@ class ReportGenerator:
         
         summary_text = (
             f"This security assessment analyzed '{codebase_name}' "
-            f"for {len(result.cwes)} vulnerability classes using AutoPoV's hybrid "
+            f"for {'an open-ended vulnerability search' if not result.cwes else str(len(result.cwes)) + ' focused vulnerability classes'} using AutoPoV's hybrid "
             f"agentic framework. The scan completed in {result.duration_s:.1f} seconds "
             f"with a total cost of ${result.total_cost_usd:.4f} USD."
         )
@@ -606,10 +667,12 @@ class ReportGenerator:
                     pdf.add_page()
                 
                 # Vulnerability header
-                cwe = finding.get('cwe_type', 'Unknown')
+                cwe = finding.get('cwe_type', 'UNCLASSIFIED')
+                cve = finding.get('cve_id')
                 pdf.set_font('Arial', 'B', 12)
                 pdf.set_text_color(239, 68, 68)
-                pdf.cell(0, 8, _safe(f"Finding #{i}: {cwe}"), 0, 1)
+                heading = f"Finding #{i}: {cwe}" + (f" | {cve}" if cve else '')
+                pdf.cell(0, 8, _safe(heading), 0, 1)
                 
                 # Location
                 pdf.set_font('Arial', '', 10)
@@ -622,6 +685,7 @@ class ReportGenerator:
                 confidence = finding.get('confidence', 0)
                 model_used = finding.get('model_used', 'N/A')
                 pdf.cell(0, 6, _safe(f"Confidence: {confidence:.2f} | Detected by: {model_used}"), 0, 1)
+                pdf.cell(0, 6, _safe(f"Classification: {self._build_classification_summary(finding)}"), 0, 1)
                 pdf.ln(2)
                 
                 # Explanation
@@ -631,6 +695,13 @@ class ReportGenerator:
                 pdf.set_font('Arial', '', 10)
                 pdf.set_text_color(75, 85, 99)
                 pdf.multi_cell(0, 5, _safe(finding.get('llm_explanation', 'No explanation available.')))
+                if finding.get('root_cause'):
+                    pdf.cell(0, 6, _safe(f"Root Cause: {finding.get('root_cause')}"), 0, 1)
+                if finding.get('impact'):
+                    pdf.cell(0, 6, _safe(f"Impact: {finding.get('impact')}"), 0, 1)
+                contract = finding.get('exploit_contract') or {}
+                if contract.get('goal'):
+                    pdf.cell(0, 6, _safe(f"Exploit Goal: {contract.get('goal')}"), 0, 1)
                 pdf.ln(3)
                 
                 # PoV Status and Validation Evidence
@@ -649,8 +720,9 @@ class ReportGenerator:
                 pdf.set_font('Arial', '', 10)
                 pdf.set_text_color(75, 85, 99)
                 
-                if validation.get('validation_method'):
-                    pdf.cell(0, 6, f"Validation Method: {validation.get('validation_method')}", 0, 1)
+                validation_method = validation.get('validation_method') or pov_result.get('validation_method')
+                if validation_method:
+                    pdf.cell(0, 6, _safe(f"Validation Method: {validation_method}"), 0, 1)
                 
                 if validation.get('execution_time_s'):
                     pdf.cell(0, 6, f"Execution Time: {validation.get('execution_time_s'):.2f} seconds", 0, 1)
@@ -681,7 +753,7 @@ class ReportGenerator:
                 pdf.multi_cell(0, 5, _safe(evidence_text))
                 
                 # Show stdout/stderr if available
-                if validation.get('stdout') or validation.get('stderr'):
+                if validation.get('stdout') or validation.get('stderr') or pov_result.get('stdout') or pov_result.get('stderr'):
                     pdf.ln(2)
                     pdf.set_font('Arial', 'B', 10)
                     pdf.set_text_color(51, 65, 85)
@@ -822,6 +894,7 @@ class ReportGenerator:
             "scout_enabled": settings.SCOUT_ENABLED,
             "codeql_enabled": settings.is_codeql_available(),
             "cwes_checked": result.cwes,
+            "discovery_scope": result.cwes if result.cwes else 'open-ended',
             "duration_seconds": result.duration_s,
             "process_steps": [
                 {
@@ -831,12 +904,12 @@ class ReportGenerator:
                 },
                 {
                     "name": "Static Analysis",
-                    "description": "CodeQL queries identified potential vulnerability patterns. " +
+                    "description": "Static analyzers and heuristics were used to surface candidate vulnerabilities before proof generation. " +
                                    ("CodeQL was available and used." if settings.is_codeql_available() else "CodeQL was not available.")
                 },
                 {
                     "name": "Autonomous Discovery",
-                    "description": "Heuristic and LLM scouts analyzed code for vulnerability candidates. " +
+                    "description": "The system performed open-ended vulnerability discovery and only treated CWE selection as an optional focus filter. " +
                                    f"Scout was {'enabled' if settings.SCOUT_ENABLED else 'disabled'}."
                 },
                 {
@@ -863,7 +936,7 @@ class ReportGenerator:
     
     def _get_openrouter_activity(self, result: ScanResult) -> List[Dict[str, Any]]:
         """Get OpenRouter activity for the scan period"""
-        if settings.MODEL_MODE != 'online' or not settings.OPENROUTER_API_KEY:
+        if settings.MODEL_MODE != 'online' or not settings.get_openrouter_api_key():
             return []
         
         # Get activity for scan date
@@ -980,22 +1053,33 @@ class ReportGenerator:
         for finding in findings:
             if not hasattr(finding, 'get'):
                 continue
+            pov_result = finding.get("pov_result") or {}
+            validation = finding.get("validation_result") or {}
             formatted.append({
-                "cwe_type": finding.get("cwe_type"),
+                "cwe_type": finding.get("cwe_type") or "UNCLASSIFIED",
+                "cve_id": finding.get("cve_id"),
                 "filepath": finding.get("filepath"),
                 "line_number": finding.get("line_number"),
+                "source": finding.get("source"),
                 "verdict": finding.get("llm_verdict"),
                 "confidence": finding.get("confidence"),
+                "severity": self._calculate_severity(finding),
                 "explanation": finding.get("llm_explanation"),
+                "root_cause": finding.get("root_cause"),
+                "impact": finding.get("impact"),
                 "vulnerable_code": finding.get("code_chunk"),
                 "final_status": finding.get("final_status"),
                 "has_pov": finding.get("pov_script") is not None,
-                "pov_success": (finding.get("pov_result") or {}).get("vulnerability_triggered", False),
+                "proof_status": self._get_proof_status(finding),
+                "pov_success": pov_result.get("vulnerability_triggered", False),
                 "pov_model_used": finding.get("pov_model_used"),
                 "model_used": finding.get("model_used"),
                 "token_usage": finding.get("token_usage", {}),
-                "pov_validation": finding.get("validation_result", {}),
-                "pov_result": finding.get("pov_result", {}),
+                "validation_method": validation.get("validation_method") or pov_result.get("validation_method"),
+                "validation_summary": self._build_validation_summary(finding),
+                "proof_summary": self._build_proof_summary(finding),
+                "pov_validation": validation,
+                "pov_result": pov_result,
                 "inference_time_s": finding.get("inference_time_s"),
                 "cost_usd": finding.get("cost_usd")
             })

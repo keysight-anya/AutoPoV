@@ -7,6 +7,7 @@ services:
     ports:
       - "8000:8000"
     volumes:
+      - chroma_data:/app/data/chroma
       - ./data:/app/data
       - ./results:/app/results
       - ./.env:/app/.env:ro
@@ -17,12 +18,30 @@ services:
       - API_PORT=8000
       - DOCKER_ENABLED=true
       - CODEQL_CLI_PATH=/usr/local/bin/codeql
+      - OLLAMA_BASE_URL=http://ollama:11434
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
       interval: 15s
       timeout: 10s
       retries: 8
       start_period: 60s
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: autopov-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
     restart: unless-stopped
 
   frontend:
@@ -38,3 +57,9 @@ services:
       backend:
         condition: service_healthy
     restart: unless-stopped
+
+volumes:
+  chroma_data:
+    driver: local
+  ollama_data:
+    driver: local

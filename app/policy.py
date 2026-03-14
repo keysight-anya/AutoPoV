@@ -17,29 +17,25 @@ class PolicyRouter:
 
     def select_model(self, stage: str, cwe: Optional[str] = None, language: Optional[str] = None) -> str:
         mode = settings.ROUTING_MODE
+        auto_model = settings.AUTO_ROUTER_MODEL or "openrouter/auto"
 
         if mode == "fixed":
-            return settings.MODEL_NAME
+            return settings.MODEL_NAME or auto_model
 
         if mode == "learning":
             recommended = self._learning.get_model_recommendation(stage, cwe=cwe, language=language)
             if recommended:
                 return recommended
-            # Fall back to auto router if learning has no signal
-            return settings.AUTO_ROUTER_MODEL
+            return auto_model
 
         if mode == "hierarchical":
-            # Hierarchical mode: use sifter for investigation, architect for PoV generation
             if stage == "investigate":
-                return settings.HIERARCHICAL_SIFTER_MODEL
-            elif stage == "pov":
-                return settings.HIERARCHICAL_ARCHITECT_MODEL
-            else:
-                # Default to sifter for other stages
-                return settings.HIERARCHICAL_SIFTER_MODEL
+                return settings.HIERARCHICAL_SIFTER_MODEL or auto_model
+            if stage == "pov":
+                return settings.HIERARCHICAL_ARCHITECT_MODEL or auto_model
+            return settings.HIERARCHICAL_SIFTER_MODEL or auto_model
 
-        # Default: auto router
-        return settings.AUTO_ROUTER_MODEL
+        return auto_model
 
     def get_hierarchical_config(self) -> Dict[str, Any]:
         """Get hierarchical routing configuration."""

@@ -44,6 +44,50 @@ class VulnerabilityVerifier:
     
     def __init__(self):
         self._llm = None
+
+    def _default_exploit_contract(self, cwe_type: str, explanation: str, vulnerable_code: str) -> Dict[str, Any]:
+        return {
+            "goal": explanation or "Demonstrate exploitability of the candidate vulnerability",
+            "target_entrypoint": "unknown",
+            "runtime_profile": "python",
+            "http_method": "GET",
+            "target_url": "",
+            "base_url": "",
+            "preconditions": [],
+            "inputs": [],
+            "trigger_steps": ["Invoke the vulnerable code path with attacker-controlled input"],
+            "success_indicators": ["VULNERABILITY TRIGGERED"],
+            "side_effects": [],
+            "expected_outcome": "The exploit should trigger observable unsafe behavior"
+        }
+
+    def _parse_pov_payload(self, raw_content: str, cwe_type: str, explanation: str, vulnerable_code: str) -> Dict[str, Any]:
+        payload = raw_content.strip()
+        if payload.startswith("```"):
+            payload = payload.split("```", 2)[1 if "```json" not in payload else 1]
+        try:
+            cleaned = raw_content.strip()
+            if "```json" in cleaned:
+                cleaned = cleaned.split("```json", 1)[1].split("```", 1)[0]
+            elif cleaned.startswith("```"):
+                cleaned = cleaned.split("```", 1)[1].rsplit("```", 1)[0]
+            data = json.loads(cleaned.strip())
+            pov_script = (data.get("pov_script") or "").strip()
+            contract = data.get("exploit_contract") or self._default_exploit_contract(cwe_type, explanation, vulnerable_code)
+            if pov_script:
+                return {"pov_script": pov_script, "exploit_contract": contract}
+        except Exception:
+            pass
+
+        pov_script = raw_content.strip()
+        if "```python" in pov_script:
+            pov_script = pov_script.split("```python", 1)[1].split("```", 1)[0].strip()
+        elif "```javascript" in pov_script:
+            pov_script = pov_script.split("```javascript", 1)[1].split("```", 1)[0].strip()
+        elif "```" in pov_script:
+            pov_script = pov_script.split("```", 1)[1].split("```", 1)[0].strip()
+        return {"pov_script": pov_script, "exploit_contract": self._default_exploit_contract(cwe_type, explanation, vulnerable_code)}
+
     
     def _get_llm(self, model_name: Optional[str] = None):
         """Get LLM instance based on configuration"""
@@ -65,7 +109,11 @@ class VulnerabilityVerifier:
                 model=actual_model,
                 api_key=api_key,
                 base_url=llm_config["base_url"],
-                temperature=0.2
+                temperature=0.2,
+                default_headers={
+                    "HTTP-Referer": "https://autopov.local",
+                    "X-OpenRouter-Title": "AutoPoV"
+                }
             )
             llm._autopov_model_name = actual_model
             
@@ -142,7 +190,9 @@ class VulnerabilityVerifier:
             ]
             
             response = llm.invoke(messages)
-            pov_script = response.content.strip()
+            parsed = self._parse_pov_payload(response.content, cwe_type, explanation, vulnerable_code)
+            pov_script = parsed["pov_script"]
+            exploit_contract = parsed["exploit_contract"]
             
             # Get actual cost from response
             actual_cost = 0.0
@@ -203,6 +253,7 @@ class VulnerabilityVerifier:
                 "pov_script": pov_script,
                 "pov_language": pov_language,
                 "target_language": target_language,
+                "exploit_contract": exploit_contract,
                 "generation_time_s": generation_time,
                 "timestamp": end_time.isoformat(),
                 "model_used": model_name or llm._autopov_model_name,
@@ -228,7 +279,8 @@ class VulnerabilityVerifier:
         cwe_type: str,
         filepath: str,
         line_number: int,
-        vulnerable_code: str = ""
+        vulnerable_code: str = "",
+        exploit_contract: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Validate a PoV script using hybrid approach:
@@ -263,7 +315,8 @@ class VulnerabilityVerifier:
             cwe_type=cwe_type,
             vulnerable_code=vulnerable_code,
             filepath=filepath,
-            line_number=line_number
+            line_number=line_number,
+            exploit_contract=exploit_contract or {}
         )
         
         result["static_result"] = {
@@ -299,7 +352,8 @@ class VulnerabilityVerifier:
                 pov_script=pov_script,
                 vulnerable_code=vulnerable_code,
                 cwe_type=cwe_type,
-                scan_id=f"validate_{cwe_type}_{line_number}"
+                scan_id=f"validate_{cwe_type}_{line_number}",
+                exploit_contract=exploit_contract or {}
             )
             
             # Extract oracle evidence from unit test details
@@ -377,14 +431,15 @@ class VulnerabilityVerifier:
             result["issues"].append(f"Non-stdlib imports detected: {', '.join(disallowed_imports)}")
         
         # Check 4: CWE-specific validation
-        cwe_issues = self._validate_cwe_specific(pov_script, cwe_type)
-        result["issues"].extend(cwe_issues)
+        if cwe_type and cwe_type != "UNCLASSIFIED":
+            cwe_issues = self._validate_cwe_specific(pov_script, cwe_type)
+            result["issues"].extend(cwe_issues)
         
         # Check 5: Use LLM for advanced validation (only if other methods inconclusive)
         if result["validation_method"] == "unknown":
             try:
                 llm_result = self._llm_validate_pov(
-                    pov_script, cwe_type, filepath, line_number
+                    pov_script, cwe_type, filepath, line_number, exploit_contract or {}
                 )
                 result["will_trigger"] = llm_result.get("will_trigger", "MAYBE")
                 result["suggestions"].extend(llm_result.get("suggestions", []))
@@ -471,14 +526,16 @@ class VulnerabilityVerifier:
         pov_script: str,
         cwe_type: str,
         filepath: str,
-        line_number: int
+        line_number: int,
+        exploit_contract: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """Use LLM to validate PoV script"""
         prompt = format_pov_validation_prompt(
             pov_script=pov_script,
             cwe_type=cwe_type,
             filepath=filepath,
-            line_number=line_number
+            line_number=line_number,
+            exploit_contract=exploit_contract or {}
         )
         
         llm = self._get_llm()
@@ -615,7 +672,8 @@ class VulnerabilityVerifier:
                 failed_pov=failed_pov,
                 validation_errors=validation_errors,
                 attempt_number=attempt_number,
-                target_language=target_language
+                target_language=target_language,
+                exploit_contract={}
             )
             
             # Call LLM with specified model
@@ -626,7 +684,9 @@ class VulnerabilityVerifier:
             ]
             
             response = llm.invoke(messages)
-            pov_script = response.content.strip()
+            parsed = self._parse_pov_payload(response.content, cwe_type, explanation, vulnerable_code)
+            pov_script = parsed["pov_script"]
+            exploit_contract = parsed["exploit_contract"]
             
             # Get actual cost from response
             actual_cost = 0.0
@@ -687,7 +747,8 @@ class VulnerabilityVerifier:
                 "model_used": model_name or llm._autopov_model_name,
                 "cost_usd": actual_cost,
                 "token_usage": token_usage,
-                "attempt_number": attempt_number
+                "attempt_number": attempt_number,
+                "exploit_contract": exploit_contract
             }
             
         except Exception as e:

@@ -39,11 +39,15 @@ ENV CODEQL_CLI_PATH=/usr/local/bin/codeql
 RUN mkdir -p /usr/local/codeql/packs \
     && codeql pack download --dir /usr/local/codeql/packs codeql/javascript-queries codeql/python-queries \
     || true
+
 # Copy requirements first for better caching
 COPY requirements.txt .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir --default-timeout=1000 -r requirements.txt
+
+# Cache bust to ensure fresh code copy
+ARG CACHE_BUST=1
 
 # Copy the application code
 COPY . .

@@ -37,6 +37,8 @@ class ScanResult:
     start_time: str
     end_time: Optional[str]
     findings: List[Dict[str, Any]]
+    detected_language: Optional[str] = None
+    language_info: Optional[Dict[str, Any]] = None
     logs: List[str] = None
     
     def __post_init__(self):
@@ -68,8 +70,11 @@ class ScanManager:
         self._scan_callbacks: Dict[str, List[Callable]] = {}
         self._executor = ThreadPoolExecutor(max_workers=3)
         self._runs_dir = settings.RUNS_DIR
+        self._active_runs_dir = settings.ACTIVE_RUNS_DIR
         self._scan_locks: Dict[str, threading.Lock] = {}
         os.makedirs(self._runs_dir, exist_ok=True)
+        os.makedirs(self._active_runs_dir, exist_ok=True)
+        self._load_active_scan_snapshots()
     
     def create_scan(
         self,
@@ -110,9 +115,80 @@ class ScanManager:
         
         # Create a lock for this scan to ensure thread-safe log updates
         self._scan_locks[scan_id] = threading.Lock()
+        self._persist_active_scan(scan_id)
         
         return scan_id
     
+
+    def _active_scan_path(self, scan_id: str) -> str:
+        return os.path.join(self._active_runs_dir, f"{scan_id}.json")
+
+    def _serialize_scan_info(self, scan_info: Dict[str, Any]) -> Dict[str, Any]:
+        data = dict(scan_info)
+        result = data.get("result")
+        if isinstance(result, ScanResult):
+            data["result"] = asdict(result)
+        findings = data.get("findings")
+        if findings is not None:
+            serialized = []
+            for finding in findings:
+                serialized.append(dict(finding) if isinstance(finding, dict) else finding.__dict__)
+            data["findings"] = serialized
+        return data
+
+    def _persist_active_scan(self, scan_id: str):
+        scan_info = self._active_scans.get(scan_id)
+        if not scan_info:
+            return
+        try:
+            with open(self._active_scan_path(scan_id), 'w') as f:
+                json.dump(self._serialize_scan_info(scan_info), f, indent=2, default=str)
+        except Exception as e:
+            print(f"[ScanManager] Failed to persist active scan {scan_id}: {e}")
+
+    def _remove_active_snapshot(self, scan_id: str):
+        try:
+            path = self._active_scan_path(scan_id)
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception as e:
+            print(f"[ScanManager] Failed to remove active scan snapshot {scan_id}: {e}")
+
+    def _load_active_scan_snapshots(self):
+        if not os.path.exists(self._active_runs_dir):
+            return
+        for fname in os.listdir(self._active_runs_dir):
+            if not fname.endswith('.json'):
+                continue
+            fpath = os.path.join(self._active_runs_dir, fname)
+            try:
+                with open(fpath, 'r') as f:
+                    data = json.load(f)
+                scan_id = data.get('scan_id')
+                if not scan_id:
+                    continue
+                status = data.get('status', 'unknown')
+                if status in {'running', 'checking', 'cloning', 'created', 'ingesting', 'investigating', 'generating_pov', 'validating_pov', 'running_pov'}:
+                    data['status'] = 'interrupted'
+                    logs = data.setdefault('logs', [])
+                    logs.append(f"[{datetime.utcnow().isoformat()}] Backend restart detected while scan was in progress. Scan state restored as interrupted.")
+                self._active_scans[scan_id] = data
+                self._scan_locks[scan_id] = threading.Lock()
+            except Exception as e:
+                print(f"[ScanManager] Failed to load active scan snapshot {fpath}: {e}")
+
+    def update_scan(self, scan_id: str, **updates) -> bool:
+        scan_info = self._active_scans.get(scan_id)
+        if not scan_info:
+            return False
+        lock = self._scan_locks.get(scan_id)
+        if lock:
+            with lock:
+                scan_info.update(updates)
+        else:
+            scan_info.update(updates)
+        self._persist_active_scan(scan_id)
+        return True
 
     async def run_scan_with_findings_async(
         self,
@@ -125,7 +201,7 @@ class ScanManager:
             raise ValueError(f"Scan {scan_id} not found")
 
         scan_info = self._active_scans[scan_id]
-        scan_info["status"] = "running"
+        self.update_scan(scan_id, status="running", progress=5)
 
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
@@ -192,12 +268,20 @@ class ScanManager:
                 start_time=final_state["start_time"],
                 end_time=final_state["end_time"],
                 findings=[dict(f) for f in final_state["findings"]],
+                detected_language=scan_info.get("detected_language"),
+                language_info=scan_info.get("language_info"),
                 logs=scan_info.get("logs", [])
             )
 
             self._save_result(result)
-            scan_info["status"] = "completed"
-            scan_info["result"] = result
+            self.update_scan(
+                scan_id,
+                status="completed",
+                progress=100,
+                result=result,
+                findings=[dict(f) for f in final_state["findings"]]
+            )
+            self._remove_active_snapshot(scan_id)
 
             get_code_ingester().cleanup(scan_id)
 
@@ -209,6 +293,7 @@ class ScanManager:
             scan_info["status"] = "failed"
             scan_info["error"] = error_msg
             scan_info["logs"].append(f"ERROR: {str(e)}")
+            self._persist_active_scan(scan_id)
             print(f"Replay {scan_id} failed: {error_msg}")
 
             result = ScanResult(
@@ -225,10 +310,14 @@ class ScanManager:
                 duration_s=0.0,
                 start_time=scan_info["created_at"],
                 end_time=datetime.utcnow().isoformat(),
-                findings=[]
+                findings=[],
+                detected_language=scan_info.get("detected_language"),
+                language_info=scan_info.get("language_info")
             )
 
             self._save_result(result)
+            self.update_scan(scan_id, status="failed", progress=100, result=result)
+            self._remove_active_snapshot(scan_id)
             return result
 
     async def run_scan_async(
@@ -250,7 +339,7 @@ class ScanManager:
             raise ValueError(f"Scan {scan_id} not found")
         
         scan_info = self._active_scans[scan_id]
-        scan_info["status"] = "running"
+        self.update_scan(scan_id, status="running", progress=10)
         
         # Run scan in thread pool
         loop = asyncio.get_running_loop()
@@ -274,7 +363,7 @@ class ScanManager:
         try:
             scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Starting vulnerability scan...")
             scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Model: {scan_info['model_name']}")
-            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] CWEs to check: {', '.join(scan_info['cwes'])}")
+            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Discovery mode: open-ended vulnerability discovery")
             
             # Get agent graph
             agent = get_agent_graph()
@@ -295,10 +384,12 @@ class ScanManager:
             # Store language info in scan state
             scan_info["detected_language"] = detected_language
             scan_info["language_info"] = lang_info
+            scan_info["progress"] = 20
+            self._persist_active_scan(scan_id)
             
             # Check for cancellation before starting scan
             if scan_info.get("status") == "cancelled":
-                self._log(state, "Scan cancelled before execution")
+                scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Scan cancelled before execution")
                 raise InterruptedError("Scan cancelled by user")
             
             # Run the scan with detected language
@@ -311,6 +402,10 @@ class ScanManager:
             )
             
             # Sync logs from agent graph state to scan_info (in case any were missed)
+            scan_info["status"] = final_state["status"]
+            scan_info["progress"] = 90
+            scan_info["findings"] = [dict(f) for f in final_state.get("findings", [])]
+            self._persist_active_scan(scan_id)
             if final_state.get("logs"):
                 existing_logs = set(scan_info["logs"])
                 for log in final_state["logs"]:
@@ -344,6 +439,8 @@ class ScanManager:
                 start_time=final_state["start_time"],
                 end_time=final_state["end_time"],
                 findings=[dict(f) for f in final_state["findings"]],
+                detected_language=scan_info.get("detected_language"),
+                language_info=scan_info.get("language_info"),
                 logs=scan_info.get("logs", [])
             )
             
@@ -351,8 +448,14 @@ class ScanManager:
             self._save_result(result)
             
             # Update scan info
-            scan_info["status"] = "completed"
-            scan_info["result"] = result
+            self.update_scan(
+                scan_id,
+                status="completed",
+                progress=100,
+                result=result,
+                findings=[dict(f) for f in final_state["findings"]]
+            )
+            self._remove_active_snapshot(scan_id)
             
             # Cleanup vector store
             get_code_ingester().cleanup(scan_id)
@@ -365,6 +468,7 @@ class ScanManager:
             scan_info["status"] = "failed"
             scan_info["error"] = error_msg
             scan_info["logs"].append(f"ERROR: {str(e)}")
+            self._persist_active_scan(scan_id)
             print(f"Scan {scan_id} failed: {error_msg}")
             
             result = ScanResult(
@@ -381,10 +485,14 @@ class ScanManager:
                 duration_s=0.0,
                 start_time=scan_info["created_at"],
                 end_time=datetime.utcnow().isoformat(),
-                findings=[]
+                findings=[],
+                detected_language=scan_info.get("detected_language"),
+                language_info=scan_info.get("language_info")
             )
             
             self._save_result(result)
+            self.update_scan(scan_id, status="failed", progress=100, result=result)
+            self._remove_active_snapshot(scan_id)
             return result
     
     def _save_result(self, result: ScanResult):
@@ -433,7 +541,8 @@ class ScanManager:
                         snapshot_path,
                         ignore=shutil.ignore_patterns(
                             '.git', 'node_modules', 'venv', '.venv', '__pycache__',
-                            '.pytest_cache', 'results', 'data', 'dist', 'build'
+                            '.pytest_cache', 'results', 'data', 'dist', 'build',
+                            '_codeql_detected_source_root'  # Exclude CodeQL symlinks
                         )
                     )
                 except Exception as e:
@@ -441,7 +550,20 @@ class ScanManager:
     
     def get_scan(self, scan_id: str) -> Optional[Dict[str, Any]]:
         """Get scan information"""
-        return self._active_scans.get(scan_id)
+        scan_info = self._active_scans.get(scan_id)
+        if scan_info:
+            return scan_info
+        snapshot_path = self._active_scan_path(scan_id)
+        if os.path.exists(snapshot_path):
+            try:
+                with open(snapshot_path, 'r') as f:
+                    data = json.load(f)
+                self._active_scans[scan_id] = data
+                self._scan_locks.setdefault(scan_id, threading.Lock())
+                return data
+            except Exception as e:
+                print(f"[ScanManager] Failed to load active scan {scan_id}: {e}")
+        return None
     
     def append_log(self, scan_id: str, message: str) -> bool:
         """
@@ -464,6 +586,7 @@ class ScanManager:
                         scan_info["logs"].append(message)
                 else:
                     scan_info["logs"].append(message)
+                self._persist_active_scan(scan_id)
                 return True
         except Exception:
             pass
@@ -519,8 +642,9 @@ class ScanManager:
         """Cancel a running scan"""
         if scan_id in self._active_scans:
             scan_info = self._active_scans[scan_id]
-            if scan_info["status"] == "running":
+            if scan_info["status"] in {"running", "checking", "cloning", "created", "interrupted"}:
                 scan_info["status"] = "cancelled"
+                self._persist_active_scan(scan_id)
                 return True
         return False
     
@@ -528,6 +652,7 @@ class ScanManager:
         """Clean up scan resources"""
         if scan_id in self._active_scans:
             del self._active_scans[scan_id]
+        self._remove_active_snapshot(scan_id)
         
         # Cleanup vector store
         get_code_ingester().cleanup(scan_id)

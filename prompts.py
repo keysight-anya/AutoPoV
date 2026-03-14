@@ -5,26 +5,31 @@ Centralized LLM prompts for vulnerability detection and PoV generation
 
 
 # Investigation Prompt - Used by the investigator agent
-INVESTIGATION_PROMPT = """You are a security expert analyzing code for vulnerabilities.
+INVESTIGATION_PROMPT = """You are a security expert analyzing a candidate vulnerability in code.
 
 CODE CONTEXT:
 {code_context}
 
-CODEQL ALERT:
-- CWE: {cwe_type}
+CANDIDATE SIGNAL:
+- Initial classification: {cwe_type}
 - File: {filepath}
 - Line: {line_number}
-- Message: {alert_message}
+- Detection note: {alert_message}
 
 {joern_context}
 
 TASK:
-Analyze this code and determine if the reported vulnerability is REAL or a FALSE POSITIVE.
+Determine whether this issue is a REAL exploitable vulnerability or a FALSE_POSITIVE.
+If it is real, classify it as precisely as possible:
+- map it to a known CWE if you can
+- include a known CVE only if there is a strong and specific match
+- if it is real but does not cleanly map to a known CWE, return UNCLASSIFIED
 
 Respond in this exact JSON format:
 {{
     "verdict": "REAL" or "FALSE_POSITIVE",
-    "cwe_type": "CWE-XXX",
+    "cwe_type": "CWE-XXX" or "UNCLASSIFIED",
+    "cve_id": "CVE-YYYY-NNNN" or null,
     "confidence": 0.0 to 1.0,
     "explanation": "Detailed explanation of your analysis",
     "vulnerable_code": "The specific vulnerable code snippet",
@@ -33,13 +38,10 @@ Respond in this exact JSON format:
 }}
 
 Guidelines:
-- Be thorough but concise
-- Consider context from surrounding code
-- Look for sanitization, validation, or mitigations
-- CWE-119: Check for buffer size validation
-- CWE-89: Check for SQL parameterization
-- CWE-416: Check for proper memory management
-- CWE-190: Check for integer bounds checking
+- Be evidence-driven
+- Do not invent a CWE or CVE if the mapping is weak
+- A real vulnerability can still be UNCLASSIFIED
+- Prefer exploitability and concrete impact over taxonomy purity
 """
 
 
@@ -47,7 +49,7 @@ Guidelines:
 POV_GENERATION_PROMPT = """You are a security researcher creating a Proof-of-Vulnerability (PoV) script.
 
 VULNERABILITY DETAILS:
-- CWE: {cwe_type}
+- Classification: {cwe_type}
 - File: {filepath}
 - Line: {line_number}
 - Vulnerable Code: {vulnerable_code}
@@ -60,7 +62,7 @@ TARGET CODE:
 ```
 
 TASK:
-Create a {pov_language} script that demonstrates this vulnerability by invoking the vulnerable code directly.
+Create a {pov_language} PoV and an exploit contract that explains how the proof should work.
 The PoV will run in an isolated test harness where the target code has already been loaded and its functions
 are available in globals.
 
@@ -68,25 +70,25 @@ REQUIREMENTS:
 1. Use only {pov_language} standard library (no external packages)
 2. The script must print "VULNERABILITY TRIGGERED" when successful
 3. Include error handling
-4. Add comments explaining each step
-5. Make the PoV as deterministic as possible
-6. Do NOT make network calls and do NOT reference target_url
-7. If you need the vulnerable snippet as text, use the variable `vulnerable_code` (provided by the harness)
-8. Prefer calling the vulnerable function(s) defined in the target code context
+4. Make the PoV as deterministic as possible
+5. Do NOT make network calls and do NOT reference target_url
+6. Prefer calling the vulnerable function(s) defined in the target code context
+7. If the issue is not cleanly mapped to a known CWE, still produce the best exploit strategy you can
 
-For specific CWEs:
-- CWE-79 (XSS): Inject malicious JavaScript payloads
-- CWE-89 (SQL Injection): Craft malicious SQL input
-- CWE-22 (Path Traversal): Use ../ sequences to access files
-- CWE-94 (Code Injection): Inject and execute arbitrary code
-- CWE-78 (Command Injection): Inject shell commands
-- CWE-798 (Hardcoded Credentials): Try default/known credentials
-- CWE-502 (Deserialization): Craft malicious serialized objects
-- CWE-352 (CSRF): Forge cross-site requests
-- CWE-601 (Open Redirect): Manipulate redirect URLs
-- CWE-312 (Cleartext Storage): Check for unencrypted sensitive data
-
-Respond with ONLY the {pov_language} script, no markdown formatting:
+Respond in JSON only with this exact shape:
+{{
+  "pov_script": "full {pov_language} script",
+  "exploit_contract": {{
+    "goal": "one sentence description of what the exploit proves",
+    "target_entrypoint": "function, method, route, or code path to exercise",
+    "preconditions": ["required setup or assumptions"],
+    "inputs": ["important attacker-controlled inputs or payloads"],
+    "trigger_steps": ["ordered exploit steps"],
+    "success_indicators": ["observable outputs or strings that prove success"],
+    "side_effects": ["files, state changes, or other concrete effects expected on success"],
+    "expected_outcome": "what should happen if the vulnerability is real"
+  }}
+}}
 """
 
 
@@ -99,8 +101,10 @@ POV SCRIPT:
 ```
 
 VULNERABILITY CONTEXT:
-- CWE: {cwe_type}
+- Classification: {cwe_type}
 - Target: {filepath}:{line_number}
+- Exploit Goal: {exploit_goal}
+- Success Indicators: {success_indicators}
 
 TASK:
 Validate this PoV script and respond in JSON format:
@@ -108,15 +112,15 @@ Validate this PoV script and respond in JSON format:
     "is_valid": true or false,
     "issues": ["List any issues found"],
     "suggestions": ["Suggestions for improvement"],
-    "will_trigger": "YES", "MAYBE", or "NO" - whether it will likely trigger the vulnerability
+    "will_trigger": "YES", "MAYBE", or "NO"
 }}
 
 Validation Criteria:
 1. Uses only standard library
 2. Contains "VULNERABILITY TRIGGERED" print statement
-3. Logic appears correct for the CWE type
+3. Logic appears aligned with the exploit goal and success indicators
 4. Has proper error handling
-5. Is deterministic (no randomness that could fail)
+5. Is deterministic
 """
 
 
@@ -300,14 +304,18 @@ def format_pov_validation_prompt(
     pov_script: str,
     cwe_type: str,
     filepath: str,
-    line_number: int
+    line_number: int,
+    exploit_contract: dict | None = None
 ) -> str:
     """Format the PoV validation prompt"""
+    exploit_contract = exploit_contract or {}
     return POV_VALIDATION_PROMPT.format(
         pov_script=pov_script,
         cwe_type=cwe_type,
         filepath=filepath,
-        line_number=line_number
+        line_number=line_number,
+        exploit_goal=exploit_contract.get("goal", "Demonstrate the vulnerability with a deterministic exploit"),
+        success_indicators=", ".join(exploit_contract.get("success_indicators", [])) or "VULNERABILITY TRIGGERED"
     )
 
 
@@ -394,18 +402,20 @@ SCOUT_PROMPT = """You are a security scout analyzing multiple files for potentia
 FILES:
 {files}
 
-CWES:
-{cwes}
+FOCUS:
+{cwe_guidance}
 
 TASK:
 Return a JSON object with an array named "findings". Each finding must include:
-- cwe: CWE-XXX
+- cwe: a best-effort CWE-XXX value, or UNCLASSIFIED if no precise mapping fits
+- cve_id: CVE-YYYY-NNNN if there is a strong specific match, otherwise null
 - filepath: path of the file
 - line: line number (best estimate)
 - snippet: short code snippet
 - reason: short reasoning
 - confidence: 0.0 to 1.0
 
+Prioritize real exploit paths, unsafe trust boundaries, auth flaws, injection, memory safety, insecure deserialization, unsafe execution, crypto misuse, privilege issues, and any other security-relevant weakness.
 Respond in JSON only.
 """
 
@@ -427,12 +437,14 @@ def format_scout_prompt(file_snippets, cwes):
 POV_REFINEMENT_PROMPT = """You are fixing a failed Proof-of-Vulnerability (PoV) script.
 
 VULNERABILITY DETAILS:
-- CWE: {cwe_type}
+- Classification: {cwe_type}
 - File: {filepath}
 - Line: {line_number}
 - Vulnerable Code: {vulnerable_code}
 - Explanation: {explanation}
 - Target Language: {target_language}
+- Existing Exploit Goal: {exploit_goal}
+- Existing Success Indicators: {success_indicators}
 
 TARGET CODE:
 ```
@@ -450,27 +462,28 @@ VALIDATION ERRORS:
 ATTEMPT: {attempt_number}
 
 TASK:
-Fix the PoV script to address the validation errors. The script must:
-1. Use only Python standard library (no external packages)
+Fix the PoV script and refresh the exploit contract so the proof is more likely to succeed.
+The script must:
+1. Use only Python standard library
 2. Print "VULNERABILITY TRIGGERED" when successful
 3. Include error handling
-4. Add comments explaining each step
-5. Make the PoV as deterministic as possible
-6. Do NOT make network calls
+4. Be deterministic
+5. Avoid network calls
 
-For specific CWEs:
-- CWE-79 (XSS): Inject malicious JavaScript payloads
-- CWE-89 (SQL Injection): Craft malicious SQL input that bypasses filters
-- CWE-22 (Path Traversal): Use ../ sequences to access files outside intended directory
-- CWE-94 (Code Injection): Inject and execute arbitrary code
-- CWE-78 (Command Injection): Inject shell commands via input
-- CWE-798 (Hardcoded Credentials): Try default/known credentials
-- CWE-502 (Deserialization): Craft malicious serialized objects
-- CWE-352 (CSRF): Forge cross-site requests
-- CWE-601 (Open Redirect): Manipulate redirect URLs
-- CWE-312 (Cleartext Storage): Check for unencrypted sensitive data
-
-Respond with ONLY the corrected Python script, no markdown formatting:
+Respond in JSON only with this exact shape:
+{{
+  "pov_script": "corrected python script",
+  "exploit_contract": {{
+    "goal": "one sentence description of what the exploit proves",
+    "target_entrypoint": "function, method, route, or code path to exercise",
+    "preconditions": ["required setup or assumptions"],
+    "inputs": ["important attacker-controlled inputs or payloads"],
+    "trigger_steps": ["ordered exploit steps"],
+    "success_indicators": ["observable outputs or strings that prove success"],
+    "side_effects": ["files, state changes, or other concrete effects expected on success"],
+    "expected_outcome": "what should happen if the vulnerability is real"
+  }}
+}}
 """
 
 
@@ -484,7 +497,8 @@ def format_pov_refinement_prompt(
     failed_pov: str,
     validation_errors: list,
     attempt_number: int,
-    target_language: str = "python"
+    target_language: str = "python",
+    exploit_contract: dict | None = None
 ) -> str:
     """Format the PoV refinement prompt"""
     return POV_REFINEMENT_PROMPT.format(

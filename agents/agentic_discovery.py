@@ -224,7 +224,7 @@ class AgenticDiscovery:
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=300
+                timeout=settings.CODEQL_TIMEOUT_S
             )
             
             if result.returncode != 0:
@@ -238,9 +238,10 @@ class AgenticDiscovery:
                     metadata={}
                 )
             
-            # Run queries for each CWE
+            # Run queries for each requested CWE, or the broad supported set when discovery is open-ended
             findings = []
-            for cwe in cwes:
+            active_cwes = cwes or settings.INTERNAL_STATIC_RULESET
+            for cwe in active_cwes:
                 query_path = self._get_cwe_query(cwe, codeql_lang)
                 if query_path:
                     cwe_findings = self._run_codeql_query(db_path, query_path, cwe, state)
@@ -294,8 +295,9 @@ class AgenticDiscovery:
         try:
             self._log(state, f"[AgenticDiscovery] Running Semgrep for {lang_profile.primary}...")
             
-            # Map CWEs to Semgrep rules
-            rules = self._map_cwes_to_semgrep_rules(cwes)
+            # Open discovery still needs broad static coverage
+            active_cwes = cwes or settings.SUPPORTED_CWES
+            rules = self._map_cwes_to_semgrep_rules(active_cwes)
             
             if not rules:
                 return DiscoveryResult(
@@ -320,7 +322,7 @@ class AgenticDiscovery:
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=300
+                timeout=settings.SEMGREP_TIMEOUT_S
             )
             
             findings = []
@@ -425,19 +427,18 @@ class AgenticDiscovery:
                         candidates.append(finding)
         
         # Limit to top candidates to control cost
-        max_candidates = 20
+        max_candidates = min(20, settings.SCOUT_MAX_FILES)
         if len(candidates) > max_candidates:
             candidates = candidates[:max_candidates]
         
         if not candidates:
             return None
         
-        self._log(state, f"[AgenticDiscovery] Running LLM scout on {len(candidates)} candidates...")
+        self._log(state, f"[AgenticDiscovery] Running LLM scout on {len(candidates)} candidate signals...")
         
-        # Import here to avoid circular dependency
         from agents.llm_scout import get_llm_scout
         
-        findings = get_llm_scout().analyze_candidates(candidates, cwes)
+        findings = get_llm_scout().scan_directory(codebase_path, cwes)
         
         return DiscoveryResult(
             strategy=DiscoveryStrategy.LLM_SCOUT,
@@ -518,7 +519,7 @@ class AgenticDiscovery:
         ]
         
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=settings.CODEQL_QUERY_TIMEOUT_S)
             
             if result.returncode == 0 and os.path.exists(result_path):
                 with open(result_path) as f:
@@ -570,10 +571,16 @@ class AgenticDiscovery:
         return "CWE-UNKNOWN"
     
     def _log(self, state: Dict[str, Any], message: str):
-        """Log message to scan state"""
+        """Log message to scan state and active scan stream."""
         if "logs" in state:
             from datetime import datetime
-            state["logs"].append(f"[{datetime.utcnow().isoformat()}] {message}")
+            entry = f"[{datetime.utcnow().isoformat()}] {message}"
+            state["logs"].append(entry)
+            try:
+                from app.scan_manager import get_scan_manager
+                get_scan_manager().append_log(state.get("scan_id"), entry)
+            except Exception:
+                pass
 
 
 # Global instance

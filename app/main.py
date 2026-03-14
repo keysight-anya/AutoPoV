@@ -6,8 +6,10 @@ Main entry point for the REST API
 import os
 import json
 import asyncio
+import secrets
 from typing import Optional, List
 from datetime import datetime
+from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, UploadFile, File, Form, Header, Request
@@ -17,7 +19,11 @@ from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from app.config import settings
-from app.auth import verify_api_key, verify_api_key_with_rate_limit, verify_admin_key, get_api_key_manager
+from app.auth import (
+    verify_api_key, verify_api_key_with_rate_limit, verify_api_key_optional,
+    verify_api_key_or_system, verify_api_key_or_system_with_rate_limit,
+    get_api_key_manager
+)
 from app.git_handler import get_git_handler
 from app.source_handler import get_source_handler
 from app.webhook_handler import get_webhook_handler
@@ -32,16 +38,14 @@ class ScanGitRequest(BaseModel):
     url: str
     token: Optional[str] = None
     branch: Optional[str] = None
-    model: str = Field(default="openai/gpt-4o")
-    cwes: List[str] = Field(default=["CWE-89", "CWE-119", "CWE-190", "CWE-416"])
+    model: Optional[str] = Field(default=None)
 
 
 class ScanPasteRequest(BaseModel):
     code: str
     language: Optional[str] = None
     filename: Optional[str] = None
-    model: str = Field(default="openai/gpt-4o")
-    cwes: List[str] = Field(default=["CWE-89", "CWE-119", "CWE-190", "CWE-416"])
+    model: Optional[str] = Field(default=None)
 
 
 
@@ -90,6 +94,22 @@ class WebhookResponse(BaseModel):
     scan_id: Optional[str] = None
 
 
+# Helper function to get the configured model
+def get_configured_model() -> str:
+    """Get the configured model name, raising error if not set"""
+    auto_model = settings.AUTO_ROUTER_MODEL or "openrouter/auto"
+    if settings.ROUTING_MODE == "fixed":
+        if settings.MODEL_NAME:
+            return settings.MODEL_NAME
+        if settings.MODEL_MODE == "online":
+            return auto_model
+        raise HTTPException(
+            status_code=400,
+            detail="No model configured. Please go to Settings > Model Config and select a model before running scans."
+        )
+    return auto_model if settings.ROUTING_MODE == "auto" else (settings.AUTO_ROUTER_MODEL or auto_model)
+
+
 # Lifespan context manager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -124,11 +144,41 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.FRONTEND_URL, "http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:5174", "http://localhost:5175"],
+    allow_origins=[settings.FRONTEND_URL.rstrip("/")],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"]
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-CSRF-Token"]
 )
+
+
+# CSRF cookie helper for web UI
+def _origin_matches_frontend(request: Request) -> bool:
+    origin = request.headers.get("origin") or request.headers.get("referer")
+    if not origin:
+        return False
+    parsed = urlparse(origin)
+    origin_base = f"{parsed.scheme}://{parsed.netloc}"
+    front = urlparse(settings.FRONTEND_URL.rstrip("/"))
+    front_base = f"{front.scheme}://{front.netloc}"
+    return origin_base == front_base
+
+
+@app.middleware("http")
+async def csrf_cookie_middleware(request: Request, call_next):
+    response = await call_next(request)
+    if _origin_matches_frontend(request):
+        if "autopov_csrf" not in request.cookies:
+            token = secrets.token_urlsafe(32)
+            secure = urlparse(settings.FRONTEND_URL).scheme == "https"
+            response.set_cookie(
+                "autopov_csrf",
+                token,
+                httponly=False,
+                samesite="Strict",
+                secure=secure,
+                path="/"
+            )
+    return response
 
 
 async def trigger_scan_from_webhook(
@@ -139,10 +189,11 @@ async def trigger_scan_from_webhook(
     triggered_by: str = "webhook"
 ) -> str:
     """Trigger scan from webhook callback"""
+    model = get_configured_model()
     scan_id = get_scan_manager().create_scan(
         codebase_path="",  # Will be set after clone
-        model_name=settings.MODEL_NAME if settings.ROUTING_MODE == "fixed" else settings.AUTO_ROUTER_MODEL,
-        cwes=settings.SUPPORTED_CWES,
+        model_name=model,
+        cwes=[],
         triggered_by=triggered_by
     )
     
@@ -159,7 +210,8 @@ async def trigger_scan_from_webhook(
             
             # Update scan with path
             scan_info = get_scan_manager().get_scan(scan_id)
-            scan_info["codebase_path"] = path
+            if scan_info:
+                get_scan_manager().update_scan(scan_id, codebase_path=path, progress=12)
             
             # Run scan
             await get_scan_manager().run_scan_async(scan_id)
@@ -186,25 +238,26 @@ async def health_check():
 
 
 @app.get("/api/config")
-async def get_config(auth: tuple = Depends(verify_api_key)):
-    """Get system configuration including supported CWEs"""
+async def get_config(auth: Optional[tuple] = Depends(verify_api_key_optional)):
+    """Get system configuration for discovery-first scans"""
     config = {
-        "supported_cwes": settings.SUPPORTED_CWES,
         "app_version": settings.APP_VERSION,
         "codeql_available": settings.is_codeql_available(),
         "docker_available": settings.is_docker_available(),
         "routing_mode": settings.ROUTING_MODE,
-        "auto_router_model": settings.AUTO_ROUTER_MODEL,
+        "auto_router_model": settings.AUTO_ROUTER_MODEL or "openrouter/auto",
         "model_mode": settings.MODEL_MODE,
         "model_name": settings.MODEL_NAME,
-        "token_tracking_enabled": settings.TOKEN_TRACKING_ENABLED
+        "token_tracking_enabled": settings.TOKEN_TRACKING_ENABLED,
+        "discovery_mode": "open-ended",
+        "internal_static_ruleset_size": len(settings.INTERNAL_STATIC_RULESET)
     }
     
     # Add hierarchical config if applicable
     if settings.ROUTING_MODE == "hierarchical":
         config["hierarchical"] = {
-            "sifter_model": settings.HIERARCHICAL_SIFTER_MODEL,
-            "architect_model": settings.HIERARCHICAL_ARCHITECT_MODEL,
+            "sifter_model": settings.HIERARCHICAL_SIFTER_MODEL or (settings.AUTO_ROUTER_MODEL or "openrouter/auto"),
+            "architect_model": settings.HIERARCHICAL_ARCHITECT_MODEL or (settings.AUTO_ROUTER_MODEL or "openrouter/auto"),
             "confidence_threshold": settings.HIERARCHICAL_SIFTER_CONFIDENCE_THRESHOLD
         }
     
@@ -216,13 +269,14 @@ async def get_config(auth: tuple = Depends(verify_api_key)):
 async def scan_git(
     request: ScanGitRequest,
     background_tasks: BackgroundTasks,
-    auth: tuple = Depends(verify_api_key_with_rate_limit)
+    auth: tuple = Depends(verify_api_key_or_system_with_rate_limit)
 ):
     """Scan a Git repository"""
+    model = request.model or get_configured_model()
     scan_id = get_scan_manager().create_scan(
         codebase_path="",  # Will be set after clone
-        model_name=settings.MODEL_NAME if settings.ROUTING_MODE == "fixed" else settings.AUTO_ROUTER_MODEL,
-        cwes=request.cwes
+        model_name=model,
+        cwes=[]
     )
     
     def run_scan():
@@ -233,7 +287,7 @@ async def scan_git(
         try:
             # Step 1: Check repository accessibility
             if scan_info:
-                scan_info["status"] = "checking"
+                scan_manager.update_scan(scan_id, status="checking", progress=2)
                 scan_manager.append_log(scan_id, f"Checking repository: {request.url}")
             
             is_accessible, message, repo_info = get_git_handler().check_repo_accessibility(request.url, request.branch)
@@ -243,14 +297,13 @@ async def scan_git(
             
             if not is_accessible:
                 if scan_info:
-                    scan_info["status"] = "failed"
-                    scan_info["error"] = message
+                    scan_manager.update_scan(scan_id, status="failed", progress=100, error=message)
                 print(f"Scan {scan_id} failed: {message}")
                 return
             
             # Step 2: Clone repository
             if scan_info:
-                scan_info["status"] = "cloning"
+                scan_manager.update_scan(scan_id, status="cloning", progress=8)
                 scan_manager.append_log(scan_id, f"Cloning repository: {request.url}")
                 if repo_info.get("size_mb"):
                     scan_manager.append_log(scan_id, f"Repository size: {repo_info['size_mb']:.1f} MB")
@@ -263,7 +316,7 @@ async def scan_git(
             
             # Update scan with path
             if scan_info:
-                scan_info["codebase_path"] = path
+                scan_manager.update_scan(scan_id, codebase_path=path, progress=12)
                 scan_manager.append_log(scan_id, f"Repository cloned to: {path}")
                 scan_manager.append_log(scan_id, "Starting vulnerability scan...")
             
@@ -282,8 +335,7 @@ async def scan_git(
         except Exception as e:
             error_msg = f"{str(e)}\n{traceback.format_exc()}"
             if scan_info:
-                scan_info["status"] = "failed"
-                scan_info["error"] = str(e)
+                scan_manager.update_scan(scan_id, status="failed", progress=100, error=str(e))
                 scan_manager.append_log(scan_id, f"ERROR: {str(e)}")
             print(f"Scan {scan_id} failed: {error_msg}")
     
@@ -300,17 +352,15 @@ async def scan_git(
 async def scan_zip(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    model: str = Form("openai/gpt-4o"),
-    cwes: str = Form("CWE-89,CWE-119,CWE-190,CWE-416"),
-    auth: tuple = Depends(verify_api_key_with_rate_limit)
+    model: Optional[str] = Form(None),
+    auth: tuple = Depends(verify_api_key_or_system_with_rate_limit)
 ):
     """Scan a ZIP file upload"""
-    cwe_list = cwes.split(",")
-    
+    model = model or get_configured_model()
     scan_id = get_scan_manager().create_scan(
         codebase_path="",
-        model_name=settings.MODEL_NAME if settings.ROUTING_MODE == "fixed" else settings.AUTO_ROUTER_MODEL,
-        cwes=cwe_list
+        model_name=model,
+        cwes=[]
     )
     
     # Read file content before passing to background task (UploadFile is not thread-safe)
@@ -330,7 +380,8 @@ async def scan_zip(
             
             # Update scan
             scan_info = get_scan_manager().get_scan(scan_id)
-            scan_info["codebase_path"] = path
+            if scan_info:
+                get_scan_manager().update_scan(scan_id, codebase_path=path, progress=12)
             
             # Run scan using a new event loop (same pattern as scan_git)
             loop = asyncio.new_event_loop()
@@ -346,8 +397,7 @@ async def scan_zip(
         except Exception as e:
             scan_info = get_scan_manager().get_scan(scan_id)
             if scan_info:
-                scan_info["status"] = "failed"
-                scan_info["error"] = str(e)
+                get_scan_manager().update_scan(scan_id, status="failed", progress=100, error=str(e))
     
     background_tasks.add_task(run_scan)
     
@@ -362,13 +412,14 @@ async def scan_zip(
 async def scan_paste(
     request: ScanPasteRequest,
     background_tasks: BackgroundTasks,
-    auth: tuple = Depends(verify_api_key_with_rate_limit)
+    auth: tuple = Depends(verify_api_key_or_system_with_rate_limit)
 ):
     """Scan pasted code"""
+    model = request.model or get_configured_model()
     scan_id = get_scan_manager().create_scan(
         codebase_path="",
-        model_name=settings.MODEL_NAME if settings.ROUTING_MODE == "fixed" else settings.AUTO_ROUTER_MODEL,
-        cwes=request.cwes
+        model_name=model,
+        cwes=[]
     )
     
     def run_scan():
@@ -399,8 +450,7 @@ async def scan_paste(
         except Exception as e:
             scan_info = get_scan_manager().get_scan(scan_id)
             if scan_info:
-                scan_info["status"] = "failed"
-                scan_info["error"] = str(e)
+                get_scan_manager().update_scan(scan_id, status="failed", progress=100, error=str(e))
     
     background_tasks.add_task(run_scan)
     
@@ -417,7 +467,7 @@ async def replay_scan(
     scan_id: str,
     request: ReplayRequest,
     background_tasks: BackgroundTasks,
-    auth: tuple = Depends(verify_api_key_with_rate_limit)
+    auth: tuple = Depends(verify_api_key_or_system_with_rate_limit)
 ):
     result = get_scan_manager().get_scan_result(scan_id)
     if not result:
@@ -466,17 +516,20 @@ async def replay_scan(
 
     detected_language = get_agent_graph()._detect_language(codebase_path)
 
+    # Use the currently configured model for replay
+    configured_model = get_configured_model()
+    
     replay_ids = []
-    for model in request.models:
-        replay_id = get_scan_manager().create_scan(
-            codebase_path=codebase_path,
-            model_name=settings.MODEL_NAME if settings.ROUTING_MODE == "fixed" else settings.AUTO_ROUTER_MODEL,
-            cwes=result.cwes
-        )
-        scan_info = get_scan_manager().get_scan(replay_id)
-        if scan_info:
-            scan_info["triggered_by"] = "replay"
-            scan_info["replay_of"] = scan_id
+    # Create one replay scan with the configured model
+    replay_id = get_scan_manager().create_scan(
+        codebase_path=codebase_path,
+        model_name=configured_model,
+        cwes=result.cwes
+    )
+    scan_info = get_scan_manager().get_scan(replay_id)
+    if scan_info:
+        scan_info["triggered_by"] = "replay"
+        scan_info["replay_of"] = scan_id
 
         def run_replay(replay_id=replay_id):
             loop = asyncio.new_event_loop()
@@ -503,7 +556,7 @@ async def replay_scan(
 @app.post("/api/scan/{scan_id}/cancel")
 async def cancel_scan(
     scan_id: str,
-    auth: tuple = Depends(verify_api_key)
+    auth: tuple = Depends(verify_api_key_or_system)
 ):
     """Cancel a running scan"""
     success = get_scan_manager().cancel_scan(scan_id)
@@ -522,7 +575,7 @@ async def cancel_scan(
 @app.get("/api/scan/{scan_id}", response_model=ScanStatusResponse)
 async def get_scan_status(
     scan_id: str,
-    auth: tuple = Depends(verify_api_key)
+    auth: tuple = Depends(verify_api_key_or_system)
 ):
     """Get scan status and results"""
     scan_info = get_scan_manager().get_scan(scan_id)
@@ -559,7 +612,7 @@ async def get_scan_status(
 @app.get("/api/scan/{scan_id}/stream")
 async def stream_scan_logs(
     scan_id: str,
-    auth: tuple = Depends(verify_api_key)
+    auth: tuple = Depends(verify_api_key_or_system)
 ):
     """Stream scan logs via SSE"""
     async def event_generator():
@@ -599,7 +652,7 @@ async def stream_scan_logs(
 async def get_history(
     limit: int = 100,
     offset: int = 0,
-    auth: tuple = Depends(verify_api_key)
+    auth: tuple = Depends(verify_api_key_or_system)
 ):
     """Get scan history"""
     history = get_scan_manager().get_scan_history(limit=limit, offset=offset)
@@ -611,7 +664,7 @@ async def get_history(
 async def get_report(
     scan_id: str,
     format: str = "json",
-    auth: tuple = Depends(verify_api_key)
+    auth: tuple = Depends(verify_api_key_or_system)
 ):
     """Get scan report"""
     result = get_scan_manager().get_scan_result(scan_id)
@@ -699,13 +752,10 @@ async def gitlab_webhook(
     )
 
 
-# API Key management (admin only)
+# API Key management
 @app.post("/api/keys/generate", response_model=APIKeyResponse)
-async def generate_api_key(
-    name: str = "default",
-    admin_key: str = Depends(verify_admin_key)
-):
-    """Generate new API key (admin only)"""
+async def generate_api_key(name: str = "default", auth: tuple = Depends(verify_api_key_or_system)):
+    """Generate new API key (public endpoint)"""
     key = get_api_key_manager().generate_key(name)
     return APIKeyResponse(
         key=key,
@@ -714,20 +764,15 @@ async def generate_api_key(
 
 
 @app.get("/api/keys", response_model=APIKeyListResponse)
-async def list_api_keys(
-    admin_key: str = Depends(verify_admin_key)
-):
-    """List API keys (admin only)"""
+async def list_api_keys(auth: tuple = Depends(verify_api_key_or_system)):
+    """List API keys (public endpoint - returns key names only, not full keys)"""
     keys = get_api_key_manager().list_keys()
     return APIKeyListResponse(keys=keys)
 
 
 @app.delete("/api/keys/{key_id}")
-async def revoke_api_key(
-    key_id: str,
-    admin_key: str = Depends(verify_admin_key)
-):
-    """Revoke an API key (admin only)"""
+async def revoke_api_key(key_id: str, auth: tuple = Depends(verify_api_key_or_system)):
+    """Revoke an API key (public endpoint)"""
     success = get_api_key_manager().revoke_key(key_id)
     if not success:
         raise HTTPException(status_code=404, detail="Key not found")
@@ -738,9 +783,9 @@ async def revoke_api_key(
 async def cleanup_results(
     max_age_days: int = 30,
     max_results: int = 500,
-    admin_key: str = Depends(verify_admin_key)
+    auth: tuple = Depends(verify_api_key_or_system)
 ):
-    """Clean up old scan result files (admin only)"""
+    """Clean up old scan result files (public endpoint)"""
     files_removed, bytes_freed = get_scan_manager().cleanup_old_results(
         max_age_days=max_age_days,
         max_results=max_results
@@ -754,7 +799,7 @@ async def cleanup_results(
 
 
 @app.get("/api/learning/summary")
-async def learning_summary(auth: tuple = Depends(verify_api_key)):
+async def learning_summary(auth: Optional[tuple] = Depends(verify_api_key_optional)):
     store = get_learning_store()
     return {
         "summary": store.get_summary(),
@@ -763,9 +808,85 @@ async def learning_summary(auth: tuple = Depends(verify_api_key)):
 
 # Metrics endpoint
 @app.get("/api/metrics")
-async def get_metrics(auth: tuple = Depends(verify_api_key)):
+async def get_metrics(auth: tuple = Depends(verify_api_key_or_system)):
     """Get system metrics"""
     return get_scan_manager().get_metrics()
+
+
+# Settings endpoints
+@app.get("/api/settings")
+async def get_settings(auth: tuple = Depends(verify_api_key_or_system)):
+    """Get current system settings (excluding sensitive values)"""
+    # Determine current model mode and selected model
+    model_mode = settings.MODEL_MODE
+    selected_model = settings.MODEL_NAME
+    effective_model = selected_model or ((settings.AUTO_ROUTER_MODEL or "openrouter/auto") if model_mode == "online" else "")
+    
+    return {
+        # OpenRouter configuration
+        "openrouter_key_from_env": settings.is_openrouter_key_from_env(),
+        "openrouter_key_configured": bool(settings.get_openrouter_api_key()),
+        
+        # Simplified model selection
+        "model_mode": model_mode,
+        "selected_model": selected_model,
+        
+        # Legacy fields for backward compatibility
+        "agent_models": {
+            "investigator": effective_model,
+            "pov_generator": effective_model,
+            "verifier": effective_model,
+            "refiner": effective_model,
+            "llm_scout": effective_model,
+        },
+        
+        "hierarchical_models": {
+            "sifter": effective_model,
+            "architect": effective_model,
+        },
+        
+        "routing_mode": settings.ROUTING_MODE,
+        "auto_router_model": settings.AUTO_ROUTER_MODEL or "openrouter/auto",
+        "available_online_models": settings.ONLINE_MODELS,
+        "available_offline_models": settings.OFFLINE_MODELS,
+    }
+
+
+@app.post("/api/settings")
+async def update_settings(
+    request: dict,
+    auth: tuple = Depends(verify_api_key_or_system)
+):
+    """Update system settings"""
+    # Update OpenRouter API key (UI-configured only if env var not set)
+    if "openrouter_api_key" in request and not settings.is_openrouter_key_from_env():
+        settings.OPENROUTER_API_KEY_UI = request["openrouter_api_key"]
+    
+    # Update simplified model selection
+    if "model_mode" in request:
+        settings.MODEL_MODE = request["model_mode"]
+    
+    auto_model = settings.AUTO_ROUTER_MODEL or "openrouter/auto"
+
+    if "selected_model" in request:
+        selected = (request["selected_model"] or "").strip()
+        effective_model = selected or (auto_model if settings.MODEL_MODE == "online" else "")
+
+        settings.MODEL_NAME = selected
+        settings.AGENT_INVESTIGATOR_MODEL = effective_model
+        settings.AGENT_POV_GENERATOR_MODEL = effective_model
+        settings.AGENT_VERIFIER_MODEL = effective_model
+        settings.AGENT_REFINER_MODEL = effective_model
+        settings.AGENT_LLM_SCOUT_MODEL = effective_model
+        settings.HIERARCHICAL_SIFTER_MODEL = effective_model
+        settings.HIERARCHICAL_ARCHITECT_MODEL = effective_model
+
+        if settings.MODEL_MODE == "online" and not selected:
+            settings.ROUTING_MODE = "auto"
+        else:
+            settings.ROUTING_MODE = "fixed"
+    
+    return {"status": "updated"}
 
 
 if __name__ == "__main__":
