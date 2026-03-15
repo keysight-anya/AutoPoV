@@ -24,3 +24,16 @@ results/
 data/chroma/
 data/api_keys.json
 data/*.db
+# AutoPoV Temporary Data
+data/chroma/
+results/runs/
+results/snapshots/
+results/povs/
+*.db
+*.sqlite3
+
+# Docker & Environment
+.env
+__pycache__/
+*.py[cod]
+.DS_Store
