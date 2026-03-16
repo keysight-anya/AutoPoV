@@ -1,0 +1,1005 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AutoPoV — Refined Direction</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg:        #141e28;
+  --surface:   #1d3040;
+  --surface2:  #233d4d;
+  --border:    rgba(255,255,255,0.07);
+  --border2:   rgba(255,255,255,0.13);
+  --text:      #f0f0f0;
+  --text2:     #8aaabb;
+  --text3:     #4a6a7a;
+  --accent:    #fe7f2d;
+  --accent-dim:rgba(254,127,45,0.10);
+  --accent-glow:rgba(254,127,45,0.04);
+  --sidebar-w: 52px;
+  --topbar-h:  48px;
+  --statusbar-h: 30px;
+}
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Rajdhani', system-ui, sans-serif;
+  font-size: 15px;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── TOPBAR ──────────────────────────────────────── */
+.topbar {
+  height: var(--topbar-h);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+.topbar-logo {
+  width: var(--sidebar-w);
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-right: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.topbar-wordmark {
+  padding: 0 20px;
+  font-family: 'Rajdhani', sans-serif;
+  font-weight: 700;
+  font-size: 16px;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--text);
+  border-right: 1px solid var(--border);
+  height: 100%;
+  display: flex;
+  align-items: center;
+}
+.topbar-wordmark span { color: var(--accent); }
+.topbar-spacer { flex: 1; }
+.topbar-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--text3);
+  letter-spacing: .06em;
+  padding: 0 18px;
+  border-left: 1px solid var(--border);
+  height: 100%;
+}
+.live-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent);
+  animation: dot-pulse 2s ease-in-out infinite;
+}
+.topbar-api {
+  display: flex; align-items: center;
+  padding: 0 16px;
+  border-left: 1px solid var(--border);
+  height: 100%;
+}
+.api-pill {
+  background: var(--surface2);
+  border: 1px solid var(--border2);
+  padding: 4px 10px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--text3);
+  letter-spacing: .04em;
+  cursor: default;
+  transition: color .15s, border-color .15s;
+}
+/* Copy button next to API pill */
+.copy-btn {
+  background: none; border: none; color: var(--text3);
+  cursor: pointer; padding: 6px 8px; margin-left: 2px;
+  display: flex; align-items: center;
+  transition: color .15s; position: relative;
+}
+.copy-btn:hover { color: var(--accent); }
+.copy-btn::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  right: 0; top: calc(100% + 6px);
+  background: var(--surface2); border: 1px solid var(--border2);
+  padding: 5px 10px; white-space: nowrap;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px; letter-spacing: .08em; color: var(--text2);
+  opacity: 0; pointer-events: none; transition: opacity .15s; z-index: 200;
+}
+.copy-btn:hover::after { opacity: 1; }
+
+/* ── LAYOUT ──────────────────────────────────────── */
+.layout { display: flex; flex: 1; overflow: hidden; }
+
+/* ── SIDEBAR ─────────────────────────────────────── */
+.sidebar {
+  width: var(--sidebar-w);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 10px 0;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.nav-item {
+  width: 100%; height: 40px;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; position: relative;
+  color: var(--text3); transition: color .15s;
+}
+.nav-item:hover { color: var(--text2); }
+.nav-item.active { color: var(--accent); }
+.nav-item.active::before {
+  content: '';
+  position: absolute; left: 0; top: 8px; bottom: 8px;
+  width: 2px; background: var(--accent);
+}
+/* Tooltip via data-tooltip attribute */
+.nav-item::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  left: calc(100% + 12px);
+  top: 50%; transform: translateY(-50%);
+  background: var(--surface2);
+  border: 1px solid var(--border2);
+  padding: 5px 10px;
+  white-space: nowrap;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  letter-spacing: .1em;
+  color: var(--text2);
+  text-transform: uppercase;
+  opacity: 0; pointer-events: none;
+  transition: opacity .15s;
+  z-index: 100;
+}
+.nav-item:hover::after { opacity: 1; }
+.nav-sep { width: 20px; height: 1px; background: var(--border); margin: 4px 0; }
+.sidebar-bottom { margin-top: auto; }
+
+/* ── MAIN ────────────────────────────────────────── */
+.main {
+  flex: 1; overflow-y: auto;
+  display: flex; flex-direction: column;
+  position: relative;
+  scrollbar-width: none; /* Firefox */
+}
+.main::-webkit-scrollbar { display: none; } /* Chrome/Safari */
+
+/* ── IDLE BACKGROUND ─────────────────────────────── */
+.idle-bg {
+  position: absolute; inset: 0;
+  pointer-events: none; overflow: hidden;
+}
+.grid-lines {
+  position: absolute; inset: -40px; /* oversized so translate doesn't show edge */
+  background-image:
+    linear-gradient(rgba(255,255,255,0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.05) 1px, transparent 1px);
+  background-size: 44px 44px;
+  opacity: .7;
+  mask-image: radial-gradient(ellipse 65% 55% at 50% 50%, black 5%, transparent 85%);
+  will-change: transform;
+}
+/* Rings: centered via margin so transform is free for JS */
+.ring {
+  position: absolute;
+  top: 50%; left: 50%;
+  margin-top: -180px; margin-left: -180px;
+  width: 360px; height: 360px;
+  border-radius: 50%;
+  border: 1px solid rgba(254,127,45,0.18);
+  opacity: .35;
+  will-change: transform;
+}
+.ring:nth-child(3) { width: 220px; height: 220px; margin-top: -110px; margin-left: -110px; border-color: rgba(254,127,45,0.25); opacity: .45; }
+.ring:nth-child(4) { width: 500px; height: 500px; margin-top: -250px; margin-left: -250px; border-color: rgba(254,127,45,0.10); opacity: .25; }
+/* Corner brackets — fixed to viewport so they don't scroll */
+.corner {
+  position: fixed; width: 14px; height: 14px;
+  will-change: transform; pointer-events: none; z-index: 50;
+}
+.corner.tl {
+  top: calc(var(--topbar-h) + 18px);
+  left: calc(var(--sidebar-w) + 18px);
+  border-top: 1.5px solid var(--accent); border-left: 1.5px solid var(--accent); opacity: .6;
+}
+.corner.tr {
+  top: calc(var(--topbar-h) + 18px); right: 18px;
+  border-top: 1.5px solid var(--accent); border-right: 1.5px solid var(--accent); opacity: .6;
+}
+.corner.bl {
+  bottom: calc(var(--statusbar-h) + 8px);
+  left: calc(var(--sidebar-w) + 18px);
+  border-bottom: 1.5px solid var(--accent); border-left: 1.5px solid var(--accent); opacity: .6;
+}
+.corner.br {
+  bottom: calc(var(--statusbar-h) + 8px); right: 18px;
+  border-bottom: 1.5px solid var(--accent); border-right: 1.5px solid var(--accent); opacity: .6;
+}
+
+/* ── SCAN CONTENT ────────────────────────────────── */
+.scan-wrapper {
+  position: relative; z-index: 1;
+  flex: 1;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  padding: 32px 40px 20px;
+}
+.page-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px; letter-spacing: .14em;
+  text-transform: uppercase; color: var(--text3);
+  display: flex; align-items: center; gap: 6px;
+  margin-bottom: 24px;
+}
+.page-label-bracket { color: var(--accent); opacity: .55; }
+.scan-eyebrow {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px; letter-spacing: .2em;
+  text-transform: uppercase; color: var(--accent);
+  margin-bottom: 14px;
+  display: flex; align-items: center; gap: 10px;
+}
+.scan-eyebrow::before, .scan-eyebrow::after {
+  content: ''; display: block; width: 20px; height: 1px;
+  background: var(--accent); opacity: .5;
+}
+.scan-title {
+  font-family: 'Rajdhani', sans-serif;
+  font-size: 28px; font-weight: 300;
+  color: var(--text); margin-bottom: 6px; text-align: center;
+  letter-spacing: .02em;
+}
+.scan-title strong { font-weight: 700; }
+.scan-sub {
+  font-size: 13px; color: var(--text3);
+  margin-bottom: 32px; text-align: center;
+  font-family: 'JetBrains Mono', monospace;
+  letter-spacing: .03em;
+}
+.scan-form { width: 100%; max-width: 580px; }
+
+/* Input type tabs — glassmorphism */
+.input-tabs {
+  display: flex;
+  gap: 3px;
+  margin-bottom: 20px;
+  border-bottom: 1px solid var(--border2);
+}
+.input-tab {
+  position: relative;
+  padding: 10px 20px 12px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
+  color: var(--text3); cursor: pointer;
+  background: rgba(255,255,255,0.02);
+  border: 1px solid rgba(255,255,255,0.06); border-bottom: none;
+  margin-bottom: -1px;
+  backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+  transition: color .15s, background .15s, border-color .15s;
+  overflow: hidden;
+}
+/* Top-edge inner highlight (glass sheen) */
+.input-tab::before {
+  content: '';
+  position: absolute; top: 0; left: 0; right: 0; height: 1px;
+  background: linear-gradient(90deg, transparent 10%, rgba(255,255,255,0.12) 50%, transparent 90%);
+  pointer-events: none;
+}
+.input-tab:hover {
+  color: var(--text2);
+  background: rgba(255,255,255,0.05);
+  border-color: rgba(255,255,255,0.12);
+}
+/* Active tab: pumpkin-tinted glass, accent border, opens into content */
+.input-tab.active {
+  color: var(--accent);
+  background: rgba(254,127,45,0.06);
+  border-color: rgba(254,127,45,0.28);
+  border-bottom: 1px solid var(--bg); /* punches through the divider */
+}
+.input-tab.active::before {
+  background: linear-gradient(90deg, transparent 10%, rgba(254,127,45,0.45) 50%, transparent 90%);
+}
+/* Accent glow bleed at bottom edge of active tab */
+.input-tab.active::after {
+  content: '';
+  position: absolute; bottom: 0; left: 10%; right: 10%; height: 1px;
+  background: var(--accent); opacity: .3;
+  pointer-events: none;
+}
+
+/* Tab panels */
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+
+/* URL field */
+.field-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px; letter-spacing: .12em;
+  text-transform: uppercase; color: var(--text3);
+  margin-bottom: 8px;
+}
+.field-group {
+  display: flex; border: 1px solid var(--border2);
+  background: var(--surface); transition: border-color .15s;
+  margin-bottom: 0;
+}
+.field-group:focus-within { border-color: var(--accent); }
+.field-prefix {
+  padding: 0 14px; border-right: 1px solid var(--border2);
+  display: flex; align-items: center;
+  color: var(--text3); font-family: 'JetBrains Mono', monospace; font-size: 12px;
+  transition: color .15s, border-color .15s;
+}
+.field-group:focus-within .field-prefix { color: var(--accent); border-right-color: var(--accent); }
+input[type="url"], input[type="text"], textarea {
+  flex: 1; background: none; border: none; outline: none;
+  color: var(--text); font-family: 'JetBrains Mono', monospace;
+  font-size: 12px; padding: 14px 14px;
+  letter-spacing: .03em;
+}
+input::placeholder, textarea::placeholder { color: var(--text3); }
+
+/* Drop zone */
+.drop-zone {
+  border: 1px dashed var(--border2);
+  padding: 36px 20px; text-align: center;
+  cursor: pointer; transition: border-color .15s, background .15s;
+}
+.drop-zone:hover { border-color: var(--accent); background: var(--accent-glow); }
+.drop-zone-icon { font-size: 24px; margin-bottom: 10px; opacity: .4; }
+.drop-zone-text {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px; color: var(--text3); letter-spacing: .06em;
+}
+.drop-zone-text strong { color: var(--accent); font-weight: 500; }
+
+/* Paste textarea */
+.paste-area {
+  width: 100%; min-height: 120px; resize: vertical;
+  background: var(--surface); border: 1px solid var(--border2);
+  color: var(--text); font-family: 'JetBrains Mono', monospace;
+  font-size: 12px; padding: 14px; outline: none; letter-spacing: .02em;
+  transition: border-color .15s;
+}
+.paste-area:focus { border-color: var(--accent); }
+
+/* ── OPTIONS ROW (paste-mode language selector) ─── */
+.options-row {
+  display: grid; grid-template-columns: 1fr 1fr;
+  gap: 12px; margin: 16px 0;
+}
+.select-field { display: flex; flex-direction: column; gap: 8px; }
+select {
+  background: var(--surface); border: 1px solid var(--border2);
+  color: var(--text2); font-family: 'JetBrains Mono', monospace;
+  font-size: 11px; letter-spacing: .04em;
+  padding: 11px 12px; outline: none; cursor: pointer;
+  appearance: none; -webkit-appearance: none;
+  transition: border-color .15s;
+}
+select:focus { border-color: var(--accent); }
+
+/* ── TABS ROW (tabs + depth toggle at right) ─────── */
+.tabs-row {
+  display: flex; align-items: flex-end;
+  justify-content: space-between;
+  margin-bottom: 20px;
+}
+/* Depth mode toggle — single rectangle at right of tab row */
+.depth-mode-btn {
+  padding: 10px 16px 12px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px; letter-spacing: .14em; text-transform: uppercase;
+  background: rgba(255,255,255,0.02);
+  border: 1px solid rgba(255,255,255,0.06); border-bottom: none;
+  color: var(--text3); cursor: pointer;
+  margin-bottom: -1px; /* align to bottom divider */
+  transition: color .2s, background .2s, border-color .2s;
+  position: relative;
+}
+.depth-mode-btn::before {
+  content: '';
+  position: absolute; top: 0; left: 0; right: 0; height: 1px;
+  background: linear-gradient(90deg, transparent 15%, rgba(255,255,255,0.1) 50%, transparent 85%);
+}
+.depth-mode-btn:hover { color: var(--text2); border-color: rgba(255,255,255,0.12); }
+.depth-mode-btn.deep {
+  background: rgba(254,127,45,0.08);
+  border-color: rgba(254,127,45,0.35);
+  color: var(--accent);
+}
+.depth-mode-btn.deep::before {
+  background: linear-gradient(90deg, transparent 15%, rgba(254,127,45,0.5) 50%, transparent 85%);
+}
+
+/* ── VULNERABILITY SCOPE ─────────────────────────── */
+.vuln-scope {
+  margin-top: 20px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+.vuln-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 14px; border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+.vuln-header-left {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px; letter-spacing: .14em; text-transform: uppercase;
+  color: var(--text2); display: flex; align-items: center; gap: 8px;
+}
+.vuln-header-left span { color: var(--accent); }
+.vuln-ctrl {
+  display: flex; gap: 8px; align-items: center;
+}
+.vuln-ctrl-btn {
+  font-family: 'JetBrains Mono', monospace; font-size: 10px;
+  letter-spacing: .1em; text-transform: uppercase;
+  color: var(--text3); background: none; border: 1px solid var(--border2);
+  padding: 3px 8px; cursor: pointer; transition: color .15s, border-color .15s;
+}
+.vuln-ctrl-btn:hover { color: var(--accent); border-color: var(--accent); }
+.vuln-body { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+
+/* Category row */
+.cwe-category { display: flex; flex-direction: column; gap: 6px; }
+.cwe-cat-header {
+  display: flex; align-items: center; gap: 8px;
+}
+.cwe-cat-label {
+  font-family: 'JetBrains Mono', monospace; font-size: 10px;
+  letter-spacing: .12em; text-transform: uppercase;
+  color: var(--text3); min-width: 110px; cursor: pointer;
+  user-select: none; transition: color .15s;
+}
+.cwe-cat-label:hover { color: var(--text2); }
+.cwe-cat-label.all-selected { color: var(--accent); }
+.cwe-pills { display: flex; flex-wrap: wrap; gap: 6px; }
+.cwe-pill {
+  display: flex; flex-direction: column; align-items: center;
+  border: 1px solid var(--border2); padding: 4px 10px;
+  cursor: pointer; transition: all .12s; user-select: none;
+  min-width: 60px;
+}
+.cwe-pill:hover { border-color: var(--border2); }
+.cwe-pill.selected { border-color: var(--accent); background: var(--accent); }
+.cwe-name {
+  font-family: 'JetBrains Mono', monospace; font-size: 10px;
+  letter-spacing: .06em; text-transform: uppercase; color: var(--text3);
+  transition: color .12s;
+}
+.cwe-pill.selected .cwe-name { color: #ffffff; }
+.cwe-id {
+  font-family: 'JetBrains Mono', monospace; font-size: 9px;
+  color: var(--text3); opacity: .5; margin-top: 2px; transition: color .12s;
+}
+.cwe-pill.selected .cwe-id { color: rgba(255,255,255,0.65); opacity: 1; }
+
+/* ── PRIMARY BUTTON ──────────────────────────────── */
+.btn-primary {
+  width: 100%; margin-top: 20px;
+  background: transparent; border: 1px solid var(--accent);
+  color: var(--accent); font-family: 'JetBrains Mono', monospace;
+  font-size: 12px; letter-spacing: .16em; text-transform: uppercase;
+  padding: 14px 32px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  transition: background .15s, color .15s;
+}
+.btn-primary:hover { background: var(--accent); color: #fff; }
+
+/* ── AWAITING ─────────────────────────────────────── */
+.awaiting {
+  font-family: 'JetBrains Mono', monospace; font-size: 10px;
+  letter-spacing: .16em; text-transform: uppercase;
+  color: var(--text3); display: flex; align-items: center; gap: 10px;
+  margin-top: 24px;
+}
+.awaiting-dots span {
+  display: inline-block; width: 4px; height: 4px; border-radius: 50%;
+  background: var(--text3); animation: dot-fade 1.4s infinite;
+}
+.awaiting-dots span:nth-child(2) { animation-delay: .2s; }
+.awaiting-dots span:nth-child(3) { animation-delay: .4s; }
+@keyframes dot-fade {
+  0%,100% { opacity: .15; }
+  50% { opacity: 1; }
+}
+@keyframes dot-pulse {
+  0%,100% { opacity: 1; }
+  50% { opacity: .25; }
+}
+
+/* ── STATUS BAR ──────────────────────────────────── */
+.statusbar {
+  height: var(--statusbar-h); border-top: 1px solid var(--border);
+  display: flex; align-items: center; padding: 0 16px;
+  gap: 0; flex-shrink: 0;
+}
+.stat-item {
+  font-family: 'JetBrains Mono', monospace; font-size: 10px;
+  color: var(--text3); letter-spacing: .06em;
+  display: flex; align-items: center; gap: 6px;
+  padding: 0 14px; border-right: 1px solid var(--border);
+  height: 100%; white-space: nowrap;
+  cursor: default;
+}
+.stat-item:first-child { padding-left: 0; }
+.stat-item.last { margin-left: auto; border-right: none; }
+.stat-val { color: var(--text2); }
+.stat-dot { width: 5px; height: 5px; border-radius: 50%; background: #22c55e; flex-shrink: 0; }
+
+/* Agents Online item — has popup */
+.agents-item {
+  position: relative; cursor: pointer;
+}
+.agents-item:hover .agent-roster { opacity: 1; pointer-events: all; transform: translateY(0); }
+.agents-item .agent-name-display { color: var(--text3); transition: color .15s; }
+.agents-item:hover .agent-name-display { color: var(--text); }
+
+/* Agent roster popup */
+.agent-roster {
+  position: absolute; bottom: calc(100% + 8px); left: 0;
+  width: 360px; background: var(--surface2);
+  border: 1px solid var(--border2);
+  opacity: 0; pointer-events: none;
+  transform: translateY(4px);
+  transition: opacity .2s, transform .2s;
+  z-index: 200;
+}
+.roster-title {
+  padding: 10px 14px; border-bottom: 1px solid var(--border);
+  font-family: 'JetBrains Mono', monospace; font-size: 10px;
+  letter-spacing: .16em; text-transform: uppercase;
+  color: var(--accent); display: flex; align-items: center; gap: 8px;
+}
+.roster-title::before {
+  content: ''; display: block; width: 6px; height: 6px;
+  border-radius: 50%; background: var(--accent);
+  animation: dot-pulse 2s infinite;
+}
+.agent-row {
+  display: grid; grid-template-columns: 100px 1fr;
+  padding: 9px 14px; border-bottom: 1px solid var(--border);
+  gap: 14px; align-items: start;
+}
+.agent-row:last-child { border-bottom: none; }
+.agent-row-name {
+  font-family: 'JetBrains Mono', monospace; font-size: 10px;
+  letter-spacing: .1em; text-transform: uppercase; color: var(--text2);
+  padding-top: 1px;
+}
+.agent-row-desc {
+  font-family: 'JetBrains Mono', monospace; font-size: 10px;
+  color: var(--text3); line-height: 1.5; letter-spacing: .03em;
+}
+
+</style>
+</head>
+<body>
+
+<!-- TOPBAR -->
+<div class="topbar">
+  <div class="topbar-logo">
+    <svg width="22" height="22" viewBox="0 0 22 22" fill="none">
+      <rect x="1.5" y="1.5" width="19" height="19" stroke="#fe7f2d" stroke-width="1.5"/>
+      <circle cx="11" cy="11" r="3.5" fill="#fe7f2d"/>
+      <line x1="11" y1="1.5" x2="11" y2="7" stroke="#fe7f2d" stroke-width="1"/>
+      <line x1="11" y1="15" x2="11" y2="20.5" stroke="#fe7f2d" stroke-width="1"/>
+      <line x1="1.5" y1="11" x2="7" y2="11" stroke="#fe7f2d" stroke-width="1"/>
+      <line x1="15" y1="11" x2="20.5" y2="11" stroke="#fe7f2d" stroke-width="1"/>
+    </svg>
+  </div>
+  <div class="topbar-wordmark">AUTO<span>POV</span></div>
+  <div class="topbar-spacer"></div>
+  <div class="topbar-status">
+    <div class="live-dot"></div>CONNECTED
+  </div>
+  <div class="topbar-api">
+    <div class="api-pill">sk-ant-•••• 4f2a</div>
+    <button class="copy-btn" id="copy-api-btn" onclick="copyApiKey()" data-tooltip="Copy API key">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="4.5" y="4.5" width="7.5" height="7.5" rx="1"/>
+        <path d="M2.5 8.5H1.5a1 1 0 01-1-1V1.5a1 1 0 011-1h6a1 1 0 011 1v1"/>
+      </svg>
+    </button>
+  </div>
+</div>
+
+<!-- BODY -->
+<div class="layout">
+
+  <!-- SIDEBAR -->
+  <nav class="sidebar">
+    <div class="nav-item active" data-tooltip="SCAN">
+      <svg width="17" height="17" viewBox="0 0 17 17" fill="none" stroke="currentColor" stroke-width="1.4">
+        <circle cx="8.5" cy="8.5" r="6.5"/><circle cx="8.5" cy="8.5" r="2.5"/>
+        <line x1="8.5" y1="2" x2="8.5" y2="6"/><line x1="8.5" y1="11" x2="8.5" y2="15"/>
+        <line x1="2" y1="8.5" x2="6" y2="8.5"/><line x1="11" y1="8.5" x2="15" y2="8.5"/>
+      </svg>
+    </div>
+    <div class="nav-item" data-tooltip="HISTORY">
+      <svg width="17" height="17" viewBox="0 0 17 17" fill="none" stroke="currentColor" stroke-width="1.4">
+        <circle cx="8.5" cy="8.5" r="6.5"/><polyline points="8.5,5 8.5,8.5 11,10.5"/>
+      </svg>
+    </div>
+    <div class="nav-item" data-tooltip="METRICS">
+      <svg width="17" height="17" viewBox="0 0 17 17" fill="none" stroke="currentColor" stroke-width="1.4">
+        <rect x="2" y="10.5" width="3" height="5"/><rect x="7" y="7" width="3" height="8.5"/>
+        <rect x="12" y="3" width="3" height="12.5"/>
+      </svg>
+    </div>
+    <div class="nav-item" data-tooltip="POLICY">
+      <svg width="17" height="17" viewBox="0 0 17 17" fill="none" stroke="currentColor" stroke-width="1.4">
+        <path d="M8.5 1.5 L15 4.5 L15 9.5 C15 13.5 8.5 16 8.5 16 C8.5 16 2 13.5 2 9.5 L2 4.5 Z"/>
+        <polyline points="5.5,8.5 7.5,10.5 11.5,6.5"/>
+      </svg>
+    </div>
+    <div class="nav-sep"></div>
+    <div class="sidebar-bottom">
+      <div class="nav-item" data-tooltip="SETTINGS" style="height:48px">
+        <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.325.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 0 1 1.37.49l1.296 2.247a1.125 1.125 0 0 1-.26 1.431l-1.003.827c-.293.241-.438.613-.43.992a7.723 7.723 0 0 1 0 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.955.26 1.43l-1.298 2.247a1.125 1.125 0 0 1-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.47 6.47 0 0 1-.22.128c-.331.183-.581.495-.644.869l-.213 1.281c-.09.543-.56.94-1.11.94h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 0 1-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 0 1-1.369-.49l-1.297-2.247a1.125 1.125 0 0 1 .26-1.431l1.004-.827c.292-.24.437-.613.43-.991a6.932 6.932 0 0 1 0-.255c.007-.38-.138-.751-.43-.992l-1.004-.827a1.125 1.125 0 0 1-.26-1.43l1.297-2.247a1.125 1.125 0 0 1 1.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.086.22-.128.332-.183.582-.495.644-.869l.214-1.28Z"/>
+          <path d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z"/>
+        </svg>
+      </div>
+    </div>
+  </nav>
+
+  <!-- MAIN -->
+  <main class="main">
+    <!-- Idle background (grid + rings only — corners are fixed outside) -->
+    <div class="idle-bg">
+      <div class="grid-lines"></div>
+      <div class="ring"></div><div class="ring"></div><div class="ring"></div>
+    </div>
+
+    <!-- Content -->
+    <div class="scan-wrapper">
+      <div class="page-label">
+        <span class="page-label-bracket">[</span>
+        VULNERABILITY ANALYSIS
+        <span class="page-label-bracket">]</span>
+      </div>
+      <div class="scan-eyebrow">Initiate Scan</div>
+      <h1 class="scan-title"><strong>AutoPoV</strong></h1>
+      <p class="scan-sub">Autonomous Proof-of-Vulnerability Framework for LLM Benchmarking</p>
+
+      <form class="scan-form" onsubmit="return false">
+
+        <!-- Input type tabs + depth toggle -->
+        <div class="tabs-row">
+          <div class="input-tabs" style="margin-bottom:0">
+            <div class="input-tab active" onclick="switchTab(this,'tab-url')">Repository URL</div>
+            <div class="input-tab" onclick="switchTab(this,'tab-zip')">ZIP Archive</div>
+            <div class="input-tab" onclick="switchTab(this,'tab-paste')">Paste Code</div>
+          </div>
+          <button class="depth-mode-btn" id="depth-mode-btn" onclick="toggleDepth()">LITE</button>
+        </div>
+
+        <!-- Tab: Repository URL -->
+        <div id="tab-url" class="tab-panel active">
+          <div class="field-label">Repository URL</div>
+          <div class="field-group">
+            <div class="field-prefix">⊕</div>
+            <input id="repo-url" type="url" placeholder="https://github.com/org/repo" autocomplete="off"/>
+          </div>
+        </div>
+
+        <!-- Tab: ZIP -->
+        <div id="tab-zip" class="tab-panel">
+          <div class="field-label">Upload Archive</div>
+          <div class="drop-zone" onclick="document.getElementById('zip-input').click()">
+            <input id="zip-input" type="file" accept=".zip,.tar.gz" style="display:none">
+            <div class="drop-zone-icon">⊞</div>
+            <div class="drop-zone-text">Drop <strong>.zip</strong> or <strong>.tar.gz</strong> here, or click to browse</div>
+          </div>
+        </div>
+
+        <!-- Tab: Paste -->
+        <div id="tab-paste" class="tab-panel">
+          <div class="options-row" style="margin:0 0 12px;">
+            <div class="select-field">
+              <div class="field-label">Language</div>
+              <select id="paste-lang">
+                <option value="">Auto-Detect</option>
+                <option>Python</option><option>JavaScript</option><option>TypeScript</option>
+                <option>Java</option><option>C</option><option>C++</option><option>Go</option>
+                <option>Rust</option><option>PHP</option><option>Ruby</option>
+                <option>Swift</option><option>Kotlin</option><option>C#</option><option>Bash</option>
+              </select>
+            </div>
+            <div class="select-field">
+              <div class="field-label">Filename (optional)</div>
+              <div class="field-group" style="margin:0">
+                <input type="text" id="paste-filename" placeholder="e.g. main.py" />
+              </div>
+            </div>
+          </div>
+          <div class="field-label">Source Code</div>
+          <textarea class="paste-area" placeholder="// Paste code snippet or file contents here..."></textarea>
+        </div>
+
+        <!-- Vulnerability Scope -->
+        <div class="vuln-scope">
+          <div class="vuln-header" onclick="toggleVulnScope()" style="cursor:pointer">
+            <div class="vuln-header-left">
+              <span id="vuln-chevron" style="font-size:9px;transition:transform .2s;display:inline-block">▼</span>
+              &nbsp;VULNERABILITY SCOPE &nbsp;
+              <span id="selected-count">20</span> / 20 selected
+            </div>
+            <div class="vuln-ctrl" onclick="event.stopPropagation()">
+              <button class="vuln-ctrl-btn" onclick="selectAllCwes(true)">SELECT ALL</button>
+              <button class="vuln-ctrl-btn" onclick="selectAllCwes(false)">CLEAR</button>
+            </div>
+          </div>
+          <div class="vuln-body" id="vuln-body">
+            <!-- Injected by JS -->
+          </div>
+        </div>
+
+        <button class="btn-primary" type="submit">
+          <svg width="13" height="13" viewBox="0 0 13 13" fill="none" stroke="currentColor" stroke-width="1.5">
+            <circle cx="6.5" cy="6.5" r="5"/><circle cx="6.5" cy="6.5" r="2"/>
+          </svg>
+          ANALYZE REPOSITORY
+        </button>
+      </form>
+
+      <div class="awaiting" id="awaiting-msg">
+        AWAITING INPUT
+        <div class="awaiting-dots"><span></span><span></span><span></span></div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- STATUS BAR -->
+<div class="statusbar">
+
+  <div class="stat-item agents-item">
+    <div class="stat-dot"></div>
+    <span class="agent-name-display">AGENTS ONLINE</span>
+    <span class="stat-val">(6)</span>
+    <!-- Agent Roster Popup -->
+    <div class="agent-roster">
+      <div class="roster-title">AGENT ROSTER</div>
+      <div class="agent-row">
+        <div class="agent-row-name">INGEST</div>
+        <div class="agent-row-desc">Chunks &amp; embeds codebase into vector store</div>
+      </div>
+      <div class="agent-row">
+        <div class="agent-row-name">SCOUT</div>
+        <div class="agent-row-desc">Pattern + LLM discovery across 20+ CWEs</div>
+      </div>
+      <div class="agent-row">
+        <div class="agent-row-name">INVESTIGATOR</div>
+        <div class="agent-row-desc">Deep RAG analysis — REAL vs FALSE_POS</div>
+      </div>
+      <div class="agent-row">
+        <div class="agent-row-name">POV GEN</div>
+        <div class="agent-row-desc">Writes working exploit script per finding</div>
+      </div>
+      <div class="agent-row">
+        <div class="agent-row-name">VALIDATION</div>
+        <div class="agent-row-desc">Static → unit test → Docker proof</div>
+      </div>
+      <div class="agent-row">
+        <div class="agent-row-name">POLICY</div>
+        <div class="agent-row-desc">Routes each task to optimal model</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="stat-item">TOTAL SCANS <span class="stat-val">0</span></div>
+  <div class="stat-item">CONFIRMED <span class="stat-val">0</span></div>
+  <div class="stat-item">PoVs <span class="stat-val">0</span></div>
+  <div class="stat-item">MODEL <span class="stat-val">claude-3-5-sonnet</span></div>
+  <div class="stat-item last">AutoPoV v0.3.0</div>
+</div>
+
+<script>
+// ── Vulnerability categories + CWEs ──────────────────
+const CATEGORIES = [
+  { label: 'INJECTION', cwes: [
+    {n:'SQL',id:'89'},{n:'COMMAND',id:'78'},{n:'LDAP',id:'90'},{n:'TEMPLATE',id:'1336'}
+  ]},
+  { label: 'AUTHENTICATION', cwes: [
+    {n:'BROKEN AUTH',id:'287'},{n:'HARDCODED',id:'798'},{n:'WEAK SESSION',id:'384'}
+  ]},
+  { label: 'CRYPTOGRAPHY', cwes: [
+    {n:'WEAK CIPHER',id:'327'},{n:'INSECURE RNG',id:'338'},{n:'HARDCODED KEY',id:'321'}
+  ]},
+  { label: 'INPUT HANDLING', cwes: [
+    {n:'XSS',id:'79'},{n:'PATH TRAV',id:'22'},{n:'BUFFER OVF',id:'787'},{n:'INT OVF',id:'190'}
+  ]},
+  { label: 'ACCESS CONTROL', cwes: [
+    {n:'IDOR',id:'639'},{n:'MISSING AUTH',id:'862'},{n:'PRIV ESC',id:'269'}
+  ]},
+  { label: 'SECRETS', cwes: [
+    {n:'API KEYS',id:'540'},{n:'ENV VARS',id:'615'},{n:'DESER',id:'502'}
+  ]},
+];
+
+const state = {}; // cwe-id -> bool
+
+function buildVulnScope() {
+  const body = document.getElementById('vuln-body');
+  CATEGORIES.forEach(cat => {
+    const div = document.createElement('div');
+    div.className = 'cwe-category';
+    const header = document.createElement('div');
+    header.className = 'cwe-cat-header';
+    const lbl = document.createElement('span');
+    lbl.className = 'cwe-cat-label all-selected';
+    lbl.textContent = cat.label;
+    lbl.onclick = () => toggleCategory(cat);
+    const pills = document.createElement('div');
+    pills.className = 'cwe-pills';
+    cat.cwes.forEach(c => {
+      state[c.id] = true;
+      const pill = document.createElement('div');
+      pill.className = 'cwe-pill selected';
+      pill.dataset.id = c.id;
+      pill.innerHTML = `<span class="cwe-name">${c.n}</span><span class="cwe-id">CWE-${c.id}</span>`;
+      pill.onclick = () => toggleCwe(c.id, cat);
+      pills.appendChild(pill);
+    });
+    header.appendChild(lbl);
+    header.appendChild(pills);
+    div.appendChild(header);
+    body.appendChild(div);
+  });
+  updateCount();
+}
+
+function toggleCwe(id, cat) {
+  state[id] = !state[id];
+  const pill = document.querySelector(`.cwe-pill[data-id="${id}"]`);
+  pill.classList.toggle('selected', state[id]);
+  updateCatLabel(cat);
+  updateCount();
+}
+
+function toggleCategory(cat) {
+  const allOn = cat.cwes.every(c => state[c.id]);
+  cat.cwes.forEach(c => {
+    state[c.id] = !allOn;
+    const pill = document.querySelector(`.cwe-pill[data-id="${c.id}"]`);
+    if (pill) pill.classList.toggle('selected', state[c.id]);
+  });
+  updateCatLabel(cat);
+  updateCount();
+}
+
+function updateCatLabel(cat) {
+  const allOn = cat.cwes.every(c => state[c.id]);
+  const header = [...document.querySelectorAll('.cwe-cat-label')].find(el => el.textContent === cat.label);
+  if (header) header.classList.toggle('all-selected', allOn);
+}
+
+function selectAllCwes(val) {
+  Object.keys(state).forEach(id => { state[id] = val; });
+  document.querySelectorAll('.cwe-pill').forEach(p => p.classList.toggle('selected', val));
+  document.querySelectorAll('.cwe-cat-label').forEach(l => l.classList.toggle('all-selected', val));
+  updateCount();
+}
+
+function updateCount() {
+  const n = Object.values(state).filter(Boolean).length;
+  document.getElementById('selected-count').textContent = n;
+}
+
+// ── Tab switching ─────────────────────────────────────
+function switchTab(el, panelId) {
+  document.querySelectorAll('.input-tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  el.classList.add('active');
+  document.getElementById(panelId).classList.add('active');
+  // Re-focus URL field when switching to url tab
+  if (panelId === 'tab-url') setTimeout(() => document.getElementById('repo-url').focus(), 50);
+}
+
+// ── Awaiting / input detection ────────────────────────
+const urlField = document.getElementById('repo-url');
+const awaitingMsg = document.getElementById('awaiting-msg');
+urlField.addEventListener('input', () => {
+  awaitingMsg.style.opacity = urlField.value ? '0' : '1';
+});
+
+// ── Collapsible vuln scope ────────────────────────────
+let vulnOpen = false; // starts collapsed
+function toggleVulnScope() {
+  vulnOpen = !vulnOpen;
+  const body = document.getElementById('vuln-body');
+  const chev = document.getElementById('vuln-chevron');
+  body.style.display = vulnOpen ? '' : 'none';
+  chev.style.transform = vulnOpen ? '' : 'rotate(-90deg)';
+}
+function initVulnScope() {
+  document.getElementById('vuln-body').style.display = 'none';
+  document.getElementById('vuln-chevron').style.transform = 'rotate(-90deg)';
+}
+
+// ── Mouse parallax (multi-layer lerp) ────────────────
+// nx/ny are smoothed normalised offsets in [-0.5, +0.5]
+// each layer multiplies by its own factor for depth illusion
+let nx = 0, ny = 0, tx = 0, ty = 0;
+document.addEventListener('mousemove', e => {
+  const main = document.querySelector('.main');
+  if (!main) return;
+  const r = main.getBoundingClientRect();
+  tx = (e.clientX - r.left) / r.width  - 0.5;
+  ty = (e.clientY - r.top)  / r.height - 0.5;
+});
+(function raf() {
+  nx += (tx - nx) * 0.05;
+  ny += (ty - ny) * 0.05;
+  // Grid — slowest, feels furthest back
+  const grid = document.querySelector('.grid-lines');
+  if (grid) grid.style.transform =
+    `translate(${(nx * 14).toFixed(2)}px, ${(ny * 10).toFixed(2)}px)`;
+  // Rings — each progressively faster = progressive depth layers
+  document.querySelectorAll('.ring').forEach((ring, i) => {
+    const factor = (i + 1) * 18;
+    ring.style.transform =
+      `translate(${(nx * factor).toFixed(2)}px, ${(ny * factor).toFixed(2)}px)`;
+  });
+  // Corners — counter-direction: move opposite to mouse (foreground parallax)
+  document.querySelectorAll('.corner').forEach(c => {
+    c.style.transform =
+      `translate(${(-nx * 7).toFixed(2)}px, ${(-ny * 5).toFixed(2)}px)`;
+  });
+  requestAnimationFrame(raf);
+})();
+
+// ── Analysis depth toggle (LITE ↔ DEEP) ──────────────
+let depthDeep = false;
+function toggleDepth() {
+  depthDeep = !depthDeep;
+  const btn = document.getElementById('depth-mode-btn');
+  btn.textContent = depthDeep ? 'DEEP' : 'LITE';
+  btn.classList.toggle('deep', depthDeep);
+}
+
+// ── Copy API key ──────────────────────────────────────
+function copyApiKey() {
+  const btn = document.getElementById('copy-api-btn');
+  navigator.clipboard.writeText('sk-ant-demo-key').catch(() => {});
+  // Brief visual confirmation — swap icon to checkmark
+  btn.innerHTML = `<svg width="13" height="13" viewBox="0 0 13 13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="2,7 5,10 11,3"/></svg>`;
+  btn.style.color = 'var(--accent)';
+  setTimeout(() => {
+    btn.innerHTML = `<svg width="13" height="13" viewBox="0 0 13 13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="4.5" width="7.5" height="7.5" rx="1"/><path d="M2.5 8.5H1.5a1 1 0 01-1-1V1.5a1 1 0 011-1h6a1 1 0 011 1v1"/></svg>`;
+    btn.style.color = '';
+  }, 1400);
+}
+
+// ── Boot ─────────────────────────────────────────────
+buildVulnScope();
+initVulnScope();
+setTimeout(() => urlField.focus(), 100);
+</script>
+
+<!-- Corner brackets: fixed to viewport, outside scroll container -->
+<div class="corner tl"></div><div class="corner tr"></div>
+<div class="corner bl"></div><div class="corner br"></div>
+</body>
+</html>

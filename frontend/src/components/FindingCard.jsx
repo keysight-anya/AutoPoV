@@ -1,178 +1,155 @@
+// frontend/src/components/FindingCard.jsx
 import { useState } from 'react'
-import { ChevronDown, ChevronUp, FileCode, AlertTriangle, CheckCircle, FlaskConical, XCircle } from 'lucide-react'
-import SeverityBadge from './SeverityBadge'
 
-const STATUS_CONFIG = {
-  confirmed:  { icon: CheckCircle,  color: 'text-safe-400',   border: 'border-l-safe-500',   bg: 'bg-safe-900' },
-  skipped:    { icon: AlertTriangle, color: 'text-warn-400',   border: 'border-l-warn-500',   bg: 'bg-warn-900' },
-  default:    { icon: XCircle,       color: 'text-threat-400', border: 'border-l-threat-500', bg: 'bg-threat-900' }
+const SEVERITY_COLORS = {
+  critical: '#ef4444',
+  high:     '#f97316',
+  medium:   '#eab308',
+  low:      '#3b82f6',
+  info:     'var(--text3)',
 }
 
-function FindingCard({ finding }) {
+function getSeverity(cwe) {
+  const critical = ['CWE-89', 'CWE-78', 'CWE-94', 'CWE-119', 'CWE-416']
+  const high     = ['CWE-79', 'CWE-502', 'CWE-798', 'CWE-918']
+  const medium   = ['CWE-22', 'CWE-352', 'CWE-287', 'CWE-306', 'CWE-601']
+  if (critical.includes(cwe)) return 'critical'
+  if (high.includes(cwe))     return 'high'
+  if (medium.includes(cwe))   return 'medium'
+  return 'low'
+}
+
+export default function FindingCard({ finding }) {
   const [expanded, setExpanded] = useState(false)
 
-  const cfg = STATUS_CONFIG[finding.final_status] || STATUS_CONFIG.default
-  const StatusIcon = cfg.icon
-
-  const confidenceColor = (c) => {
-    if (c >= 0.8) return 'text-safe-400'
-    if (c >= 0.6) return 'text-warn-400'
-    return 'text-threat-400'
-  }
-
+  const severity = getSeverity(finding.cwe_type)
+  const sevColor = SEVERITY_COLORS[severity]
   const validation = finding.validation_result
-  const unitTest = validation?.unit_test_result
+  const unitTest   = validation?.unit_test_result
   const staticResult = validation?.static_result
 
-  return (
-    <div className={`bg-gray-900/80 rounded-xl border border-gray-800/60 border-l-2 ${cfg.border} overflow-hidden transition-all`}>
-      {/* Header */}
-      <div
-        className="flex items-center justify-between px-4 py-3.5 cursor-pointer hover:bg-gray-800/30 transition-colors"
-        onClick={() => setExpanded(!expanded)}
-      >
-        <div className="flex items-center gap-3 min-w-0">
-          <StatusIcon className={`w-4 h-4 shrink-0 ${cfg.color}`} />
-          <div className="min-w-0">
-            <div className="flex items-center gap-2 flex-wrap">
-              <SeverityBadge cwe={finding.cwe_type} />
-              <span className="font-medium text-sm">{finding.cwe_type}</span>
-            </div>
-            <div className="flex items-center gap-1.5 text-xs text-gray-500 mt-0.5">
-              <FileCode className="w-3 h-3 shrink-0" />
-              <span className="font-mono truncate">{finding.filepath}:{finding.line_number}</span>
-            </div>
-          </div>
-        </div>
+  const statusColor =
+    finding.final_status === 'confirmed' ? '#22c55e'
+  : finding.final_status === 'skipped'   ? '#fde047'
+  : '#f87171'
 
-        <div className="flex items-center gap-3 shrink-0 ml-3">
-          <span className={`text-xs font-medium ${confidenceColor(finding.confidence)}`}>
-            {(finding.confidence * 100).toFixed(0)}% conf.
-          </span>
-          {expanded
-            ? <ChevronUp className="w-4 h-4 text-gray-500" />
-            : <ChevronDown className="w-4 h-4 text-gray-500" />
-          }
-        </div>
+  return (
+    <div style={{
+      background: 'var(--surface1)',
+      border: '1px solid var(--border1)',
+      borderLeft: `3px solid ${sevColor}`,
+      marginBottom: 8,
+      overflow: 'hidden',
+    }}>
+      {/* Header row */}
+      <div
+        onClick={() => setExpanded(e => !e)}
+        style={{
+          display: 'flex', alignItems: 'center', gap: 12,
+          padding: '12px 16px',
+          cursor: 'pointer',
+        }}
+      >
+        {/* Status dot */}
+        <span style={{ color: statusColor, fontSize: 10, flexShrink: 0 }}>●</span>
+
+        {/* CWE badge */}
+        <span style={{
+          fontFamily: '"JetBrains Mono", monospace',
+          fontSize: 9, letterSpacing: '.1em',
+          padding: '2px 8px',
+          border: `1px solid ${sevColor}`,
+          color: sevColor,
+          flexShrink: 0,
+        }}>
+          {finding.cwe_type}
+        </span>
+
+        {/* File path */}
+        <span style={{
+          fontFamily: '"JetBrains Mono", monospace',
+          fontSize: 10, color: 'var(--text2)',
+          flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+        }}>
+          {finding.filepath}:{finding.line_number}
+        </span>
+
+        {/* Confidence */}
+        <span style={{
+          fontFamily: '"JetBrains Mono", monospace',
+          fontSize: 9, letterSpacing: '.06em',
+          color: finding.confidence >= 0.8 ? '#22c55e'
+               : finding.confidence >= 0.6 ? '#fde047' : '#f87171',
+          flexShrink: 0,
+        }}>
+          {(finding.confidence * 100).toFixed(0)}%
+        </span>
+
+        {/* Expand chevron */}
+        <span style={{
+          color: 'var(--text3)', fontSize: 10, flexShrink: 0,
+          transform: expanded ? 'rotate(0deg)' : 'rotate(-90deg)',
+          transition: 'transform .15s',
+          display: 'inline-block',
+        }}>▼</span>
       </div>
 
-      {/* Expanded */}
+      {/* Expanded content */}
       {expanded && (
-        <div className="border-t border-gray-800/60 p-4 space-y-4">
+        <div style={{ borderTop: '1px solid var(--border1)', padding: '14px 16px' }}>
           {/* Explanation */}
           {finding.llm_explanation && (
-            <div>
-              <p className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-1.5">Analysis</p>
-              <p className="text-sm text-gray-300 leading-relaxed">{finding.llm_explanation}</p>
+            <div style={{ marginBottom: 14 }}>
+              <div style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: 9, letterSpacing: '.12em', color: 'var(--text3)', marginBottom: 6 }}>EXPLANATION</div>
+              <p style={{ fontSize: 12, color: 'var(--text2)', lineHeight: 1.6, margin: 0 }}>{finding.llm_explanation}</p>
             </div>
           )}
 
-          {/* Vulnerable Code */}
+          {/* Vulnerable code */}
           {finding.code_chunk && (
-            <div>
-              <p className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-1.5">Vulnerable Code</p>
-              <pre className="bg-gray-950 border border-threat-500/10 p-3 rounded-lg overflow-x-auto">
-                <code className="text-xs text-threat-300 font-mono leading-relaxed">{finding.code_chunk}</code>
-              </pre>
+            <div style={{ marginBottom: 14 }}>
+              <div style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: 9, letterSpacing: '.12em', color: 'var(--text3)', marginBottom: 6 }}>VULNERABLE CODE</div>
+              <pre style={{ background: 'var(--bg)', border: '1px solid var(--border1)', padding: '10px 12px', margin: 0, overflowX: 'auto', fontSize: 11, color: '#fca5a5', fontFamily: '"JetBrains Mono", monospace' }}>{finding.code_chunk}</pre>
             </div>
           )}
 
-          {/* PoV status grid */}
-          <div>
-            <p className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-1.5">PoV Status</p>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-              {[
-                { label: 'Generated', value: finding.pov_script ? 'Yes' : 'No', positive: !!finding.pov_script },
-                { label: 'Method', value: validation?.validation_method || '—', positive: null },
-                { label: 'Will Trigger', value: validation?.will_trigger || '—', positive: null },
-                { label: 'Triggered', value: finding.pov_result?.vulnerability_triggered ? 'Yes' : 'No', positive: finding.pov_result?.vulnerability_triggered }
-              ].map(({ label, value, positive }) => (
-                <div key={label} className="bg-gray-950/60 border border-gray-800/40 rounded-lg p-2.5">
-                  <p className="text-xs text-gray-500 mb-0.5">{label}</p>
-                  <p className={`text-sm font-medium ${positive === true ? 'text-safe-400' : positive === false ? 'text-threat-400' : 'text-gray-300'}`}>
-                    {value}
-                  </p>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {/* PoV Script */}
+          {/* PoV script */}
           {finding.pov_script && (
-            <div>
-              <p className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-1.5">Proof of Vulnerability</p>
-              <pre className="bg-gray-950 border border-safe-500/10 p-3 rounded-lg overflow-x-auto">
-                <code className="text-xs text-safe-300 font-mono leading-relaxed">{finding.pov_script}</code>
-              </pre>
+            <div style={{ marginBottom: 14 }}>
+              <div style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: 9, letterSpacing: '.12em', color: 'var(--text3)', marginBottom: 6 }}>PROOF OF VULNERABILITY</div>
+              <pre style={{ background: 'var(--bg)', border: '1px solid var(--border1)', padding: '10px 12px', margin: 0, overflowX: 'auto', fontSize: 11, color: '#86efac', fontFamily: '"JetBrains Mono", monospace' }}>{finding.pov_script}</pre>
             </div>
           )}
 
-          {/* PoV Execution */}
+          {/* PoV result */}
           {finding.pov_result && (
-            <div>
-              <p className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-1.5">Execution Result</p>
-              <div className={`flex items-start gap-2.5 p-3 rounded-lg border ${
-                finding.pov_result.vulnerability_triggered
-                  ? 'bg-threat-900/40 border-threat-500/20'
-                  : 'bg-gray-950/60 border-gray-800/40'
-              }`}>
-                <FlaskConical className={`w-4 h-4 mt-0.5 shrink-0 ${finding.pov_result.vulnerability_triggered ? 'text-threat-400' : 'text-gray-500'}`} />
-                <div>
-                  <p className={`text-sm font-medium ${finding.pov_result.vulnerability_triggered ? 'text-threat-300' : 'text-gray-400'}`}>
-                    {finding.pov_result.vulnerability_triggered ? 'VULNERABILITY TRIGGERED' : 'PoV did not trigger'}
-                  </p>
-                  {(finding.pov_result.stdout || finding.pov_result.stderr) && (
-                    <pre className="mt-2 text-xs text-gray-500 overflow-x-auto whitespace-pre-wrap">
-                      {(finding.pov_result.stdout || '') + (finding.pov_result.stderr ? '\n' + finding.pov_result.stderr : '')}
-                    </pre>
-                  )}
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Validation details */}
-          {(staticResult || unitTest || validation?.issues?.length > 0) && (
-            <div>
-              <p className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-1.5">Validation Details</p>
-              <div className="bg-gray-950/60 border border-gray-800/40 rounded-lg p-3 space-y-2 text-xs text-gray-400">
-                {staticResult && (
-                  <div className="flex gap-4">
-                    <span className="text-gray-500">Static confidence:</span>
-                    <span>{(staticResult.confidence * 100).toFixed(0)}%</span>
-                    {staticResult.matched_patterns?.length > 0 && (
-                      <span>{staticResult.matched_patterns.length} patterns matched</span>
-                    )}
-                  </div>
-                )}
-                {unitTest && (
-                  <div className="flex gap-4">
-                    <span className="text-gray-500">Unit test:</span>
-                    <span>{unitTest.success ? 'executed' : 'failed'}</span>
-                    <span>triggered: {unitTest.vulnerability_triggered ? 'yes' : 'no'}</span>
-                    {unitTest.stderr && <span className="text-threat-400 truncate">{unitTest.stderr}</span>}
-                  </div>
-                )}
-                {validation?.issues?.length > 0 && (
-                  <ul className="list-disc list-inside text-warn-300 space-y-0.5">
-                    {validation.issues.slice(0, 3).map((issue, idx) => <li key={idx}>{issue}</li>)}
-                  </ul>
-                )}
+            <div style={{ marginBottom: 14 }}>
+              <div style={{
+                padding: '8px 12px',
+                background: finding.pov_result.vulnerability_triggered ? 'rgba(239,68,68,0.1)' : 'var(--surface2)',
+                border: `1px solid ${finding.pov_result.vulnerability_triggered ? 'rgba(239,68,68,0.3)' : 'var(--border1)'}`,
+                fontFamily: '"JetBrains Mono", monospace',
+                fontSize: 10, letterSpacing: '.1em',
+                color: finding.pov_result.vulnerability_triggered ? '#fca5a5' : 'var(--text3)',
+              }}>
+                {finding.pov_result.vulnerability_triggered ? '⚠ VULNERABILITY TRIGGERED' : 'POV DID NOT TRIGGER'}
               </div>
             </div>
           )}
 
           {/* Metadata */}
-          <div className="flex flex-wrap items-center gap-3 text-xs text-gray-600 pt-2 border-t border-gray-800/40">
-            {finding.inference_time_s && <span>Inference: {finding.inference_time_s.toFixed(2)}s</span>}
-            {finding.cost_usd != null && <span>Cost: ${finding.cost_usd.toFixed(4)}</span>}
-            {finding.model_used && <span className="font-mono">{finding.model_used.split('/').pop()}</span>}
-            {finding.pov_model_used && <span className="font-mono">PoV: {finding.pov_model_used.split('/').pop()}</span>}
+          <div style={{
+            display: 'flex', flexWrap: 'wrap', gap: 16,
+            borderTop: '1px solid var(--border1)', paddingTop: 10,
+            fontFamily: '"JetBrains Mono", monospace',
+            fontSize: 9, letterSpacing: '.06em', color: 'var(--text3)',
+          }}>
+            {finding.inference_time_s && <span>INFERENCE {finding.inference_time_s.toFixed(2)}s</span>}
+            {finding.cost_usd        && <span>COST ${finding.cost_usd.toFixed(4)}</span>}
+            {finding.model_used      && <span>MODEL {finding.model_used}</span>}
           </div>
         </div>
       )}
     </div>
   )
 }
-
-export default FindingCard

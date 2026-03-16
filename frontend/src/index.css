@@ -1,100 +1,51 @@
+/* frontend/src/index.css */
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,300;0,400;0,500;0,600;1,400&family=Inter:wght@300;400;500;600&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-/* Custom scrollbar for dark theme */
-::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+:root {
+  --bg:          #141e28;
+  --surface1:    #141e28;
+  --surface2:    #1a2c3c;
+  --accent:      #fe7f2d;
+  --text1:       #e8edf2;
+  --text2:       #8ba3b8;
+  --text3:       #4d6478;
+  --border1:     #1e2e3e;
+  --border2:     #253545;
+  --topbar-h:    48px;
+  --sidebar-w:   48px;
+  --statusbar-h: 28px;
 }
 
-::-webkit-scrollbar-track {
-  background: #090d1a;
+*, *::before, *::after {
+  box-sizing: border-box;
 }
 
-::-webkit-scrollbar-thumb {
-  background: #374151;
-  border-radius: 3px;
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
 }
 
-::-webkit-scrollbar-thumb:hover {
-  background: #4b5563;
+body {
+  background: var(--bg);
+  color: var(--text1);
+  font-family: 'Inter', system-ui, sans-serif;
+  font-size: 14px;
 }
 
-/* Code block styling */
-pre {
-  background: #090d1a;
-  border-radius: 0.5rem;
-  padding: 1rem;
-  overflow-x: auto;
-  border: 1px solid #1e2a3a;
-}
+/* Custom scrollbar */
+::-webkit-scrollbar       { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: var(--surface1); }
+::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
 
-code {
-  font-family: 'Fira Code', 'JetBrains Mono', monospace;
-  font-size: 0.8125rem;
+/* Log entry animation */
+@keyframes logIn {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
-
-/* Animation for live logs */
-@keyframes fadeIn {
-  from {
-    opacity: 0;
-    transform: translateY(-4px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-.log-entry {
-  animation: fadeIn 0.2s ease-out;
-}
-
-/* Scanning pulse animation */
-@keyframes scanPulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.4; }
-}
-
-.scan-pulse {
-  animation: scanPulse 1.5s ease-in-out infinite;
-}
-
-/* Status badges */
-.status-badge {
-  @apply px-2 py-0.5 rounded text-xs font-medium;
-}
-
-.status-completed {
-  @apply bg-green-900/30 text-green-400 border border-green-500/20;
-}
-
-.status-running {
-  @apply bg-blue-900/20 text-blue-400 border border-blue-500/20;
-}
-
-.status-failed {
-  @apply bg-red-900/30 text-red-400 border border-red-500/20;
-}
-
-.status-pending {
-  @apply bg-gray-800 text-gray-400 border border-gray-700;
-}
-
-/* Glow effects for findings */
-.finding-confirmed {
-  box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.25), 0 0 24px rgba(239, 68, 68, 0.04);
-}
-
-.finding-false-positive {
-  box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.2);
-}
-
-/* Background grid pattern */
-.bg-grid {
-  background-image:
-    linear-gradient(rgba(14, 165, 233, 0.04) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(14, 165, 233, 0.04) 1px, transparent 1px);
-  background-size: 48px 48px;
-}
+.log-entry { animation: logIn 0.2s ease-out; }

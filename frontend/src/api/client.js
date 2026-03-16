@@ -2,6 +2,8 @@ import axios from 'axios'
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api'
 
+
+// Get AutoPoV backend API key
 const getApiKey = () => {
   return localStorage.getItem('autopov_api_key') || import.meta.env.VITE_API_KEY
 }
@@ -16,6 +18,12 @@ const shouldUseApiKey = (config) => {
   return Boolean(config?.useApiKey)
 }
 
+// Get OpenRouter API key (for per-request LLM key injection)
+const getOpenRouterKey = () => {
+  return localStorage.getItem('openrouter_api_key') || null
+}
+
+// Create axios instance
 const apiClient = axios.create({
   baseURL: API_URL,
   withCredentials: true,
@@ -50,6 +58,25 @@ export const scanZip = (formData) => apiClient.post('/scan/zip', formData, {
   }
 })
 export const scanPaste = (data) => apiClient.post('/scan/paste', data)
+
+export const scanGit = (data) => apiClient.post('/scan/git', {
+  ...data,
+  openrouter_api_key: getOpenRouterKey()
+})
+
+export const scanZip = (formData) => {
+  const orKey = getOpenRouterKey()
+  if (orKey) formData.append('openrouter_api_key', orKey)
+  return apiClient.post('/scan/zip', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' }
+  })
+}
+
+export const scanPaste = (data) => apiClient.post('/scan/paste', {
+  ...data,
+  openrouter_api_key: getOpenRouterKey()
+})
+
 export const getScanStatus = (scanId) => apiClient.get(`/scan/${scanId}`)
 
 export const getScanLogs = (scanId) => {

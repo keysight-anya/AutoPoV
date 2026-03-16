@@ -1,35 +1,53 @@
 import { useEffect, useState } from 'react'
-import { Activity, RefreshCw } from 'lucide-react'
 import { getMetrics, healthCheck } from '../api/client'
 
-function StatCard({ label, value, sub }) {
+function StatCard({ label, value, sub, accent }) {
+  const border = {
+    threat:  'border-l-2 border-l-threat-500',
+    safe:    'border-l-2 border-l-safe-500',
+    warn:    'border-l-2 border-l-warn-500',
+    primary: 'border-l-2 border-l-primary-600',
+  }[accent] || ''
+
   return (
-    <div className="bg-gray-900 border border-gray-800 rounded-lg p-4">
-      <div className="text-sm text-gray-400">{label}</div>
-      <div className="text-2xl font-semibold mt-1">{value}</div>
-      {sub && <div className="text-xs text-gray-500 mt-1">{sub}</div>}
+    <div className={`card p-5 ${border}`}>
+      <p className="label-caps mb-3">{label}</p>
+      <p className="stat-num text-gray-100">{value}</p>
+      {sub && <p className="text-xs text-gray-600 mt-1.5">{sub}</p>}
     </div>
   )
 }
 
-function ToolBadge({ label, available }) {
+function ToolStatus({ label, available }) {
   return (
-    <div className={`flex items-center space-x-2 px-3 py-2 rounded-lg border text-sm ${
-      available
-        ? 'bg-green-900/20 border-green-800 text-green-300'
-        : 'bg-gray-800 border-gray-700 text-gray-500'
-    }`}>
-      <span className={`w-2 h-2 rounded-full ${available ? 'bg-green-400' : 'bg-gray-600'}`} />
-      <span>{label}</span>
+    <div className="flex items-center gap-3 py-2.5 border-b border-gray-850 last:border-0">
+      <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${available ? 'bg-safe-400' : 'bg-gray-700'}`} />
+      <span className="text-xs text-gray-400 flex-1 font-mono">{label}</span>
+      {available
+        ? <span className="badge-safe">ONLINE</span>
+        : <span className="badge-neutral">OFFLINE</span>
+      }
+    </div>
+  )
+}
+
+function SectionGrid({ title, children }) {
+  return (
+    <div>
+      <p className="label-caps mb-3">{title}</p>
+      {/* gap-px + bg shows through as 1-px dividers — brutalist grid */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-px bg-gray-850">
+        {children}
+      </div>
     </div>
   )
 }
 
 function Metrics() {
-  const [metrics, setMetrics] = useState(null)
-  const [health, setHealth] = useState(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState(null)
+  const [metrics,     setMetrics]     = useState(null)
+  const [health,      setHealth]      = useState(null)
+  const [loading,     setLoading]     = useState(true)
+  const [error,       setError]       = useState(null)
   const [lastRefresh, setLastRefresh] = useState(null)
 
   const fetchAll = async () => {
@@ -38,7 +56,7 @@ function Metrics() {
     try {
       const [metricsRes, healthRes] = await Promise.all([
         getMetrics().catch(() => null),
-        healthCheck().catch(() => null)
+        healthCheck().catch(() => null),
       ])
       setMetrics(metricsRes?.data || null)
       setHealth(healthRes?.data || null)
@@ -50,152 +68,139 @@ function Metrics() {
     }
   }
 
-  useEffect(() => {
-    fetchAll()
-  }, [])
+  useEffect(() => { fetchAll() }, [])
 
   return (
-    <div className="max-w-6xl mx-auto space-y-8">
+    <div className="space-y-10 animate-fade-up">
+
       {/* Header */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center space-x-3">
-          <Activity className="w-8 h-8 text-primary-500" />
-          <div>
-            <h1 className="text-2xl font-bold">System Metrics</h1>
-            <p className="text-sm text-gray-400">
-              {lastRefresh ? `Last updated: ${lastRefresh.toLocaleTimeString()}` : 'Agent server statistics'}
+      <div className="flex items-end justify-between">
+        <div>
+          <p className="label-caps mb-1">// TELEMETRY</p>
+          <h1 className="heading-display text-4xl text-gray-100">SYSTEM METRICS</h1>
+          {lastRefresh && (
+            <p className="text-xs text-gray-600 mt-1 font-mono tracking-widest">
+              REFRESHED {lastRefresh.toLocaleTimeString()}
             </p>
-          </div>
+          )}
         </div>
         <button
           onClick={fetchAll}
           disabled={loading}
-          className="flex items-center space-x-2 px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg transition-colors disabled:opacity-50"
+          className="btn-ghost text-xs disabled:opacity-50"
         >
-          <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
-          <span>Refresh</span>
+          {loading ? (
+            <>
+              <span className="inline-block w-3 h-3 border border-current border-t-transparent animate-spin mr-2" />
+              LOADING
+            </>
+          ) : (
+            '↻ REFRESH'
+          )}
         </button>
       </div>
 
+      {/* Error */}
       {error && (
-        <div className="p-4 bg-red-900/30 border border-red-800 rounded-lg">
-          <p className="text-red-300">{error}</p>
+        <div className="card-threat p-4 flex items-center gap-3">
+          <span className="label-caps text-threat-400">ERROR</span>
+          <span className="text-threat-300 text-sm">{error}</span>
         </div>
       )}
 
-      {/* Health */}
+      {/* Agent health */}
       {health && (
-        <div className="bg-gray-900 border border-gray-800 rounded-lg p-6">
-          <h2 className="text-lg font-semibold mb-4">Agent Server Health</h2>
-          <div className="flex items-center space-x-2 mb-4">
-            <span className={`w-3 h-3 rounded-full ${health.status === 'healthy' ? 'bg-green-400' : 'bg-red-400'}`} />
-            <span className="font-medium capitalize">{health.status}</span>
-            <span className="text-gray-500 text-sm">v{health.version}</span>
-          </div>
-          <div className="flex flex-wrap gap-3">
-            <ToolBadge label="Docker (PoV Execution)" available={health.docker_available} />
-            <ToolBadge label="CodeQL (Static Analysis)" available={health.codeql_available} />
-            <ToolBadge label="Joern (Graph Analysis)" available={health.joern_available} />
-          </div>
-        </div>
-      )}
+        <div>
+          <p className="label-caps mb-3">AGENT SERVER</p>
+          <div className="card grid grid-cols-1 md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-gray-850">
 
-      {/* Metrics cards */}
-      {metrics && (
-        <>
-          {/* Scan counts */}
-          <div>
-            <h2 className="text-lg font-semibold mb-3">Scan Activity</h2>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-              {metrics.total_scans !== undefined && (
-                <StatCard label="Total Scans" value={metrics.total_scans} />
-              )}
-              {metrics.completed_scans !== undefined && (
-                <StatCard label="Completed" value={metrics.completed_scans} />
-              )}
-              {metrics.failed_scans !== undefined && (
-                <StatCard label="Failed" value={metrics.failed_scans} />
-              )}
-              {metrics.running_scans !== undefined && (
-                <StatCard label="Running" value={metrics.running_scans} />
-              )}
-            </div>
-          </div>
-
-          {/* Findings */}
-          {(metrics.total_findings !== undefined || metrics.confirmed_findings !== undefined) && (
-            <div>
-              <h2 className="text-lg font-semibold mb-3">Finding Statistics</h2>
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                {metrics.total_findings !== undefined && (
-                  <StatCard label="Total Findings" value={metrics.total_findings} />
-                )}
-                {metrics.confirmed_findings !== undefined && (
-                  <StatCard label="Confirmed" value={metrics.confirmed_findings} />
-                )}
-                {metrics.false_positives !== undefined && (
-                  <StatCard label="False Positives" value={metrics.false_positives} />
-                )}
-                {metrics.avg_confidence !== undefined && (
-                  <StatCard
-                    label="Avg Confidence"
-                    value={`${(metrics.avg_confidence * 100).toFixed(1)}%`}
-                  />
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* Cost / duration */}
-          {(metrics.total_cost_usd !== undefined || metrics.avg_duration_s !== undefined) && (
-            <div>
-              <h2 className="text-lg font-semibold mb-3">Cost & Performance</h2>
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                {metrics.total_cost_usd !== undefined && (
-                  <StatCard label="Total Cost" value={`$${parseFloat(metrics.total_cost_usd).toFixed(4)}`} />
-                )}
-                {metrics.avg_cost_usd !== undefined && (
-                  <StatCard label="Avg Cost / Scan" value={`$${parseFloat(metrics.avg_cost_usd).toFixed(4)}`} />
-                )}
-                {metrics.avg_duration_s !== undefined && (
-                  <StatCard label="Avg Duration" value={`${parseFloat(metrics.avg_duration_s).toFixed(1)}s`} />
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* Remaining raw keys */}
-          {(() => {
-            const knownKeys = new Set([
-              'total_scans', 'completed_scans', 'failed_scans', 'running_scans',
-              'total_findings', 'confirmed_findings', 'false_positives', 'avg_confidence',
-              'total_cost_usd', 'avg_cost_usd', 'avg_duration_s'
-            ])
-            const extra = Object.entries(metrics).filter(([k]) => !knownKeys.has(k))
-            if (!extra.length) return null
-            return (
+            {/* Status cell */}
+            <div className="p-5 flex items-center gap-4">
+              <span className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${
+                health.status === 'healthy'
+                  ? 'bg-safe-400 animate-pulse-glow'
+                  : 'bg-threat-500'
+              }`} />
               <div>
-                <h2 className="text-lg font-semibold mb-3">Additional Metrics</h2>
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                  {extra.map(([k, v]) => (
-                    <StatCard
-                      key={k}
-                      label={k.replace(/_/g, ' ')}
-                      value={typeof v === 'number' ? (Number.isInteger(v) ? v : v.toFixed(4)) : String(v)}
-                    />
-                  ))}
-                </div>
+                <p className="text-sm font-semibold text-gray-200 tracking-widest uppercase">
+                  {health.status}
+                </p>
+                <p className="label-caps text-gray-600 mt-0.5">VERSION {health.version}</p>
               </div>
-            )
-          })()}
-        </>
-      )}
+            </div>
 
-      {!loading && !metrics && !health && (
-        <div className="p-8 text-center text-gray-500">
-          No metrics available. Make sure the agent server is running.
+            {/* Tool availability */}
+            <div className="p-5">
+              <p className="label-caps mb-2">ANALYSIS TOOLS</p>
+              <ToolStatus label="Docker — PoV Execution"   available={health.docker_available} />
+              <ToolStatus label="CodeQL — Static Analysis" available={health.codeql_available} />
+              <ToolStatus label="Joern — Graph Analysis"   available={health.joern_available} />
+            </div>
+          </div>
         </div>
       )}
+
+      {/* Scan activity */}
+      {metrics && metrics.total_scans !== undefined && (
+        <SectionGrid title="SCAN ACTIVITY">
+          {metrics.total_scans    !== undefined && <StatCard label="TOTAL SCANS" value={metrics.total_scans} />}
+          {metrics.completed_scans !== undefined && <StatCard label="COMPLETED"  value={metrics.completed_scans} accent="safe" />}
+          {metrics.failed_scans   !== undefined && <StatCard label="FAILED"      value={metrics.failed_scans}   accent="threat" />}
+          {metrics.running_scans  !== undefined && <StatCard label="RUNNING"     value={metrics.running_scans}  accent="primary" />}
+        </SectionGrid>
+      )}
+
+      {/* Findings */}
+      {metrics && (metrics.total_findings !== undefined || metrics.confirmed_findings !== undefined) && (
+        <SectionGrid title="FINDING STATISTICS">
+          {metrics.total_findings     !== undefined && <StatCard label="TOTAL FINDINGS"  value={metrics.total_findings} />}
+          {metrics.confirmed_findings !== undefined && <StatCard label="CONFIRMED"        value={metrics.confirmed_findings} accent="safe" />}
+          {metrics.false_positives    !== undefined && <StatCard label="FALSE POSITIVES"  value={metrics.false_positives}   accent="warn" />}
+          {metrics.avg_confidence     !== undefined && (
+            <StatCard label="AVG CONFIDENCE" value={`${(metrics.avg_confidence * 100).toFixed(1)}%`} />
+          )}
+        </SectionGrid>
+      )}
+
+      {/* Cost & performance */}
+      {metrics && (metrics.total_cost_usd !== undefined || metrics.avg_duration_s !== undefined) && (
+        <SectionGrid title="COST & PERFORMANCE">
+          {metrics.total_cost_usd  !== undefined && <StatCard label="TOTAL COST"      value={`$${parseFloat(metrics.total_cost_usd).toFixed(4)}`} />}
+          {metrics.avg_cost_usd    !== undefined && <StatCard label="AVG COST / SCAN" value={`$${parseFloat(metrics.avg_cost_usd).toFixed(4)}`} />}
+          {metrics.avg_duration_s  !== undefined && <StatCard label="AVG DURATION"    value={`${parseFloat(metrics.avg_duration_s).toFixed(1)}s`} />}
+        </SectionGrid>
+      )}
+
+      {/* Catch-all extra keys */}
+      {metrics && (() => {
+        const knownKeys = new Set([
+          'total_scans','completed_scans','failed_scans','running_scans',
+          'total_findings','confirmed_findings','false_positives','avg_confidence',
+          'total_cost_usd','avg_cost_usd','avg_duration_s',
+        ])
+        const extra = Object.entries(metrics).filter(([k]) => !knownKeys.has(k))
+        if (!extra.length) return null
+        return (
+          <SectionGrid title="ADDITIONAL METRICS">
+            {extra.map(([k, v]) => (
+              <StatCard
+                key={k}
+                label={k.replace(/_/g, ' ').toUpperCase()}
+                value={typeof v === 'number' ? (Number.isInteger(v) ? v : v.toFixed(4)) : String(v)}
+              />
+            ))}
+          </SectionGrid>
+        )
+      })()}
+
+      {/* Offline state */}
+      {!loading && !metrics && !health && (
+        <div className="card p-14 text-center">
+          <p className="label-caps text-gray-600 mb-1">NO DATA</p>
+          <p className="text-xs text-gray-700">Agent server appears to be offline</p>
+        </div>
+      )}
+
     </div>
   )
 }
