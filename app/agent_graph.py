@@ -102,6 +102,8 @@ class ScanState(TypedDict):
 
     proofs_attempted: int
     openrouter_api_key: Optional[str]
+    proofs_attempted: int
+    openrouter_api_key: Optional[str]
 
 
 class AgentGraph:
@@ -1577,6 +1579,7 @@ class AgentGraph:
             logs=[],
             error=None,
             proofs_attempted=0
+            openrouter_api_key=openrouter_api_key
             openrouter_api_key=openrouter_api_key
         )
         
