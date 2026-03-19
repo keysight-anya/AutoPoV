@@ -22,12 +22,6 @@ from app.config import settings
 
 security = HTTPBearer()
 
-def _frontend_origin() -> str:
-    raw = settings.FRONTEND_URL.rstrip('/')
-    parsed = urlparse(raw)
-    return f"{parsed.scheme}://{parsed.netloc}"
-
-
 def _request_origin(request: Request) -> Optional[str]:
     origin = request.headers.get("origin")
     if not origin:
@@ -45,7 +39,7 @@ def _is_internal_request(request: Request) -> bool:
     origin = _request_origin(request)
     if not origin:
         return False
-    return origin == _frontend_origin()
+    return origin in settings.get_allowed_frontend_origins()
 
 
 def _require_internal_request(request: Request) -> None:

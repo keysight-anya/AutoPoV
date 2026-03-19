@@ -3,7 +3,9 @@ AutoPoV Docker Runner Module
 Executes PoV scripts in isolated Docker containers
 """
 
+import io
 import os
+import tarfile
 import tempfile
 import shutil
 from typing import Dict, Optional, Any, List, Tuple
@@ -133,19 +135,25 @@ class DockerRunner:
             
             start_time = datetime.utcnow()
             
-            # Run container
-            container = client.containers.run(
+            exec_cmd = "mkdir -p /pov && " + " ".join(runtime_command + [f"/pov/{pov_filename}"])
+            container = client.containers.create(
                 image=image,
-                command=runtime_command + [pov_filename],
-                volumes={temp_dir: {'bind': '/pov', 'mode': 'ro'}},
-                working_dir='/pov',
+                command=["sh", "-lc", exec_cmd],
+                working_dir='/',
                 mem_limit=self.memory_limit,
                 cpu_quota=int(self.cpu_limit * 100000),
-                network_mode='none',  # No network access for security
-                detach=True,
-                stdout=True,
-                stderr=True
+                network_mode='none',
+                detach=True
             )
+
+            archive_buffer = io.BytesIO()
+            with tarfile.open(fileobj=archive_buffer, mode='w') as tar:
+                for name in os.listdir(temp_dir):
+                    full_path = os.path.join(temp_dir, name)
+                    tar.add(full_path, arcname=f'pov/{name}')
+            archive_buffer.seek(0)
+            container.put_archive('/', archive_buffer.getvalue())
+            container.start()
             
             # Wait for completion with timeout
             try:
@@ -167,8 +175,13 @@ class DockerRunner:
             end_time = datetime.utcnow()
             execution_time = (end_time - start_time).total_seconds()
             
-            # Check for vulnerability trigger
-            vulnerability_triggered = "VULNERABILITY TRIGGERED" in stdout
+            # Check for vulnerability trigger using both generic and contract-specific indicators
+            indicators = ["VULNERABILITY TRIGGERED"]
+            contract = exploit_contract or {}
+            indicators.extend(contract.get("success_indicators", []) or [])
+            indicators.extend(contract.get("side_effects", []) or [])
+            haystack = (stdout + "\n" + stderr).lower()
+            vulnerability_triggered = any(str(ind).strip().lower() in haystack for ind in indicators if str(ind).strip())
             
             return {
                 "success": exit_code == 0 or vulnerability_triggered,
@@ -179,7 +192,8 @@ class DockerRunner:
                 "execution_time_s": execution_time,
                 "timestamp": end_time.isoformat(),
                 "execution_profile": execution_profile or target_language or "python",
-                "runtime_image": image
+                "runtime_image": image,
+                "validation_method": "generic_container_runtime"
             }
             
         except ContainerError as e:
@@ -332,7 +346,8 @@ exec(open('/pov/pov_script.py').read())
         pov_script: str,
         binary_data: bytes,
         scan_id: str,
-        pov_id: str
+        pov_id: str,
+        exploit_contract: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Run PoV with binary input data
@@ -372,9 +387,7 @@ exec(open('/pov/pov_script.py').read())
                 mem_limit=self.memory_limit,
                 cpu_quota=int(self.cpu_limit * 100000),
                 network_mode='none',
-                detach=True,
-                stdout=True,
-                stderr=True
+                detach=True
             )
             
             try:

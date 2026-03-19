@@ -10,14 +10,17 @@ import uuid
 import threading
 import shutil
 from typing import Dict, Any, List, Optional, Callable, Tuple
+from pathlib import Path
 from datetime import datetime, timedelta
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
 from app.config import settings
 from app.agent_graph import get_agent_graph, ScanState
 from agents.ingest_codebase import get_code_ingester
+from agents.agentic_discovery import get_agentic_discovery
+from app.openrouter_client import rehydrate_openrouter_usage
 
 
 @dataclass
@@ -39,11 +42,17 @@ class ScanResult:
     findings: List[Dict[str, Any]]
     detected_language: Optional[str] = None
     language_info: Optional[Dict[str, Any]] = None
+    total_loc: int = 0
+    unproven_findings: int = 0
     logs: List[str] = None
+    error: Optional[str] = None
+    scan_openrouter_usage: Optional[List[Dict[str, Any]]] = None
     
     def __post_init__(self):
         if self.logs is None:
             self.logs = []
+        if self.scan_openrouter_usage is None:
+            self.scan_openrouter_usage = []
 
 
 class ScanManager:
@@ -105,6 +114,7 @@ class ScanManager:
             "status": "created",
             "codebase_path": codebase_path,
             "model_name": model_name,
+            "model_mode": settings.resolve_model_mode(model_name),
             "cwes": cwes,
             "triggered_by": triggered_by,
             "lite": lite,
@@ -156,6 +166,12 @@ class ScanManager:
         except Exception as e:
             print(f"[ScanManager] Failed to remove active scan snapshot {scan_id}: {e}")
 
+    def _retire_terminal_scan(self, scan_id: str):
+        """Remove terminal scans from the active snapshot set while preserving saved results."""
+        self._active_scans.pop(scan_id, None)
+        self._scan_locks.pop(scan_id, None)
+        self._remove_active_snapshot(scan_id)
+
     def _load_active_scan_snapshots(self):
         if not os.path.exists(self._active_runs_dir):
             return
@@ -178,6 +194,25 @@ class ScanManager:
                 self._scan_locks[scan_id] = threading.Lock()
             except Exception as e:
                 print(f"[ScanManager] Failed to load active scan snapshot {fpath}: {e}")
+
+    def _count_source_loc(self, codebase_path: str) -> int:
+        """Count non-empty lines across recognized source files."""
+        source_exts = {
+            '.py', '.js', '.ts', '.tsx', '.jsx', '.java', '.c', '.cpp', '.cc', '.cxx', '.h', '.hpp',
+            '.go', '.rb', '.php', '.cs', '.swift', '.kt', '.scala', '.rs', '.r', '.lua', '.sh', '.dockerfile'
+        }
+        total_loc = 0
+
+        for file_path in Path(codebase_path).rglob('*'):
+            if not file_path.is_file() or file_path.suffix.lower() not in source_exts:
+                continue
+            try:
+                with file_path.open('r', encoding='utf-8', errors='ignore') as handle:
+                    total_loc += sum(1 for line in handle if line.strip())
+            except OSError:
+                continue
+
+        return total_loc
 
     def update_scan(self, scan_id: str, **updates) -> bool:
         scan_info = self._active_scans.get(scan_id)
@@ -248,8 +283,9 @@ class ScanManager:
             scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Replay completed with status: {final_state['status']}")
 
             confirmed = sum(1 for f in final_state["findings"] if f["final_status"] == "confirmed")
-            skipped = sum(1 for f in final_state["findings"] if f["final_status"] == "skipped")
+            skipped = sum(1 for f in final_state["findings"] if f.get("llm_verdict") == "FALSE_POSITIVE")
             failed = sum(1 for f in final_state["findings"] if f["final_status"] == "failed")
+            unproven = sum(1 for f in final_state["findings"] if f["final_status"] not in {"confirmed", "failed"})
 
             start = datetime.fromisoformat(final_state["start_time"])
             end = datetime.fromisoformat(final_state["end_time"]) if final_state["end_time"] else datetime.utcnow()
@@ -265,14 +301,17 @@ class ScanManager:
                 confirmed_vulns=confirmed,
                 false_positives=skipped,
                 failed=failed,
-                total_cost_usd=final_state["total_cost_usd"],
+                total_cost_usd=(exact_total_cost if exact_total_cost > 0 else final_state["total_cost_usd"]),
                 duration_s=duration,
                 start_time=final_state["start_time"],
                 end_time=final_state["end_time"],
                 findings=[dict(f) for f in final_state["findings"]],
                 detected_language=scan_info.get("detected_language"),
                 language_info=scan_info.get("language_info"),
-                logs=scan_info.get("logs", [])
+                total_loc=(scan_info.get("language_info") or {}).get("total_loc", 0),
+                unproven_findings=unproven,
+                logs=scan_info.get("logs", []),
+                scan_openrouter_usage=[dict(u) for u in final_state.get("scan_openrouter_usage", []) if isinstance(u, dict)]
             )
 
             self._save_result(result)
@@ -283,7 +322,7 @@ class ScanManager:
                 result=result,
                 findings=[dict(f) for f in final_state["findings"]]
             )
-            self._remove_active_snapshot(scan_id)
+            self._retire_terminal_scan(scan_id)
 
             get_code_ingester().cleanup(scan_id)
 
@@ -314,12 +353,16 @@ class ScanManager:
                 end_time=datetime.utcnow().isoformat(),
                 findings=[],
                 detected_language=scan_info.get("detected_language"),
-                language_info=scan_info.get("language_info")
+                language_info=scan_info.get("language_info"),
+                total_loc=(scan_info.get("language_info") or {}).get("total_loc", 0),
+                unproven_findings=0,
+                logs=scan_info.get("logs", []),
+                scan_openrouter_usage=[dict(u) for u in final_state.get("scan_openrouter_usage", []) if isinstance(u, dict)]
             )
 
             self._save_result(result)
             self.update_scan(scan_id, status="failed", progress=100, result=result)
-            self._remove_active_snapshot(scan_id)
+            self._retire_terminal_scan(scan_id)
             return result
 
     async def run_scan_async(
@@ -374,18 +417,29 @@ class ScanManager:
             agent.set_scan_manager(self)
             
             # Detect all languages in the codebase
-            lang_info = agent._detect_all_languages(scan_info["codebase_path"])
-            detected_language = lang_info['primary']
+            from agents.agentic_discovery import get_agentic_discovery
+            lang_profile = get_agentic_discovery()._profile_languages(scan_info["codebase_path"])
+            detected_language = lang_profile.primary
             
+            total_loc = self._count_source_loc(scan_info["codebase_path"])
+
             scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Detected primary language: {detected_language}")
-            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] All languages found: {', '.join(lang_info['all_languages'])}")
-            for lang, count in sorted(lang_info['language_stats'].items(), key=lambda x: x[1], reverse=True):
-                pct = (count / lang_info['total_files']) * 100 if lang_info['total_files'] > 0 else 0
+            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] All languages found: {', '.join(lang_profile.all_languages)}")
+            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Total source files: {lang_profile.total_files}")
+            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Total LOC: {total_loc}")
+            for lang, count in sorted(lang_profile.language_stats.items(), key=lambda x: x[1], reverse=True):
+                pct = (count / lang_profile.total_files) * 100 if lang_profile.total_files > 0 else 0
                 scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}]   - {lang}: {count} files ({pct:.1f}%)")
             
             # Store language info in scan state
             scan_info["detected_language"] = detected_language
-            scan_info["language_info"] = lang_info
+            scan_info["language_info"] = {
+                'primary': lang_profile.primary,
+                'all_languages': lang_profile.all_languages,
+                'language_stats': lang_profile.language_stats,
+                'total_files': lang_profile.total_files,
+                'total_loc': total_loc
+            }
             scan_info["progress"] = 20
             self._persist_active_scan(scan_id)
             
@@ -401,6 +455,7 @@ class ScanManager:
                 cwes=scan_info["cwes"],
                 scan_id=scan_id,
                 detected_language=detected_language,
+                model_mode=scan_info.get("model_mode"),
                 openrouter_api_key=scan_info.get("openrouter_api_key")
             )
             
@@ -418,9 +473,17 @@ class ScanManager:
             scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Scan completed with status: {final_state['status']}")
             
             # Process results
+            exact_scan_usage = [dict(u) for u in final_state.get("scan_openrouter_usage", []) if isinstance(u, dict)]
+            api_key_for_usage = scan_info.get("openrouter_api_key") or settings.get_openrouter_api_key()
+            if exact_scan_usage and api_key_for_usage:
+                exact_scan_usage = [rehydrate_openrouter_usage(u, api_key_for_usage) for u in exact_scan_usage]
+                final_state["scan_openrouter_usage"] = exact_scan_usage
+            exact_total_cost = sum(float((u or {}).get("cost_usd", 0.0) or 0.0) for u in exact_scan_usage)
+
             confirmed = sum(1 for f in final_state["findings"] if f["final_status"] == "confirmed")
-            skipped = sum(1 for f in final_state["findings"] if f["final_status"] == "skipped")
+            skipped = sum(1 for f in final_state["findings"] if f.get("llm_verdict") == "FALSE_POSITIVE")
             failed = sum(1 for f in final_state["findings"] if f["final_status"] == "failed")
+            unproven = sum(1 for f in final_state["findings"] if f["final_status"] not in {"confirmed", "failed"})
             
             # Calculate duration
             start = datetime.fromisoformat(final_state["start_time"])
@@ -437,14 +500,17 @@ class ScanManager:
                 confirmed_vulns=confirmed,
                 false_positives=skipped,
                 failed=failed,
-                total_cost_usd=final_state["total_cost_usd"],
+                total_cost_usd=(exact_total_cost if exact_total_cost > 0 else final_state["total_cost_usd"]),
                 duration_s=duration,
                 start_time=final_state["start_time"],
                 end_time=final_state["end_time"],
                 findings=[dict(f) for f in final_state["findings"]],
                 detected_language=scan_info.get("detected_language"),
                 language_info=scan_info.get("language_info"),
-                logs=scan_info.get("logs", [])
+                total_loc=(scan_info.get("language_info") or {}).get("total_loc", 0),
+                unproven_findings=unproven,
+                logs=scan_info.get("logs", []),
+                scan_openrouter_usage=exact_scan_usage,
             )
             
             # Save result
@@ -458,7 +524,7 @@ class ScanManager:
                 result=result,
                 findings=[dict(f) for f in final_state["findings"]]
             )
-            self._remove_active_snapshot(scan_id)
+            self._retire_terminal_scan(scan_id)
             
             # Cleanup vector store
             get_code_ingester().cleanup(scan_id)
@@ -490,12 +556,15 @@ class ScanManager:
                 end_time=datetime.utcnow().isoformat(),
                 findings=[],
                 detected_language=scan_info.get("detected_language"),
-                language_info=scan_info.get("language_info")
+                language_info=scan_info.get("language_info"),
+                total_loc=(scan_info.get("language_info") or {}).get("total_loc", 0),
+                unproven_findings=0,
+                logs=scan_info.get("logs", [])
             )
             
             self._save_result(result)
             self.update_scan(scan_id, status="failed", progress=100, result=result)
-            self._remove_active_snapshot(scan_id)
+            self._retire_terminal_scan(scan_id)
             return result
     
     def _save_result(self, result: ScanResult):
@@ -516,7 +585,7 @@ class ScanManager:
                 writer.writerow([
                     'scan_id', 'status', 'model_name', 'cwes', 'total_findings',
                     'confirmed_vulns', 'false_positives', 'failed', 'total_cost_usd',
-                    'duration_s', 'start_time', 'end_time'
+                    'duration_s', 'start_time', 'end_time', 'total_loc', 'unproven_findings'
                 ])
             
             writer.writerow([
@@ -531,7 +600,9 @@ class ScanManager:
                 result.total_cost_usd,
                 result.duration_s,
                 result.start_time,
-                result.end_time
+                result.end_time,
+                result.total_loc,
+                result.unproven_findings
             ])
         
         # Optional snapshot for replay support
@@ -602,7 +673,9 @@ class ScanManager:
         if os.path.exists(json_path):
             with open(json_path, 'r') as f:
                 data = json.load(f)
-                return ScanResult(**data)
+                allowed_fields = {field.name for field in fields(ScanResult)}
+                filtered = {key: value for key, value in data.items() if key in allowed_fields}
+                return ScanResult(**filtered)
         
         return None
     
@@ -621,10 +694,35 @@ class ScanManager:
                 reader = csv.DictReader(f)
                 rows = list(reader)
                 
-                # Reverse to get newest first
+                # Reverse to get newest first, then keep the newest row per scan_id
                 rows.reverse()
+                seen = set()
+                deduped_rows = []
+                for row in rows:
+                    scan_id = row.get('scan_id')
+                    if scan_id in seen:
+                        continue
+                    seen.add(scan_id)
+                    deduped_rows.append(row)
                 
-                for row in rows[offset:offset + limit]:
+                active_like_statuses = {"running", "checking", "cloning", "created", "ingesting", "investigating", "generating_pov", "validating_pov", "running_pov", "pending"}
+                for row in deduped_rows[offset:offset + limit]:
+                    scan_id = row.get('scan_id')
+                    result = self.get_scan_result(scan_id) if scan_id else None
+                    if result:
+                        row = {
+                            **row,
+                            'status': result.status,
+                            'model_name': result.model_name or row.get('model_name'),
+                            'findings_count': str(result.total_findings),
+                            'confirmed_vulns': str(result.confirmed_vulns),
+                            'false_positives': str(result.false_positives),
+                            'failed': str(result.failed),
+                            'created_at': result.start_time or row.get('created_at'),
+                            'end_time': result.end_time or row.get('end_time'),
+                        }
+                    elif scan_id not in self._active_scans and row.get('status') in active_like_statuses:
+                        continue
                     history.append(row)
         
         return history
@@ -641,15 +739,199 @@ class ScanManager:
         
         return []
     
-    def cancel_scan(self, scan_id: str) -> bool:
+    def cancel_scan(self, scan_id: str) -> Tuple[bool, str]:
         """Cancel a running scan"""
+        # First check active scans
         if scan_id in self._active_scans:
             scan_info = self._active_scans[scan_id]
-            if scan_info["status"] in {"running", "checking", "cloning", "created", "interrupted"}:
+            if scan_info["status"] in {"running", "checking", "cloning", "created", "interrupted", "ingesting", "investigating", "generating_pov", "validating_pov", "running_pov"}:
                 scan_info["status"] = "cancelled"
+                scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Scan cancelled by user request")
                 self._persist_active_scan(scan_id)
-                return True
-        return False
+                return True, f"Scan {scan_id} cancelled"
+            else:
+                return False, f"Scan already {scan_info['status']}"
+        
+        # Check if scan exists in saved results (stuck scan from previous run)
+        result = self.get_scan_result(scan_id)
+        if result:
+            # Scan exists but is not active - it may be stuck
+            if result.status in {"running", "investigating", "generating_pov", "validating_pov", "running_pov", "checking", "cloning", "created", "ingesting"}:
+                # Update the result to cancelled
+                result.status = "cancelled"
+                result.logs.append(f"[{datetime.utcnow().isoformat()}] Scan cancelled by user request")
+                self._save_result(result)
+                return True, f"Stuck scan {scan_id} marked as cancelled"
+            else:
+                return False, f"Scan already {result.status}"
+        
+        return False, f"Scan {scan_id} not found"
+    
+    def stop_scan(self, scan_id: str) -> Tuple[bool, str]:
+        """
+        Force stop a running scan immediately.
+        This is more aggressive than cancel - it marks the scan as stopped
+        and will cause the scan to abort on its next check.
+        
+        Returns:
+            (success, message) tuple
+        """
+        # First check active scans
+        if scan_id in self._active_scans:
+            scan_info = self._active_scans[scan_id]
+            current_status = scan_info.get("status", "unknown")
+            
+            if current_status in {"completed", "failed", "cancelled", "stopped"}:
+                return False, f"Scan already {current_status}"
+            
+            # Force stop the scan - mark as failed with stopped status
+            scan_info["status"] = "failed"
+            scan_info["error"] = "Scan force-stopped by user"
+            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Scan force-stopped by user")
+            scan_info["end_time"] = datetime.utcnow().isoformat()
+            self._persist_active_scan(scan_id)
+            
+            # Create a failed result
+            result = ScanResult(
+                scan_id=scan_id,
+                status="failed",
+                codebase_path=scan_info.get("codebase_path", ""),
+                model_name=scan_info.get("model_name", ""),
+                cwes=scan_info.get("cwes", []),
+                total_findings=len(scan_info.get("findings", [])),
+                confirmed_vulns=0,
+                false_positives=0,
+                failed=0,
+                total_cost_usd=scan_info.get("total_cost_usd", 0.0),
+                duration_s=0.0,
+                start_time=scan_info.get("created_at", datetime.utcnow().isoformat()),
+                end_time=datetime.utcnow().isoformat(),
+                findings=scan_info.get("findings", []),
+                scan_openrouter_usage=scan_info.get("scan_openrouter_usage", []),
+                detected_language=scan_info.get("detected_language"),
+                language_info=scan_info.get("language_info"),
+                logs=scan_info.get("logs", [])
+            )
+            
+            # Save the failed result
+            self._save_result(result)
+            
+            # Clean up
+            self._remove_active_snapshot(scan_id)
+            get_code_ingester().cleanup(scan_id)
+            
+            return True, f"Scan {scan_id} stopped successfully"
+        
+        # Check if scan exists in saved results (stuck scan from previous run)
+        result = self.get_scan_result(scan_id)
+        if result:
+            # Scan exists but is not active - it may be stuck
+            if result.status in {"running", "investigating", "generating_pov", "validating_pov", "running_pov", "checking", "cloning", "created", "ingesting", "interrupted"}:
+                # Update the result to failed
+                result.status = "failed"
+                result.error = "Scan force-stopped by user"
+                result.logs.append(f"[{datetime.utcnow().isoformat()}] Scan force-stopped by user")
+                self._save_result(result)
+                return True, f"Stuck scan {scan_id} marked as failed"
+            else:
+                return False, f"Scan already {result.status}"
+        
+        return False, f"Scan {scan_id} not found"
+    
+    def delete_scan(self, scan_id: str) -> Tuple[bool, str]:
+        """
+        Delete a scan and all its associated data.
+        Only works for scans that are not currently running.
+        
+        Returns:
+            (success, message) tuple
+        """
+        # Check if scan is in active scans
+        if scan_id in self._active_scans:
+            scan_info = self._active_scans[scan_id]
+            current_status = scan_info.get("status", "unknown")
+            
+            if current_status in {"running", "checking", "cloning", "ingesting", "investigating", "generating_pov", "validating_pov", "running_pov"}:
+                return False, f"Cannot delete scan while it is {current_status}. Stop it first."
+            
+            # Remove from active scans
+            del self._active_scans[scan_id]
+            self._remove_active_snapshot(scan_id)
+        
+        # Also check if scan exists as a saved result (for scans not in active_scans)
+        result = self.get_scan_result(scan_id)
+        if not result and scan_id not in self._active_scans:
+            return False, f"Scan {scan_id} not found"
+        
+        # Remove result file if exists
+        result_path = os.path.join(self._runs_dir, f"{scan_id}.json")
+        if os.path.exists(result_path):
+            os.remove(result_path)
+        
+        # Remove from history CSV
+        self._remove_from_history(scan_id)
+        
+        # Remove snapshot if exists
+        snapshot_path = os.path.join(settings.SNAPSHOT_DIR, scan_id)
+        if os.path.exists(snapshot_path):
+            shutil.rmtree(snapshot_path, ignore_errors=True)
+        
+        # Cleanup vector store
+        get_code_ingester().cleanup(scan_id)
+        
+        return True, f"Scan {scan_id} deleted successfully"
+    
+    def _remove_from_history(self, scan_id: str):
+        """Remove a scan from the history CSV"""
+        csv_path = os.path.join(self._runs_dir, "scan_history.csv")
+        if not os.path.exists(csv_path):
+            return
+        
+        try:
+            # Read all rows
+            with open(csv_path, 'r', newline='') as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+                fieldnames = reader.fieldnames
+            
+            # Filter out the scan to delete
+            rows = [r for r in rows if r.get('scan_id') != scan_id]
+            
+            # Write back
+            with open(csv_path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+        except Exception as e:
+            print(f"[ScanManager] Failed to remove {scan_id} from history: {e}")
+    
+    def get_active_scans(self) -> List[Dict[str, Any]]:
+        """Get list of all active/in-progress scans"""
+        active = []
+        active_statuses = {"running", "checking", "cloning", "created", "ingesting", 
+                         "investigating", "generating_pov", "validating_pov", "running_pov",
+                         "pending"}
+        terminal_statuses = {"completed", "failed", "cancelled", "stopped"}
+        stale_ids = []
+        for scan_id, scan_info in list(self._active_scans.items()):
+            status = scan_info.get("status", "unknown")
+            if status in terminal_statuses:
+                stale_ids.append(scan_id)
+                continue
+            if status in active_statuses:
+                active.append({
+                    "scan_id": scan_id,
+                    "status": status,
+                    "progress": scan_info.get("progress", 0),
+                    "created_at": scan_info.get("created_at"),
+                    "model_name": scan_info.get("model_name"),
+                    "codebase_path": scan_info.get("codebase_path"),
+                    "detected_language": scan_info.get("detected_language"),
+                    "findings_count": len(scan_info.get("findings", []))
+                })
+        for scan_id in stale_ids:
+            self._retire_terminal_scan(scan_id)
+        return active
     
     def cleanup_scan(self, scan_id: str):
         """Clean up scan resources"""

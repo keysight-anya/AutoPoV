@@ -2,20 +2,21 @@
 
 <cite>
 **Referenced Files in This Document**
+- [README.md](file://README.md)
 - [app/main.py](file://app/main.py)
 - [app/agent_graph.py](file://app/agent_graph.py)
 - [app/scan_manager.py](file://app/scan_manager.py)
 - [app/config.py](file://app/config.py)
-- [app/policy.py](file://app/policy.py)
 - [app/learning_store.py](file://app/learning_store.py)
 - [agents/__init__.py](file://agents/__init__.py)
 - [agents/ingest_codebase.py](file://agents/ingest_codebase.py)
+- [agents/agentic_discovery.py](file://agents/agentic_discovery.py)
 - [agents/investigator.py](file://agents/investigator.py)
-- [agents/verifier.py](file://agents/verifier.py)
-- [agents/docker_runner.py](file://agents/docker_runner.py)
-- [agents/heuristic_scout.py](file://agents/heuristic_scout.py)
-- [agents/llm_scout.py](file://agents/llm_scout.py)
-- [prompts.py](file://prompts.py)
+- [agents/pov_tester.py](file://agents/pov_tester.py)
+- [Dockerfile.backend](file://Dockerfile.backend)
+- [docker-compose.yml](file://docker-compose.yml)
+- [requirements.txt](file://requirements.txt)
+- [frontend/package.json](file://frontend/package.json)
 </cite>
 
 ## Table of Contents
@@ -31,273 +32,227 @@
 10. [Appendices](#appendices)
 
 ## Introduction
-This document describes the architecture and design of AutoPoV, a multi-agent vulnerability research platform built around LangGraph state machines. The system orchestrates autonomous agents to detect, investigate, and validate vulnerabilities across codebases. It integrates external tools (CodeQL, Docker, ChromaDB) and a Policy Agent/Learning Store to continuously improve model routing and outcomes. The platform supports both synchronous and asynchronous execution, real-time streaming of scan logs, and a hybrid validation pipeline that combines static analysis, unit testing, and LLM-based checks.
+This document describes the high-level architecture and design of AutoPoV, an autonomous, agentic system for discovering, investigating, generating, and validating exploitable vulnerabilities. The system is built around a LangGraph-based agent orchestration engine, stateful workflow management, and conditional routing. It integrates external tools (CodeQL, Docker, ChromaDB, Joern), a learning store for self-improvement, and a FastAPI backend with real-time streaming and robust security controls. The document also covers infrastructure requirements, system context diagrams, cross-cutting concerns (security, monitoring, scalability), and the technology stack.
 
 ## Project Structure
-AutoPoV is organized into cohesive layers:
-- API Layer: FastAPI endpoints manage scans, streaming logs, reports, and administrative tasks.
-- Orchestration Layer: LangGraph-based Agent Graph defines the state machine and routing logic.
-- Agent Layer: Specialized agents implement vulnerability stages (ingest, codeql, investigate, generate PoV, validate PoV, run in Docker).
-- Persistence and Policy: Learning Store records outcomes; Policy Router selects models based on routing mode and learned signals.
-- Configuration: Centralized settings define runtime behavior, tool availability, and resource limits.
+AutoPoV is organized into three primary layers:
+- Backend API and Orchestration: FastAPI application, agent graph, scan lifecycle, configuration, and learning store.
+- Agents: Specialized modules implementing discovery, investigation, exploit generation, validation, and runtime execution.
+- Frontend: React-based web UI communicating with the backend via REST and Server-Sent Events (SSE).
 
 ```mermaid
 graph TB
-subgraph "API Layer"
-API["FastAPI app<br/>REST endpoints"]
-end
-subgraph "Orchestration"
-AG["Agent Graph (LangGraph)<br/>State Machine"]
+subgraph "Backend"
+API["FastAPI App<br/>app/main.py"]
+AG["Agent Graph<br/>app/agent_graph.py"]
+SM["Scan Manager<br/>app/scan_manager.py"]
+CFG["Settings & Config<br/>app/config.py"]
+LS["Learning Store<br/>app/learning_store.py"]
 end
 subgraph "Agents"
-I["Ingest Codebase"]
-CQ["CodeQL Runner"]
-INV["Investigator"]
-GEN["PoV Generator"]
-VAL["PoV Validator"]
-DR["Docker Runner"]
+AC["Code Ingestion<br/>agents/ingest_codebase.py"]
+AD["Agentic Discovery<br/>agents/agentic_discovery.py"]
+INV["Investigator<br/>agents/investigator.py"]
+PT["PoV Tester<br/>agents/pov_tester.py"]
 end
-subgraph "Persistence & Policy"
-LS["Learning Store (SQLite)"]
-POL["Policy Router"]
+subgraph "External Systems"
+CH["ChromaDB"]
+CO["CodeQL CLI"]
+DJ["Docker Engine"]
+JR["Joern"]
 end
-subgraph "External Tools"
-CODEQL["CodeQL CLI"]
-DOCK["Docker Engine"]
-CHROMA["ChromaDB"]
-end
-API --> AG
-AG --> I
-AG --> CQ
+FE["React Frontend<br/>frontend/package.json"]
+FE --> API
+API --> SM
+SM --> AG
+AG --> AC
+AG --> AD
 AG --> INV
-AG --> GEN
-AG --> VAL
-AG --> DR
-INV --> POL
-VAL --> POL
-I --> CHROMA
-CQ --> CODEQL
-DR --> DOCK
-INV --> LS
-VAL --> LS
+AG --> PT
+AC --> CH
+AD --> CO
+INV --> CH
+PT --> DJ
+INV --> JR
+API --> LS
 ```
 
 **Diagram sources**
-- [app/main.py:114-768](file://app/main.py#L114-L768)
-- [app/agent_graph.py:82-169](file://app/agent_graph.py#L82-L169)
-- [app/scan_manager.py:47-73](file://app/scan_manager.py#L47-L73)
-- [app/policy.py:12-40](file://app/policy.py#L12-L40)
-- [app/learning_store.py:14-256](file://app/learning_store.py#L14-L256)
+- [app/main.py:165-212](file://app/main.py#L165-L212)
+- [app/agent_graph.py:137-229](file://app/agent_graph.py#L137-L229)
+- [app/scan_manager.py:58-133](file://app/scan_manager.py#L58-L133)
+- [app/config.py:14-342](file://app/config.py#L14-L342)
+- [app/learning_store.py:14-200](file://app/learning_store.py#L14-L200)
+- [agents/ingest_codebase.py:107-200](file://agents/ingest_codebase.py#L107-L200)
+- [agents/agentic_discovery.py:50-200](file://agents/agentic_discovery.py#L50-L200)
+- [agents/investigator.py:38-200](file://agents/investigator.py#L38-L200)
+- [agents/pov_tester.py:18-200](file://agents/pov_tester.py#L18-L200)
+- [frontend/package.json:1-34](file://frontend/package.json#L1-L34)
 
 **Section sources**
-- [app/main.py:114-768](file://app/main.py#L114-L768)
-- [app/agent_graph.py:82-169](file://app/agent_graph.py#L82-L169)
-- [app/scan_manager.py:47-73](file://app/scan_manager.py#L47-L73)
+- [README.md:89-124](file://README.md#L89-L124)
+- [app/main.py:165-212](file://app/main.py#L165-L212)
+- [app/agent_graph.py:137-229](file://app/agent_graph.py#L137-L229)
+- [app/scan_manager.py:58-133](file://app/scan_manager.py#L58-L133)
+- [app/config.py:14-342](file://app/config.py#L14-L342)
+- [app/learning_store.py:14-200](file://app/learning_store.py#L14-L200)
+- [agents/ingest_codebase.py:107-200](file://agents/ingest_codebase.py#L107-L200)
+- [agents/agentic_discovery.py:50-200](file://agents/agentic_discovery.py#L50-L200)
+- [agents/investigator.py:38-200](file://agents/investigator.py#L38-L200)
+- [agents/pov_tester.py:18-200](file://agents/pov_tester.py#L18-L200)
+- [frontend/package.json:1-34](file://frontend/package.json#L1-L34)
 
 ## Core Components
-- FastAPI Application: Exposes endpoints for initiating scans (Git, ZIP, paste), replaying scans, streaming logs, retrieving results, managing API keys, and administrative cleanup.
-- Agent Graph (LangGraph): Defines a state machine with nodes for ingestion, CodeQL analysis, investigation, PoV generation, validation, Docker execution, and logging outcomes. Edges encode conditional routing based on context and outcomes.
-- Scan Manager: Manages scan lifecycle, state, persistence, concurrency, and metrics. Bridges API and Agent Graph.
+- FastAPI Backend: Provides REST endpoints for scan initiation, status, streaming logs, replay, cancellation, and administrative operations. Implements CORS, CSRF protection, and rate-limited authentication.
+- Agent Graph (LangGraph): Defines a stateful workflow with nodes for ingestion, discovery, investigation, exploit generation, validation, and runtime execution. Conditional edges route based on confidence thresholds, validation outcomes, and retry policies.
+- Scan Manager: Manages scan lifecycle, persistence, concurrency, and background execution. Maintains active scans, snapshots, and results.
+- Configuration: Centralized settings for models, tools, storage, parallelism, and safety controls.
+- Learning Store: SQLite-backed persistence for agent outcomes enabling adaptive model routing and self-improvement.
 - Agents:
-  - Ingest Codebase: Loads code into ChromaDB for retrieval-augmented investigation.
-  - CodeQL Runner: Creates databases, executes queries, parses SARIF, and merges autonomous discovery results.
-  - Investigator: Uses LLMs with RAG and optional Joern analysis to decide vulnerability veracity.
-  - Verifier: Generates PoV scripts and validates them via static analysis, unit tests, and LLM fallback.
-  - Docker Runner: Executes PoVs in isolated containers with strict resource limits.
-  - Heuristic and LLM Scouts: Lightweight candidate discovery for autonomous exploration.
-- Policy Router: Selects models for each stage based on routing mode (fixed, auto, learning).
-- Learning Store: Persists investigation and PoV outcomes to drive model recommendations.
+  - Code Ingestion: Chunks code, computes embeddings, and persists to ChromaDB.
+  - Agentic Discovery: Integrates CodeQL, Semgrep, LLM scouts, and heuristics with language profiling and triage.
+  - Investigator: LLM + RAG analysis to classify findings as REAL or FALSE_POSITIVE with confidence.
+  - PoV Tester: Executes generated exploits in targeted harnesses or containers to confirm exploitability.
+- Infrastructure: Docker Compose for backend, Ollama, and frontend; Dockerfile.backend installs CodeQL and Docker CLI.
 
 **Section sources**
-- [app/main.py:204-584](file://app/main.py#L204-L584)
-- [app/agent_graph.py:82-169](file://app/agent_graph.py#L82-L169)
-- [app/scan_manager.py:47-115](file://app/scan_manager.py#L47-L115)
-- [agents/investigator.py:37-519](file://agents/investigator.py#L37-L519)
-- [agents/verifier.py:42-562](file://agents/verifier.py#L42-L562)
-- [agents/docker_runner.py:27-377](file://agents/docker_runner.py#L27-L377)
-- [agents/heuristic_scout.py:13-242](file://agents/heuristic_scout.py#L13-L242)
-- [agents/llm_scout.py:32-208](file://agents/llm_scout.py#L32-L208)
-- [app/policy.py:12-40](file://app/policy.py#L12-L40)
-- [app/learning_store.py:14-256](file://app/learning_store.py#L14-L256)
+- [app/main.py:257-286](file://app/main.py#L257-L286)
+- [app/agent_graph.py:111-229](file://app/agent_graph.py#L111-L229)
+- [app/scan_manager.py:58-133](file://app/scan_manager.py#L58-L133)
+- [app/config.py:14-342](file://app/config.py#L14-L342)
+- [app/learning_store.py:14-200](file://app/learning_store.py#L14-L200)
+- [agents/ingest_codebase.py:107-200](file://agents/ingest_codebase.py#L107-L200)
+- [agents/agentic_discovery.py:50-200](file://agents/agentic_discovery.py#L50-L200)
+- [agents/investigator.py:38-200](file://agents/investigator.py#L38-L200)
+- [agents/pov_tester.py:18-200](file://agents/pov_tester.py#L18-L200)
+- [Dockerfile.backend:1-80](file://Dockerfile.backend#L1-L80)
+- [docker-compose.yml:1-66](file://docker-compose.yml#L1-L66)
 
 ## Architecture Overview
-The system centers on a LangGraph state machine that orchestrates agents through a deterministic, stateful workflow. The Agent Graph transitions between nodes based on outcomes and context, enabling autonomous routing decisions. The Policy Router dynamically selects models per stage, while the Learning Store accumulates outcomes to inform future routing.
+The system follows a stateful, agent-centric architecture:
+- Stateful Orchestration: LangGraph maintains ScanState and VulnerabilityState across nodes, enabling persistent context and deterministic routing.
+- Conditional Routing: Edges evaluate confidence, validation results, and retry counts to decide next steps.
+- Tool Integration: Agents invoke CodeQL, ChromaDB, Docker, and Joern depending on language and exploitability.
+- Persistence and Adaptation: Learning Store records outcomes to improve model selection and routing over time.
 
 ```mermaid
-sequenceDiagram
-participant Client as "Client"
-participant API as "FastAPI"
-participant SM as "ScanManager"
-participant AG as "AgentGraph"
-participant INV as "Investigator"
-participant VER as "Verifier"
-participant DR as "DockerRunner"
-Client->>API : "POST /api/scan/git"
-API->>SM : "create_scan()"
-API->>SM : "run_scan_async(scan_id)"
-SM->>AG : "run_scan(codebase_path, model, cwes)"
-AG->>INV : "investigate(current_finding)"
-INV-->>AG : "verdict, explanation, confidence"
-AG->>VER : "generate_pov()"
-VER-->>AG : "PoV script"
-AG->>VER : "validate_pov()"
-VER-->>AG : "validation result"
-AG->>DR : "run_pov()"
-DR-->>AG : "execution result"
-AG-->>SM : "final state"
-SM-->>API : "ScanResult"
-API-->>Client : "ScanResponse"
+graph TB
+A["FastAPI Endpoint"] --> B["ScanManager.create_scan"]
+B --> C["AgentGraph.compile()"]
+C --> D["Ingest Codebase"]
+D --> E["Run CodeQL/Semgrep/LangSmith"]
+E --> F["Investigate (LLM+RAG)"]
+F --> G{"Confidence ≥ threshold?"}
+G -- "Yes" --> H["Generate PoV Script"]
+G -- "No" --> I["Skip Finding"]
+H --> J["Validate (Static → Unit → Docker)"]
+J --> K{"Confirmed?"}
+K -- "Yes" --> L["Record in Learning Store"]
+K -- "No" --> M["Refine or Retry"]
+L --> N["Next Finding or End"]
+M --> J
+I --> N
 ```
 
 **Diagram sources**
-- [app/main.py:204-401](file://app/main.py#L204-L401)
-- [app/scan_manager.py:234-265](file://app/scan_manager.py#L234-L265)
-- [app/agent_graph.py:691-778](file://app/agent_graph.py#L691-L778)
-- [agents/investigator.py:270-433](file://agents/investigator.py#L270-L433)
-- [agents/verifier.py:90-224](file://agents/verifier.py#L90-L224)
-- [agents/docker_runner.py:62-192](file://agents/docker_runner.py#L62-L192)
+- [app/agent_graph.py:137-229](file://app/agent_graph.py#L137-L229)
+- [app/scan_manager.py:58-133](file://app/scan_manager.py#L58-L133)
+- [app/learning_store.py:14-200](file://app/learning_store.py#L14-L200)
 
 ## Detailed Component Analysis
 
-### Agent Graph and State Machine
-The Agent Graph defines a state machine with typed state for a scan and individual findings. Nodes encapsulate each vulnerability stage, and edges implement conditional routing based on outcomes and context.
-
-```mermaid
-flowchart TD
-START(["Entry: ingest_code"]) --> RUN_CODEQL["run_codeql"]
-RUN_CODEQL --> LOG_COUNT["log_findings_count"]
-LOG_COUNT --> INVESTIGATE["investigate"]
-INVESTIGATE --> DECIDE_GEN{"Should generate PoV?"}
-DECIDE_GEN --> |Yes| GEN["generate_pov"]
-DECIDE_GEN --> |No| SKIP["log_skip"]
-GEN --> VALIDATE["validate_pov"]
-VALIDATE --> DECIDE_RUN{"Run in Docker?"}
-DECIDE_RUN --> |Yes| DOCKER["run_in_docker"]
-DECIDE_RUN --> |Retry| GEN
-DECIDE_RUN --> |No| FAIL["log_failure"]
-DOCKER --> CONFIRM["log_confirmed"]
-CONFIRM --> MORE{"More findings?"}
-SKIP --> MORE
-FAIL --> MORE
-MORE --> |Yes| INVESTIGATE
-MORE --> |No| END(["End"])
-```
-
-**Diagram sources**
-- [app/agent_graph.py:82-169](file://app/agent_graph.py#L82-L169)
-
-Key behaviors:
-- Ingestion into ChromaDB for RAG-driven investigation.
-- CodeQL execution with language detection and SARIF parsing; fallback to autonomous discovery if unavailable.
-- Investigation using LLMs with optional Joern CPG analysis for specific CWEs.
-- Hybrid PoV validation pipeline: static analysis, unit tests, and LLM fallback.
-- Docker execution with resource limits and isolation.
-
-**Section sources**
-- [app/agent_graph.py:178-307](file://app/agent_graph.py#L178-L307)
-- [app/agent_graph.py:342-505](file://app/agent_graph.py#L342-L505)
-- [app/agent_graph.py:506-690](file://app/agent_graph.py#L506-L690)
-- [app/agent_graph.py:691-778](file://app/agent_graph.py#L691-L778)
-- [app/agent_graph.py:779-867](file://app/agent_graph.py#L779-L867)
-
-### Investigator Agent
-The Investigator performs LLM-based vulnerability analysis with RAG and optional Joern CPG analysis for use-after-free. It extracts token usage and cost, formats structured JSON responses, and records outcomes to the Learning Store.
+### LangGraph-Based Agent Orchestration
+- State Types: ScanState and VulnerabilityState encapsulate scan-wide and per-finding context, including tokens, costs, logs, and validation history.
+- Nodes: Ingestion, discovery, investigation, PoV generation, validation, refinement, runtime execution, and logging nodes.
+- Conditional Edges: Route based on confidence thresholds, validation outcomes, and retry limits.
+- Parallel Investigation: Optional batch processing of findings to accelerate throughput.
 
 ```mermaid
 classDiagram
-class VulnerabilityInvestigator {
-+investigate(scan_id, codebase_path, cwe_type, filepath, line_number, alert_message, model_name) Dict
-+batch_investigate(scan_id, codebase_path, alerts, progress_callback) List
--_get_code_context(scan_id, filepath, line_number, context_lines) str
--_get_rag_context(scan_id, cwe_type, filepath) str
--_run_joern_analysis(codebase_path, filepath, line_number, cwe_type) Optional~str~
--_get_llm(model_name) ChatLLM
--_calculate_actual_cost(model_name, prompt_tokens, completion_tokens) float
+class ScanState {
++string scan_id
++string status
++string codebase_path
++string model_name
++string model_mode
++string[] cwes
++VulnerabilityState[] findings
++Optional~VulnerabilityState[]~ preloaded_findings
++Optional~string~ detected_language
++int current_finding_idx
++string start_time
++Optional~string~ end_time
++float total_cost_usd
++int total_tokens
++Dict~string, Dict~string,int~~ tokens_by_model
++string[] logs
++Optional~string~ error
++int proofs_attempted
++int confirmed_count
++Optional~string~ openrouter_api_key
++bool rag_ready
++Optional~Dict~string,Any~~ rag_stats
++Dict[]string,Any~~ scan_openrouter_usage
 }
+class VulnerabilityState {
++Optional~string~ cve_id
++string filepath
++int line_number
++string cwe_type
++string code_chunk
++string llm_verdict
++string llm_explanation
++float confidence
++Optional~string~ pov_script
++Optional~string~ pov_path
++Optional~Dict~string,Any~~ pov_result
++int retry_count
++float inference_time_s
++float cost_usd
++Optional~string~ final_status
++Optional~string~ detected_language
++Optional~string~ source
++Optional~string~ model_used
++int prompt_tokens
++int completion_tokens
++int total_tokens
++Optional~string~ sifter_model
++Optional~Dict~string,int~~ sifter_tokens
++Optional~string~ architect_model
++Optional~Dict~string,int~~ architect_tokens
++Optional~Dict~string,Any~~ validation_result
++Optional~Dict[]string,Any~~ refinement_history
++Optional~Dict~string,Any~~ exploit_contract
++Optional~string~ execution_profile
+}
+class AgentGraph {
++set_scan_manager(scan_manager)
++_build_graph() StateGraph
++_node_ingest_code(state) ScanState
++_node_run_codeql(state) ScanState
++_node_investigate(state) ScanState
++_node_investigate_parallel(state) ScanState
++_should_generate_pov(state) str
++_should_run_pov(state) str
++_after_runtime_proof(state) str
++_has_more_findings(state) str
+}
+AgentGraph --> ScanState : "manages"
+AgentGraph --> VulnerabilityState : "updates"
 ```
 
 **Diagram sources**
-- [agents/investigator.py:37-519](file://agents/investigator.py#L37-L519)
+- [app/agent_graph.py:45-110](file://app/agent_graph.py#L45-L110)
+- [app/agent_graph.py:111-229](file://app/agent_graph.py#L111-L229)
 
 **Section sources**
-- [agents/investigator.py:270-433](file://agents/investigator.py#L270-L433)
-- [prompts.py:7-44](file://prompts.py#L7-L44)
+- [app/agent_graph.py:45-110](file://app/agent_graph.py#L45-L110)
+- [app/agent_graph.py:111-229](file://app/agent_graph.py#L111-L229)
 
-### Verifier Agent (PoV Generation and Validation)
-The Verifier generates PoV scripts and validates them using a hybrid pipeline: static analysis, unit test execution, and LLM-based validation. It records PoV outcomes to the Learning Store.
-
-```mermaid
-classDiagram
-class VulnerabilityVerifier {
-+generate_pov(cwe_type, filepath, line_number, vulnerable_code, explanation, code_context, target_language, model_name) Dict
-+validate_pov(pov_script, cwe_type, filepath, line_number, vulnerable_code) Dict
-+analyze_failure(cwe_type, filepath, line_number, explanation, failed_pov, execution_output, attempt_number, max_retries) Dict
--_get_llm(model_name) ChatLLM
--_validate_cwe_specific(pov_script, cwe_type) list
--_llm_validate_pov(pov_script, cwe_type, filepath, line_number) Dict
-}
-```
-
-**Diagram sources**
-- [agents/verifier.py:42-562](file://agents/verifier.py#L42-L562)
-
-**Section sources**
-- [agents/verifier.py:90-224](file://agents/verifier.py#L90-L224)
-- [agents/verifier.py:225-388](file://agents/verifier.py#L225-L388)
-- [prompts.py:46-121](file://prompts.py#L46-L121)
-
-### Docker Runner
-The Docker Runner executes PoVs in isolated containers with strict resource limits and no network access. It captures execution results and determines if the PoV triggered the vulnerability.
-
-```mermaid
-classDiagram
-class DockerRunner {
-+is_available() bool
-+run_pov(pov_script, scan_id, pov_id, extra_files) Dict
-+run_with_input(pov_script, input_data, scan_id, pov_id) Dict
-+run_binary_pov(pov_script, binary_data, scan_id, pov_id) Dict
-+batch_run(pov_scripts, scan_id, progress_callback) List
-+get_stats() Dict
--_get_client() DockerClient
-}
-```
-
-**Diagram sources**
-- [agents/docker_runner.py:27-377](file://agents/docker_runner.py#L27-L377)
-
-**Section sources**
-- [agents/docker_runner.py:62-192](file://agents/docker_runner.py#L62-L192)
-- [agents/docker_runner.py:193-310](file://agents/docker_runner.py#L193-L310)
-
-### Policy Router and Learning Store
-The Policy Router selects models for each stage based on routing mode (fixed, auto, learning). The Learning Store persists outcomes and computes model performance statistics to guide recommendations.
-
-```mermaid
-classDiagram
-class PolicyRouter {
-+select_model(stage, cwe, language) str
-}
-class LearningStore {
-+record_investigation(scan_id, cwe, filepath, language, source, verdict, confidence, model, cost_usd) void
-+record_pov(scan_id, cwe, model, cost_usd, success, validation_method) void
-+get_summary() dict
-+get_model_stats() dict
-+get_model_recommendation(stage, cwe, language) Optional~str~
-}
-PolicyRouter --> LearningStore : "reads performance"
-```
-
-**Diagram sources**
-- [app/policy.py:12-40](file://app/policy.py#L12-L40)
-- [app/learning_store.py:14-256](file://app/learning_store.py#L14-L256)
-
-**Section sources**
-- [app/policy.py:18-32](file://app/policy.py#L18-L32)
-- [app/learning_store.py:61-124](file://app/learning_store.py#L61-L124)
-- [app/learning_store.py:188-248](file://app/learning_store.py#L188-L248)
-
-### API and Real-Time Streaming
-The API exposes endpoints for initiating scans, replaying results, retrieving history, and streaming logs via Server-Sent Events. It integrates with Scan Manager and Agent Graph to orchestrate workloads.
+### Stateful Workflow Management
+- Scan Lifecycle: Creation, persistence, background execution, cancellation, and result serialization.
+- Concurrency: Thread-safe logs and locks per scan; background tasks for long-running operations.
+- Snapshots: Active scans persisted to disk to recover from backend restarts.
 
 ```mermaid
 sequenceDiagram
@@ -305,99 +260,231 @@ participant Client as "Client"
 participant API as "FastAPI"
 participant SM as "ScanManager"
 participant AG as "AgentGraph"
-Client->>API : "GET /api/scan/{scan_id}/stream"
-API->>API : "event_generator()"
-loop Every second
-API->>SM : "get_scan(scan_id)"
-SM-->>API : "scan_info"
-API-->>Client : "SSE log events"
-end
-API-->>Client : "SSE complete event"
+Client->>API : "POST /api/scan/git"
+API->>SM : "create_scan()"
+SM-->>API : "scan_id"
+API-->>Client : "ScanResponse"
+API->>SM : "run_scan_async(scan_id)"
+SM->>AG : "compile() and invoke()"
+AG-->>SM : "state updates (logs, findings)"
+SM-->>API : "status updates"
+API-->>Client : "SSE stream"
 ```
 
 **Diagram sources**
-- [app/main.py:548-584](file://app/main.py#L548-L584)
-- [app/scan_manager.py:419-494](file://app/scan_manager.py#L419-L494)
+- [app/main.py:289-371](file://app/main.py#L289-L371)
+- [app/scan_manager.py:58-133](file://app/scan_manager.py#L58-L133)
+- [app/agent_graph.py:137-229](file://app/agent_graph.py#L137-L229)
 
 **Section sources**
-- [app/main.py:204-401](file://app/main.py#L204-L401)
-- [app/main.py:548-584](file://app/main.py#L548-L584)
+- [app/scan_manager.py:58-133](file://app/scan_manager.py#L58-L133)
+- [app/main.py:289-371](file://app/main.py#L289-L371)
 
-## Dependency Analysis
-The system exhibits clear separation of concerns:
-- API depends on Scan Manager and Agent Graph.
-- Agent Graph depends on Policy Router, Learning Store, and agents.
-- Agents depend on external tools (CodeQL, Docker) and internal stores (ChromaDB, SQLite).
-- Configuration centralizes environment-dependent behavior.
+### Conditional Routing Mechanisms
+- Confidence Threshold: Findings below a configurable threshold are skipped.
+- Validation Outcomes: Confirmed vs. failed/expired findings drive routing to refinement or termination.
+- Retry Policy: Controlled retries with refinement loops.
+
+```mermaid
+flowchart TD
+Start(["Investigate Node"]) --> CheckConf["Confidence ≥ MIN_CONFIDENCE_FOR_POV?"]
+CheckConf --> |No| Skip["Log Skip"]
+CheckConf --> |Yes| Gen["Generate PoV"]
+Gen --> Validate["Validate (Static → Unit → Docker)"]
+Validate --> Confirmed{"Confirmed?"}
+Confirmed --> |Yes| Record["Record in Learning Store"]
+Confirmed --> |No| Refine["Refine/Retry"]
+Refine --> Validate
+Record --> Next{"More Findings?"}
+Skip --> Next
+Next --> |Yes| Investigate["Investigate Next Finding"]
+Next --> |No| End(["End"])
+```
+
+**Diagram sources**
+- [app/agent_graph.py:164-227](file://app/agent_graph.py#L164-L227)
+- [app/config.py:134-139](file://app/config.py#L134-L139)
+
+**Section sources**
+- [app/agent_graph.py:164-227](file://app/agent_graph.py#L164-L227)
+- [app/config.py:134-139](file://app/config.py#L134-L139)
+
+### External Tool Integration
+- CodeQL: Discovery and analysis orchestrated via agentic discovery with language-specific suites and fallbacks.
+- ChromaDB: Persistent vector store for semantic search; ingestion supports online and offline embeddings.
+- Docker: Sandboxed execution of PoV scripts; configurable timeouts and resource limits.
+- Joern: Optional CPG analysis for native memory safety issues.
 
 ```mermaid
 graph LR
-API["app/main.py"] --> SM["app/scan_manager.py"]
-SM --> AG["app/agent_graph.py"]
-AG --> POL["app/policy.py"]
-AG --> LS["app/learning_store.py"]
-AG --> INV["agents/investigator.py"]
-AG --> VER["agents/verifier.py"]
-AG --> DR["agents/docker_runner.py"]
-INV --> PROMPTS["prompts.py"]
-VER --> PROMPTS
-INV --> LS
-VER --> LS
-AG --> ICG["agents/ingest_codebase.py"]
-ICG --> CHROMA["ChromaDB"]
-AG --> CODEQL["CodeQL CLI"]
-AG --> DOCK["Docker Engine"]
+AD["Agentic Discovery"] --> CO["CodeQL CLI"]
+AC["Code Ingestion"] --> CH["ChromaDB"]
+INV["Investigator"] --> CH
+PT["PoV Tester"] --> DJ["Docker Engine"]
+INV --> JR["Joern"]
 ```
 
 **Diagram sources**
-- [app/main.py:13-28](file://app/main.py#L13-L28)
-- [app/agent_graph.py:19-29](file://app/agent_graph.py#L19-L29)
-- [agents/investigator.py:27-29](file://agents/investigator.py#L27-L29)
-- [agents/verifier.py:27-33](file://agents/verifier.py#L27-L33)
+- [agents/agentic_discovery.py:50-200](file://agents/agentic_discovery.py#L50-L200)
+- [agents/ingest_codebase.py:107-200](file://agents/ingest_codebase.py#L107-L200)
+- [agents/investigator.py:38-200](file://agents/investigator.py#L38-L200)
+- [agents/pov_tester.py:18-200](file://agents/pov_tester.py#L18-L200)
 
 **Section sources**
-- [app/main.py:13-28](file://app/main.py#L13-L28)
-- [app/agent_graph.py:19-29](file://app/agent_graph.py#L19-L29)
-- [agents/__init__.py:6-20](file://agents/__init__.py#L6-L20)
+- [agents/agentic_discovery.py:50-200](file://agents/agentic_discovery.py#L50-L200)
+- [agents/ingest_codebase.py:107-200](file://agents/ingest_codebase.py#L107-L200)
+- [agents/investigator.py:38-200](file://agents/investigator.py#L38-L200)
+- [agents/pov_tester.py:18-200](file://agents/pov_tester.py#L18-L200)
+
+### Learning Store and Adaptive Routing
+- Persistence: Records investigation outcomes and PoV runs with timestamps and costs.
+- Analytics: Aggregates model performance and suggests model recommendations per stage and context.
+- Feedback Loop: Improves routing decisions over time.
+
+```mermaid
+classDiagram
+class LearningStore {
++record_investigation(...)
++record_pov(...)
++get_summary() dict
++get_model_stats() dict
++get_model_recommendation(stage, cwe, language) Optional~string~
+}
+```
+
+**Diagram sources**
+- [app/learning_store.py:14-200](file://app/learning_store.py#L14-L200)
+
+**Section sources**
+- [app/learning_store.py:14-200](file://app/learning_store.py#L14-L200)
+
+### Frontend and Real-Time Streaming
+- Technology Stack: React, Vite, Tailwind, Axios, Recharts.
+- Communication: REST APIs and SSE for live logs and progress updates.
+- Pages: Dashboard, scan management, metrics, settings, and results.
+
+```mermaid
+graph TB
+FE["React Frontend"] --> API["FastAPI Backend"]
+API --> SSE["SSE Stream Logs"]
+FE --> SSE
+```
+
+**Diagram sources**
+- [frontend/package.json:1-34](file://frontend/package.json#L1-L34)
+- [app/main.py:769-806](file://app/main.py#L769-L806)
+
+**Section sources**
+- [frontend/package.json:1-34](file://frontend/package.json#L1-L34)
+- [app/main.py:769-806](file://app/main.py#L769-L806)
+
+## Dependency Analysis
+- Backend Dependencies: FastAPI, LangChain, LangGraph, ChromaDB, Docker SDK, GitPython, OpenRouter client, and others.
+- Containerization: Docker Compose provisions backend, Ollama, and frontend; volumes persist ChromaDB and results.
+- Tool Availability: Runtime checks for Docker, CodeQL, and Joern; environment-driven configuration.
+
+```mermaid
+graph TB
+REQ["requirements.txt"] --> FA["FastAPI"]
+REQ --> LC["LangChain"]
+REQ --> LG["LangGraph"]
+REQ --> CD["ChromaDB"]
+REQ --> DK["Docker SDK"]
+REQ --> GP["GitPython"]
+DC["docker-compose.yml"] --> BE["backend"]
+DC --> OL["ollama"]
+DC --> FE["frontend"]
+BE --> DF["Dockerfile.backend"]
+```
+
+**Diagram sources**
+- [requirements.txt:1-47](file://requirements.txt#L1-L47)
+- [docker-compose.yml:1-66](file://docker-compose.yml#L1-L66)
+- [Dockerfile.backend:1-80](file://Dockerfile.backend#L1-L80)
+
+**Section sources**
+- [requirements.txt:1-47](file://requirements.txt#L1-L47)
+- [docker-compose.yml:1-66](file://docker-compose.yml#L1-L66)
+- [Dockerfile.backend:1-80](file://Dockerfile.backend#L1-L80)
 
 ## Performance Considerations
-- Concurrency: Scan Manager uses a thread pool executor to run scans synchronously within an async loop, balancing CPU-bound tasks and I/O.
-- Cost Control: Configurable caps on LLM usage and costs; token usage extraction enables accurate billing.
-- Tool Availability: Graceful fallbacks when CodeQL or Docker are unavailable; autonomous discovery ensures continuity.
-- Memory and CPU Limits: Docker Runner enforces strict resource limits to prevent resource exhaustion.
-- Vector Store Efficiency: ChromaDB ingestion and retrieval optimized for RAG context; cleanup after scans reduces overhead.
+- Parallel Processing: Batch findings for investigation to reduce latency; tune worker count and rate limits.
+- Early Termination: Stop after a configurable number of confirmed findings to cap cost and time.
+- Chunking and Embeddings: Tune chunk size and overlap; prefer local embeddings for offline resilience.
+- Resource Limits: Configure Docker CPU/memory limits and timeouts; enforce per-request LLM timeouts.
+- Caching: Utilize analysis cache and prompt cache to reduce repeated work.
 
 [No sources needed since this section provides general guidance]
 
 ## Troubleshooting Guide
-Common issues and resolutions:
-- CodeQL not available: The Agent Graph falls back to autonomous discovery and LLM-only analysis.
-- Docker not available: PoV validation skips container execution; results indicate Docker unavailability.
-- LLM model selection failures: Policy Router defaults to auto router when learning store has no recommendation.
-- Streaming logs: Ensure SSE endpoint is polled and that Scan Manager maintains logs until completion.
-- Cost tracking: Verify token usage extraction and pricing calculations; adjust model mode and cost caps accordingly.
+- Health Checks: Use the health endpoint to verify Docker, CodeQL, and Joern availability.
+- Authentication: Ensure admin and API keys are configured; verify rate-limiting behavior.
+- Logs: Subscribe to SSE streams for real-time diagnostics; inspect persisted scan snapshots.
+- Tool Availability: Confirm Docker, CodeQL, and Joern binaries; adjust paths and timeouts in settings.
+- Storage: Verify persistent volumes for ChromaDB and results; ensure adequate disk space.
 
 **Section sources**
-- [app/agent_graph.py:256-300](file://app/agent_graph.py#L256-L300)
-- [agents/docker_runner.py:81-91](file://agents/docker_runner.py#L81-L91)
-- [app/policy.py:24-29](file://app/policy.py#L24-L29)
-- [app/scan_manager.py:419-494](file://app/scan_manager.py#L419-L494)
+- [app/main.py:257-267](file://app/main.py#L257-L267)
+- [app/config.py:201-249](file://app/config.py#L201-L249)
+- [app/scan_manager.py:175-197](file://app/scan_manager.py#L175-L197)
 
 ## Conclusion
-AutoPoV’s architecture leverages LangGraph to orchestrate a robust, stateful, and autonomous vulnerability research workflow. By combining CodeQL, LLMs, and hybrid validation, it achieves high-confidence detection and reproducible PoVs. The Policy Router and Learning Store enable continuous improvement, while the API and streaming mechanisms provide operational visibility and scalability.
+AutoPoV’s architecture centers on a stateful, conditional agent graph orchestrated by LangGraph, integrated with external tools and a learning store for continuous improvement. The FastAPI backend provides secure, scalable APIs with real-time streaming and robust lifecycle management. Infrastructure is containerized for ease of deployment, while configuration enables flexible model and tool choices. Together, these design choices enable autonomous, reproducible, and benchmarkable vulnerability research.
 
 [No sources needed since this section summarizes without analyzing specific files]
 
 ## Appendices
 
-### Technology Stack Choices and Trade-offs
-- LangGraph: Enables declarative state machines and conditional routing; trade-off is increased abstraction complexity.
-- ChromaDB: Provides efficient RAG for investigation; trade-off is dependency on persistent vector storage.
-- CodeQL: Strong static analysis coverage; trade-off is tool availability and query compilation time.
-- Docker: Ensures reproducibility and safety; trade-off is resource overhead and dependency on container runtime.
-- LLMs (Online/Offline): Flexibility in deployment; trade-off is cost and latency; token usage tracking mitigates risk.
-- SQLite Learning Store: Lightweight persistence; trade-off is limited concurrent writes compared to distributed systems.
+### System Context Diagram: From Code Ingestion to Exploit Validation
+```mermaid
+graph TB
+CI["Code Input<br/>Git/ZIP/Paste"] --> IG["Ingestion Agent"]
+IG --> CH["ChromaDB"]
+IG --> AD["Agentic Discovery"]
+AD --> CO["CodeQL CLI"]
+AD --> SG["Semgrep"]
+AD --> SC["LLM Scout"]
+AD --> HS["Heuristic Scout"]
+AD --> MR["Merge & Dedupe"]
+MR --> INV["Investigator Agent"]
+INV --> CH
+INV --> JR["Joern"]
+INV --> VR["Validation Agent"]
+VR --> ST["Static Validator"]
+VR --> UT["Unit Test Runner"]
+VR --> DR["Docker Runner"]
+DR --> PT["PoV Tester"]
+PT --> OUT["Confirmed Vulns"]
+INV --> LS["Learning Store"]
+PT --> LS
+```
+
+**Diagram sources**
+- [README.md:34-69](file://README.md#L34-L69)
+- [agents/agentic_discovery.py:50-200](file://agents/agentic_discovery.py#L50-L200)
+- [agents/ingest_codebase.py:107-200](file://agents/ingest_codebase.py#L107-L200)
+- [agents/investigator.py:38-200](file://agents/investigator.py#L38-L200)
+- [agents/pov_tester.py:18-200](file://agents/pov_tester.py#L18-L200)
+- [app/learning_store.py:14-200](file://app/learning_store.py#L14-L200)
+
+### Infrastructure Requirements
+- Backend: Python 3.11+, FastAPI, LangChain, LangGraph, ChromaDB, Docker SDK, GitPython.
+- Tools: Docker Desktop, CodeQL CLI, optional Joern.
+- Frontend: Node.js 20+, Vite, React, Tailwind.
+- Deployment: Docker Compose with persistent volumes for ChromaDB and results.
 
 **Section sources**
-- [app/config.py:162-232](file://app/config.py#L162-L232)
-- [app/learning_store.py:14-256](file://app/learning_store.py#L14-L256)
+- [README.md:130-140](file://README.md#L130-L140)
+- [requirements.txt:1-47](file://requirements.txt#L1-L47)
+- [docker-compose.yml:1-66](file://docker-compose.yml#L1-L66)
+- [Dockerfile.backend:1-80](file://Dockerfile.backend#L1-L80)
+
+### Cross-Cutting Concerns
+- Security: Two-tier authentication (Admin Key, API Key), rate limiting, CSRF protection, and optional sandboxing via Docker.
+- Monitoring: Real-time SSE logs, LangSmith tracing, and metrics endpoints.
+- Scalability: Parallel investigation, early termination, and configurable resource limits.
+
+**Section sources**
+- [app/main.py:196-212](file://app/main.py#L196-L212)
+- [app/config.py:127-131](file://app/config.py#L127-L131)
+- [app/config.py:133-139](file://app/config.py#L133-L139)

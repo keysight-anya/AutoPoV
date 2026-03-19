@@ -1,15 +1,25 @@
 #!/usr/bin/env python3
+import json
 import sys
-sys.path.insert(0, '/home/user/AutoPoV/autopov')
 
-import requests
+scan_id = sys.argv[1] if len(sys.argv) > 1 else "40745440-b559-4c57-ae86-f882ceba022e"
 
-API_KEY = "apov_yOBQlf4t_RXfIIDaTKQ51MgPbGbBx_aCJbCs6cORNXw"
-BASE_URL = "http://localhost:8000/api"
+with open(f"/home/user/AutoPoV/results/runs/{scan_id}.json", "r") as f:
+    d = json.load(f)
 
-scan_id = "99561b87-ec97-4a82-8454-e03a4884d327"
+print(f"Status: {d['status']}")
+print(f"Findings: {len(d['findings'])}")
+print(f"Confirmed: {sum(1 for f in d['findings'] if f.get('final_status')=='confirmed')}")
+print(f"End time: {d.get('end_time', 'None')}")
 
-headers = {"Authorization": f"Bearer {API_KEY}"}
-response = requests.get(f"{BASE_URL}/scan/{scan_id}", headers=headers)
-print(f"Status Code: {response.status_code}")
-print(f"Response: {response.json()}")
+# Check for duplicate keys
+keys = []
+for f in d['findings']:
+    key = f"{f.get('filepath')}:{f.get('line_number')}:{f.get('cwe_type')}"
+    keys.append(key)
+
+duplicates = [k for k in set(keys) if keys.count(k) > 1]
+if duplicates:
+    print(f"\nDuplicate keys found: {duplicates}")
+else:
+    print("\nNo duplicate keys")

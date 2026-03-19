@@ -56,10 +56,24 @@ class _SentenceTransformerEmbeddings:
         self._model = SentenceTransformer(model_name)
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        return self._model.encode(texts, convert_to_numpy=False, show_progress_bar=False)
+        vectors = self._model.encode(texts, convert_to_numpy=False, show_progress_bar=False)
+        return [_coerce_embedding_vector(vector) for vector in vectors]
 
     def embed_query(self, text: str) -> List[float]:
-        return self._model.encode(text, convert_to_numpy=False, show_progress_bar=False)
+        vector = self._model.encode(text, convert_to_numpy=False, show_progress_bar=False)
+        return _coerce_embedding_vector(vector)
+
+
+def _coerce_embedding_vector(vector) -> List[float]:
+    """Normalize embedding outputs into plain Python float lists for Chroma."""
+    if hasattr(vector, "tolist"):
+        vector = vector.tolist()
+    return [float(value) for value in vector]
+
+
+def _coerce_embedding_batch(vectors) -> List[List[float]]:
+    """Normalize a batch of embeddings into Chroma-compatible lists."""
+    return [_coerce_embedding_vector(vector) for vector in vectors]
 
 
 class _HashEmbeddings:
@@ -382,7 +396,7 @@ class CodeIngester:
             
             # Generate embeddings for batch
             batch_texts = all_chunks[i:batch_end]
-            batch_embeddings = embeddings.embed_documents(batch_texts)
+            batch_embeddings = _coerce_embedding_batch(embeddings.embed_documents(batch_texts))
             
             # Add to collection
             collection.add(
@@ -419,7 +433,7 @@ class CodeIngester:
         
         # Get embeddings
         embeddings = self._get_embeddings()
-        query_embedding = embeddings.embed_query(query)
+        query_embedding = _coerce_embedding_vector(embeddings.embed_query(query))
         
         # Query collection
         results = collection.query(

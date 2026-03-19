@@ -94,7 +94,7 @@ class LiveDockerTester:
                 old_container.remove(force=True)
             except Exception:
                 pass
-            container = client.containers.run(image=app_config["image"], name=container_name, detach=True, ports={f"{app_config['port']}/tcp": host_port}, environment=app_config.get("env", {}), remove=True, stdout=True, stderr=True)
+            container = client.containers.run(image=app_config["image"], name=container_name, detach=True, ports={f"{app_config['port']}/tcp": host_port}, environment=app_config.get("env", {}), remove=True)
             time.sleep(app_config.get("startup_time", 10))
             target_url = f"http://localhost:{host_port}"
             if self._wait_for_app(target_url + app_config.get("health_check_path", "/"), timeout=30):

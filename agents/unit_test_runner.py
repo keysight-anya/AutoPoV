@@ -193,91 +193,58 @@ class UnitTestRunner:
         vulnerable_function: str,
         cwe_type: str
     ) -> str:
-        """Create a test harness that combines vulnerable code with PoV"""
-        
-        # Create a safe test environment
-        harness = f'''#!/usr/bin/env python3
-"""
-AutoPoV Test Harness
-Isolated test of vulnerable code with PoV
-"""
+        """Create a test harness that combines vulnerable code with PoV."""
 
-import sys
-import io
-import traceback
-from contextlib import redirect_stdout, redirect_stderr
+        escaped_vulnerable = vulnerable_function.replace('\\', '\\\\').replace('\"\"\"', '\\\"\\\"\\\"')
+        escaped_pov = pov_script.replace('\\', '\\\\').replace('\"\"\"', '\\\"\\\"\\\"')
 
-# Capture original stdout/stderr
-original_stdout = sys.stdout
-original_stderr = sys.stderr
-
-# Create string buffers to capture output
-stdout_buffer = io.StringIO()
-stderr_buffer = io.StringIO()
-
-try:
-    # Set up the vulnerable code context
-    vulnerable_code_context = """
-{vulnerable_code}
-"""
-    
-    # Provide helpers for PoV scripts
-    vulnerable_code = vulnerable_code_context
-    target_url = "http://localhost"
-    TARGET_URL = target_url
-    
-    # Execute vulnerable code in isolated namespace
-    vulnerable_namespace = {{}}
-    exec(vulnerable_code_context, vulnerable_namespace)
-    
-    # Make vulnerable functions available globally
-    globals().update(vulnerable_namespace)
-    
-    # Now run the PoV script
-    pov_code = """
-{pov_code}
-"""
-    
-    # Redirect output for PoV execution
-    with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
-        # Execute PoV
-        pov_namespace = {{
-            **vulnerable_namespace,  # Make vulnerable functions available
-            '__name__': '__main__'
-        }}
-        exec(pov_code, pov_namespace)
-    
-    # Check results
-    stdout_output = stdout_buffer.getvalue()
-    stderr_output = stderr_buffer.getvalue()
-    
-    # Print captured output
-    print(stdout_output, file=original_stdout)
-    print(stderr_output, file=original_stderr)
-    
-    # Check if vulnerability was triggered
-    if "VULNERABILITY TRIGGERED" in stdout_output:
-        print("\\n[TEST RESULT] Vulnerability successfully triggered", file=original_stdout)
-        sys.exit(0)
-    else:
-        print("\\n[TEST RESULT] Vulnerability not triggered", file=original_stdout)
-        sys.exit(1)
-        
-except Exception as e:
-    error_msg = f"Test harness error: {{str(e)}}\\n{{traceback.format_exc()}}"
-    print(error_msg, file=original_stderr)
-    sys.exit(2)
-'''
-        
-        # Escape the code to safely embed in the harness
-        escaped_vulnerable = vulnerable_function.replace('\\', '\\\\').replace('"""', '\\"\\"\\"').replace("'''", "\\'\\'\\'")
-        escaped_pov = pov_script.replace('\\', '\\\\').replace('"""', '\\"\\"\\"').replace("'''", "\\'\\'\\'")
-        
-        return harness.format(
-            vulnerable_code=escaped_vulnerable,
-            pov_code=escaped_pov
+        harness = (
+            '#!/usr/bin/env python3\n'
+            '"""\n'
+            'AutoPoV Test Harness\n'
+            'Isolated test of vulnerable code with PoV\n'
+            '"""\n\n'
+            'import sys\n'
+            'import io\n'
+            'import traceback\n'
+            'from contextlib import redirect_stdout, redirect_stderr\n\n'
+            'original_stdout = sys.stdout\n'
+            'original_stderr = sys.stderr\n'
+            'stdout_buffer = io.StringIO()\n'
+            'stderr_buffer = io.StringIO()\n\n'
+            'try:\n'
+            '    vulnerable_code_context = """__VULNERABLE_CODE__"""\n\n'
+            '    vulnerable_code = vulnerable_code_context\n'
+            '    target_url = "http://localhost"\n'
+            '    TARGET_URL = target_url\n\n'
+            '    vulnerable_namespace = {}\n'
+            '    exec(vulnerable_code_context, vulnerable_namespace)\n'
+            '    globals().update(vulnerable_namespace)\n\n'
+            '    pov_code = """__POV_CODE__"""\n\n'
+            '    with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):\n'
+            '        pov_namespace = {\n'
+            '            **vulnerable_namespace,\n'
+            '            "__name__": "__main__"\n'
+            '        }\n'
+            '        exec(pov_code, pov_namespace)\n\n'
+            '    stdout_output = stdout_buffer.getvalue()\n'
+            '    stderr_output = stderr_buffer.getvalue()\n\n'
+            '    print(stdout_output, file=original_stdout)\n'
+            '    print(stderr_output, file=original_stderr)\n\n'
+            '    if "VULNERABILITY TRIGGERED" in stdout_output:\n'
+            '        print("\\n[TEST RESULT] Vulnerability successfully triggered", file=original_stdout)\n'
+            '        sys.exit(0)\n'
+            '    else:\n'
+            '        print("\\n[TEST RESULT] Vulnerability not triggered", file=original_stdout)\n'
+            '        sys.exit(1)\n\n'
+            'except Exception as e:\n'
+            '    error_msg = f"Test harness error: {str(e)}\\n{traceback.format_exc()}"\n'
+            '    print(error_msg, file=original_stderr)\n'
+            '    sys.exit(2)\n'
         )
-    
+
+        return harness.replace('__VULNERABLE_CODE__', escaped_vulnerable).replace('__POV_CODE__', escaped_pov)
+
     def _run_isolated_test(self, test_harness: str, scan_id: str) -> Dict[str, Any]:
         """Run the test harness in an isolated subprocess"""
         
@@ -370,49 +337,37 @@ sys.stdin = io.StringIO("""{mock_input}""")
         execution_time: float,
         exploit_contract: Dict[str, Any] | None = None
     ) -> Dict[str, Any]:
-        """
-        Check if vulnerability was triggered using CWE-specific oracles.
-        
-        Returns a dict with:
-        - triggered: bool - Whether vulnerability was triggered
-        - confidence: str - "high", "medium", "low"
-        - evidence: list - What evidence was found
-        - method: str - Which detection method succeeded
-        """
+        """Check if a vulnerability was triggered using taxonomy labels and generic exploit-contract evidence."""
         combined_output = (stdout + stderr).lower()
         evidence = []
         confidence = "low"
         method = None
-        
-        # Check for the basic indicator first (low confidence)
-        if "VULNERABILITY TRIGGERED" in stdout:
+
+        if "vulnerability triggered" in combined_output:
             evidence.append("PoV printed 'VULNERABILITY TRIGGERED'")
             confidence = "low"
             method = "string_match"
-        
+
         exploit_contract = exploit_contract or {}
         oracle = self.CWE_ORACLES.get(cwe_type, {})
 
-        # Generic contract-based indicators
         for pattern in exploit_contract.get("success_indicators", []):
-            if str(pattern).lower() in combined_output:
+            token = str(pattern).strip().lower()
+            if token and token in combined_output:
                 evidence.append(f"Contract success indicator found: '{pattern}'")
                 confidence = "high"
-                method = "contract_output"
-        
-        # Check for expected output patterns (medium-high confidence)
-        expected_patterns = oracle.get("expected_output_patterns", [])
+                method = method or "contract_output"
+
+        expected_patterns = list(oracle.get("expected_output_patterns", []))
+        expected_patterns.extend([str(x) for x in exploit_contract.get("success_indicators", []) if x])
         for pattern in expected_patterns:
-            if pattern.lower() in combined_output:
+            if str(pattern).lower() in combined_output:
                 evidence.append(f"Expected pattern found: '{pattern}'")
                 confidence = "high"
-                method = "output_pattern"
-        
-        # Check for content patterns in side-effect files (high confidence)
-        # Files are relative to settings.TEMP_DIR for Docker compatibility
+                method = method or "output_pattern"
+
         from app.config import settings
         temp_dir = settings.TEMP_DIR
-        
         content_patterns = list(oracle.get("expected_content_patterns", []))
         content_patterns.extend([str(x) for x in exploit_contract.get("success_indicators", [])])
         side_effect_files = list(oracle.get("side_effect_files", []))
@@ -421,50 +376,58 @@ sys.stdin = io.StringIO("""{mock_input}""")
             file_path = os.path.join(temp_dir, filename)
             try:
                 if os.path.exists(file_path):
-                    with open(file_path, 'r') as f:
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                         file_content = f.read()
-                    for pattern in content_patterns:
-                        if pattern.lower() in file_content.lower():
-                            evidence.append(f"Sensitive content in {file_path}: '{pattern}'")
-                            confidence = "high"
-                            method = "file_content"
-                    # Clean up the file after checking
+                    if any(str(pattern).lower() in file_content.lower() for pattern in content_patterns if pattern):
+                        evidence.append(f"Observed side effect file: {file_path}")
+                        confidence = "high"
+                        method = method or "side_effect_file"
                     os.remove(file_path)
             except Exception:
                 pass
-        
-        # Check for error patterns (medium confidence)
+
         error_patterns = oracle.get("error_patterns", [])
         for pattern in error_patterns:
             if pattern.lower() in combined_output:
                 evidence.append(f"Error pattern found: '{pattern}'")
                 if confidence == "low":
                     confidence = "medium"
-                    method = "error_pattern"
-        
-        # Check for DOM patterns (for XSS)
+                    method = method or "error_pattern"
+
         dom_patterns = oracle.get("dom_patterns", [])
         for pattern in dom_patterns:
             if pattern.lower() in combined_output:
                 evidence.append(f"DOM manipulation found: '{pattern}'")
                 confidence = "high"
-                method = "dom_pattern"
-        
-        # Check timing for time-based detection (SQL injection)
+                method = method or "dom_pattern"
+
         timing_threshold = oracle.get("timing_threshold_s")
         if timing_threshold and execution_time >= timing_threshold:
             evidence.append(f"Time-based detection: {execution_time:.2f}s >= {timing_threshold}s")
             confidence = "medium"
-            method = "timing"
-        
+            method = method or "timing"
+
+        generic_indicators = [
+            exploit_contract.get("expected_outcome", ""),
+            exploit_contract.get("goal", ""),
+            *exploit_contract.get("inputs", []),
+            *exploit_contract.get("trigger_steps", []),
+        ]
+        for indicator in generic_indicators:
+            token = str(indicator).strip().lower()
+            if token and token in combined_output:
+                evidence.append(f"Generic exploit indicator found: '{indicator}'")
+                if confidence == "low":
+                    confidence = "medium"
+                method = method or "generic_contract"
+
         triggered = len(evidence) > 0
-        
         return {
             "triggered": triggered,
             "confidence": confidence,
             "evidence": evidence,
             "method": method,
-            "cwe_description": oracle.get("description", "Unknown"),
+            "cwe_description": oracle.get("description", "Generic exploit validation"),
             "exploit_goal": exploit_contract.get("goal", "")
         }
     

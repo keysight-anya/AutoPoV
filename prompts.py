@@ -1,17 +1,17 @@
 """
 AutoPoV Prompts Module
-Centralized LLM prompts for vulnerability detection and PoV generation
+Centralized LLM prompts for vulnerability discovery, investigation, and proof generation.
 """
 
+import json
 
-# Investigation Prompt - Used by the investigator agent
 INVESTIGATION_PROMPT = """You are a security expert analyzing a candidate vulnerability in code.
 
 CODE CONTEXT:
 {code_context}
 
 CANDIDATE SIGNAL:
-- Initial classification: {cwe_type}
+- Initial signal label: {cwe_type}
 - File: {filepath}
 - Line: {line_number}
 - Detection note: {alert_message}
@@ -21,9 +21,9 @@ CANDIDATE SIGNAL:
 TASK:
 Determine whether this issue is a REAL exploitable vulnerability or a FALSE_POSITIVE.
 If it is real, classify it as precisely as possible:
-- map it to a known CWE if you can
+- map it to a known CWE if the match is strong
 - include a known CVE only if there is a strong and specific match
-- if it is real but does not cleanly map to a known CWE, return UNCLASSIFIED
+- if it is real but does not cleanly map to a known taxonomy entry, return UNCLASSIFIED
 
 Respond in this exact JSON format:
 {{
@@ -39,17 +39,15 @@ Respond in this exact JSON format:
 
 Guidelines:
 - Be evidence-driven
-- Do not invent a CWE or CVE if the mapping is weak
+- Do not invent taxonomy labels when the mapping is weak
 - A real vulnerability can still be UNCLASSIFIED
-- Prefer exploitability and concrete impact over taxonomy purity
+- Prefer exploitability and concrete impact over naming purity
 """
 
-
-# PoV Generation Prompt - Used to generate Proof-of-Vulnerability scripts
 POV_GENERATION_PROMPT = """You are a security researcher creating a Proof-of-Vulnerability (PoV) script.
 
 VULNERABILITY DETAILS:
-- Classification: {cwe_type}
+- Current classification label: {cwe_type}
 - File: {filepath}
 - Line: {line_number}
 - Vulnerable Code: {vulnerable_code}
@@ -63,17 +61,19 @@ TARGET CODE:
 
 TASK:
 Create a {pov_language} PoV and an exploit contract that explains how the proof should work.
-The PoV will run in an isolated test harness where the target code has already been loaded and its functions
-are available in globals.
+The PoV must be runnable in the AutoPoV harness against the real repository or built target.
+For native C/C++ targets, prefer executing the real built binary or directly invoking the vulnerable helper with deterministic inputs.
+Use environment variables like TARGET_BINARY, TARGET_BIN, MQJS_BIN, and CODEBASE_PATH when the exploit needs the built artifact or repository path.
 
 REQUIREMENTS:
-1. Use only {pov_language} standard library (no external packages)
-2. The script must print "VULNERABILITY TRIGGERED" when successful
+1. Use only {pov_language} standard library
+2. The script must print "VULNERABILITY TRIGGERED" only when the exploit condition is actually observed
 3. Include error handling
 4. Make the PoV as deterministic as possible
-5. Do NOT make network calls and do NOT reference target_url
-6. Prefer calling the vulnerable function(s) defined in the target code context
-7. If the issue is not cleanly mapped to a known CWE, still produce the best exploit strategy you can
+5. Prefer directly exercising the vulnerable function, route, binary, or code path
+6. For native targets, prefer subprocess crash detection, sanitizer evidence, or direct helper invocation over abstract mock logic
+7. The exploit_contract.target_entrypoint must be a concise function name, route, or binary path hint, not a prose sentence
+8. If the issue is not cleanly mapped to a known taxonomy entry, still produce the best exploit strategy you can
 
 Respond in JSON only with this exact shape:
 {{
@@ -91,8 +91,6 @@ Respond in JSON only with this exact shape:
 }}
 """
 
-
-# PoV Validation Prompt - Used to validate generated PoV scripts
 POV_VALIDATION_PROMPT = """You are validating a Proof-of-Vulnerability (PoV) Python script.
 
 POV SCRIPT:
@@ -101,7 +99,7 @@ POV SCRIPT:
 ```
 
 VULNERABILITY CONTEXT:
-- Classification: {cwe_type}
+- Current classification label: {cwe_type}
 - Target: {filepath}:{line_number}
 - Exploit Goal: {exploit_goal}
 - Success Indicators: {success_indicators}
@@ -118,13 +116,11 @@ Validate this PoV script and respond in JSON format:
 Validation Criteria:
 1. Uses only standard library
 2. Contains "VULNERABILITY TRIGGERED" print statement
-3. Logic appears aligned with the exploit goal and success indicators
+3. Logic is aligned with the exploit goal, success indicators, and expected side effects
 4. Has proper error handling
 5. Is deterministic
 """
 
-
-# Code Analysis Prompt - Used for initial code analysis
 CODE_ANALYSIS_PROMPT = """You are analyzing a codebase for security vulnerabilities.
 
 CODE:
@@ -136,24 +132,21 @@ LANGUAGE: {language}
 FILE: {filepath}
 
 TASK:
-Identify potential security vulnerabilities in this code. Focus on:
-1. Buffer overflows (CWE-119)
-2. SQL injections (CWE-89)
-3. Use after free (CWE-416)
-4. Integer overflows (CWE-190)
+Identify potential security vulnerabilities in this code without assuming a predefined taxonomy.
+If a finding strongly aligns with a known CWE, you may include it. Otherwise use UNCLASSIFIED.
 
 For each vulnerability found, provide:
-- CWE type
-- Line number(s)
-- Description
-- Severity (Critical/High/Medium/Low)
-- Suggested fix
+- classification label (known CWE if justified, otherwise UNCLASSIFIED)
+- line number(s)
+- description
+- severity (Critical/High/Medium/Low)
+- suggested fix
 
 Respond in JSON format:
 {{
     "vulnerabilities": [
         {{
-            "cwe": "CWE-XXX",
+            "cwe": "CWE-XXX or UNCLASSIFIED",
             "line": line_number,
             "description": "Description",
             "severity": "Critical|High|Medium|Low",
@@ -163,11 +156,9 @@ Respond in JSON format:
     "summary": "Brief summary of findings"
 }}
 
-If no vulnerabilities found, return empty vulnerabilities array.
+If no vulnerabilities found, return an empty vulnerabilities array.
 """
 
-
-# RAG Context Enhancement Prompt
 RAG_CONTEXT_PROMPT = """You are enhancing context for a vulnerability investigation.
 
 PRIMARY CODE:
@@ -179,21 +170,18 @@ RELATED CODE CHUNKS:
 {related_chunks}
 
 TASK:
-Synthesize this information to provide a comprehensive understanding of:
-1. How the vulnerable code functions
+Synthesize this information to provide a concise understanding of:
+1. How the relevant code functions
 2. What inputs it receives
 3. How data flows through it
 4. Any security controls present
-
-Provide a concise summary that will help in vulnerability analysis.
+5. What makes the candidate vulnerability plausible or implausible
 """
 
-
-# Retry Analysis Prompt - Used when PoV fails
 RETRY_ANALYSIS_PROMPT = """A Proof-of-Vulnerability script failed to trigger the vulnerability.
 
 ORIGINAL VULNERABILITY:
-- CWE: {cwe_type}
+- Classification label: {cwe_type}
 - Location: {filepath}:{line_number}
 - Explanation: {explanation}
 
@@ -212,26 +200,80 @@ ATTEMPT: {attempt_number} of {max_retries}
 TASK:
 Analyze why the PoV failed and suggest improvements. Consider:
 1. Was the vulnerability path incorrect?
-2. Are there input validation checks we missed?
-3. Is there a specific condition required to trigger it?
-4. Do we need different input data?
+2. Are there input validation checks or preconditions we missed?
+3. Is there a specific state required to trigger it?
+4. Do we need different input data or a different exploit path?
 
 Respond in JSON format:
 {{
     "failure_reason": "Explanation of why it failed",
     "suggested_changes": "Specific changes to make",
-    "different_approach": true or false - whether to try a completely different approach
+    "different_approach": true or false
 }}
 """
 
+POV_REFINEMENT_PROMPT = """You are fixing a failed Proof-of-Vulnerability (PoV) script.
 
-# Summary Report Prompt - Used for generating analysis summaries
+VULNERABILITY DETAILS:
+- Current classification label: {cwe_type}
+- File: {filepath}
+- Line: {line_number}
+- Vulnerable Code: {vulnerable_code}
+- Explanation: {explanation}
+- Target Language: {target_language}
+
+TARGET CODE:
+```
+{code_context}
+```
+
+FAILED POV SCRIPT:
+```python
+{failed_pov}
+```
+
+VALIDATION / EXECUTION ERRORS:
+{validation_errors}
+
+CURRENT EXPLOIT CONTRACT:
+{exploit_contract}
+
+TASK:
+Return a corrected, executable PoV script and an updated exploit contract.
+Do not return failure analysis, prose, or planning notes.
+Return only runnable code in the `pov_script` field.
+
+REQUIREMENTS:
+1. The response must be JSON only.
+2. `pov_script` must contain executable code, not analysis text.
+3. The script must print "VULNERABILITY TRIGGERED" only when the exploit condition is actually observed.
+4. The script must explicitly use the exploit contract target entrypoint if one is provided.
+5. Prefer deterministic local proof techniques for native targets: controlled inputs, subprocess crash detection, sanitizer evidence, or direct invocation of the vulnerable helper when possible.
+6. Include concrete success indicators and side effects in the exploit contract.
+
+Respond in JSON only with this exact shape:
+{{
+  "pov_script": "full runnable PoV script",
+  "exploit_contract": {{
+    "goal": "one sentence description of what the exploit proves",
+    "target_entrypoint": "function, method, route, binary, or code path to exercise",
+    "runtime_profile": "web|python|javascript|node|c|cpp|native|binary",
+    "preconditions": ["required setup or assumptions"],
+    "inputs": ["important attacker-controlled inputs or payloads"],
+    "trigger_steps": ["ordered exploit steps"],
+    "success_indicators": ["observable outputs or strings that prove success"],
+    "side_effects": ["files, state changes, or other concrete effects expected on success"],
+    "expected_outcome": "what should happen if the vulnerability is real"
+  }}
+}}
+"""
+
 SUMMARY_REPORT_PROMPT = """You are generating a summary of a vulnerability scan.
 
 SCAN METRICS:
 - Total Files Scanned: {total_files}
 - Total Lines Scanned: {total_lines}
-- CWEs Checked: {cwes_checked}
+- Discovery Scope: {cwes_checked}
 - Model Used: {model_name}
 - Duration: {duration_seconds}s
 
@@ -252,264 +294,175 @@ Generate an executive summary of this security scan. Include:
 2. Key findings and their severity
 3. Patterns observed
 4. Recommendations for remediation
-5. Notable true positives vs false positives
+5. Notable proven vulnerabilities vs inconclusive candidates
 
 Format as a professional security report summary.
 """
 
 
-def format_investigation_prompt(
-    code_context: str,
-    cwe_type: str,
-    filepath: str,
-    line_number: int,
-    alert_message: str,
-    joern_context: str = ""
-) -> str:
-    """Format the investigation prompt with context"""
+def format_investigation_prompt(code_context: str, cwe_type: str, filepath: str, line_number: int, alert_message: str, joern_context: str = "") -> str:
     return INVESTIGATION_PROMPT.format(
         code_context=code_context,
-        cwe_type=cwe_type,
+        cwe_type=cwe_type or 'UNCLASSIFIED',
         filepath=filepath,
         line_number=line_number,
-        alert_message=alert_message,
-        joern_context=joern_context if joern_context else ""
+        alert_message=alert_message or 'Candidate security signal',
+        joern_context=joern_context or ''
     )
 
 
-def format_pov_generation_prompt(
-    cwe_type: str,
-    filepath: str,
-    line_number: int,
-    vulnerable_code: str,
-    explanation: str,
-    code_context: str,
-    target_language: str = "python",
-    pov_language: str = "python"
-) -> str:
-    """Format the PoV generation prompt"""
+def format_pov_generation_prompt(cwe_type: str, filepath: str, line_number: int, vulnerable_code: str, explanation: str, code_context: str, target_language: str, pov_language: str) -> str:
     return POV_GENERATION_PROMPT.format(
-        cwe_type=cwe_type,
+        cwe_type=cwe_type or 'UNCLASSIFIED',
         filepath=filepath,
         line_number=line_number,
-        vulnerable_code=vulnerable_code,
-        explanation=explanation,
-        code_context=code_context,
-        target_language=target_language,
-        pov_language=pov_language
+        vulnerable_code=vulnerable_code or '',
+        explanation=explanation or '',
+        code_context=code_context or '',
+        target_language=target_language or 'unknown',
+        pov_language=pov_language or 'python'
     )
 
 
-def format_pov_validation_prompt(
-    pov_script: str,
-    cwe_type: str,
-    filepath: str,
-    line_number: int,
-    exploit_contract: dict | None = None
-) -> str:
-    """Format the PoV validation prompt"""
-    exploit_contract = exploit_contract or {}
+def format_pov_validation_prompt(pov_script: str, cwe_type: str, filepath: str, line_number: int, exploit_goal: str = '', success_indicators: str = '', exploit_contract=None) -> str:
+    contract = exploit_contract or {}
+    derived_goal = exploit_goal or contract.get('goal') or 'Establish whether the identified vulnerability is real.'
+    indicators = success_indicators
+    if not indicators:
+        parts = []
+        if contract.get('success_indicators'):
+            parts.append(', '.join(str(x) for x in contract.get('success_indicators', []) if str(x).strip()))
+        if contract.get('side_effects'):
+            parts.append('Side effects: ' + ', '.join(str(x) for x in contract.get('side_effects', []) if str(x).strip()))
+        indicators = ' | '.join([p for p in parts if p]) or 'Observable exploit success indicators not specified.'
     return POV_VALIDATION_PROMPT.format(
-        pov_script=pov_script,
-        cwe_type=cwe_type,
+        pov_script=pov_script or '',
+        cwe_type=cwe_type or 'UNCLASSIFIED',
         filepath=filepath,
         line_number=line_number,
-        exploit_goal=exploit_contract.get("goal", "Demonstrate the vulnerability with a deterministic exploit"),
-        success_indicators=", ".join(exploit_contract.get("success_indicators", [])) or "VULNERABILITY TRIGGERED"
+        exploit_goal=derived_goal,
+        success_indicators=indicators
     )
 
 
-def format_code_analysis_prompt(
-    code: str,
-    language: str,
-    filepath: str
-) -> str:
-    """Format the code analysis prompt"""
-    return CODE_ANALYSIS_PROMPT.format(
-        code=code,
-        language=language,
-        filepath=filepath
-    )
-
-
-def format_rag_context_prompt(
-    primary_code: str,
-    related_chunks: str
-) -> str:
-    """Format the RAG context enhancement prompt"""
+def format_rag_context_prompt(primary_code: str, related_chunks: str) -> str:
     return RAG_CONTEXT_PROMPT.format(
-        primary_code=primary_code,
-        related_chunks=related_chunks
+        primary_code=primary_code or '',
+        related_chunks=related_chunks or '[No related chunks available]'
     )
 
 
-def format_retry_analysis_prompt(
-    cwe_type: str,
-    filepath: str,
-    line_number: int,
-    explanation: str,
-    failed_pov: str,
-    execution_output: str,
-    attempt_number: int,
-    max_retries: int
-) -> str:
-    """Format the retry analysis prompt"""
+def format_retry_analysis_prompt(cwe_type: str, filepath: str, line_number: int, explanation: str, failed_pov: str, execution_output: str, attempt_number: int, max_retries: int) -> str:
     return RETRY_ANALYSIS_PROMPT.format(
-        cwe_type=cwe_type,
+        cwe_type=cwe_type or 'UNCLASSIFIED',
         filepath=filepath,
         line_number=line_number,
-        explanation=explanation,
-        failed_pov=failed_pov,
-        execution_output=execution_output,
+        explanation=explanation or '',
+        failed_pov=failed_pov or '',
+        execution_output=execution_output or '',
         attempt_number=attempt_number,
         max_retries=max_retries
     )
 
 
-def format_summary_report_prompt(
-    total_files: int,
-    total_lines: int,
-    cwes_checked: str,
-    model_name: str,
-    duration_seconds: float,
-    total_alerts: int,
-    confirmed_vulns: int,
-    false_positives: int,
-    pov_success_rate: float,
-    detection_rate: float,
-    false_positive_rate: float,
-    vulnerabilities_list: str
-) -> str:
-    """Format the summary report prompt"""
-    return SUMMARY_REPORT_PROMPT.format(
-        total_files=total_files,
-        total_lines=total_lines,
-        cwes_checked=cwes_checked,
-        model_name=model_name,
-        duration_seconds=duration_seconds,
-        total_alerts=total_alerts,
-        confirmed_vulns=confirmed_vulns,
-        false_positives=false_positives,
-        pov_success_rate=pov_success_rate,
-        detection_rate=detection_rate,
-        false_positive_rate=false_positive_rate,
-        vulnerabilities_list=vulnerabilities_list
-    )
-
-# Scout Prompt - Used for autonomous candidate discovery
-SCOUT_PROMPT = """You are a security scout analyzing multiple files for potential vulnerabilities.
-
-FILES:
-{files}
-
-FOCUS:
-{cwe_guidance}
-
-TASK:
-Return a JSON object with an array named "findings". Each finding must include:
-- cwe: a best-effort CWE-XXX value, or UNCLASSIFIED if no precise mapping fits
-- cve_id: CVE-YYYY-NNNN if there is a strong specific match, otherwise null
-- filepath: path of the file
-- line: line number (best estimate)
-- snippet: short code snippet
-- reason: short reasoning
-- confidence: 0.0 to 1.0
-
-Prioritize real exploit paths, unsafe trust boundaries, auth flaws, injection, memory safety, insecure deserialization, unsafe execution, crypto misuse, privilege issues, and any other security-relevant weakness.
-Respond in JSON only.
-"""
-
-
-def format_scout_prompt(file_snippets, cwes):
-    formatted_files = []
-    for item in file_snippets:
-        formatted_files.append(
-            f"FILE: {item.get('filepath')}\nLANGUAGE: {item.get('language')}\nCODE:\n{item.get('code')}\n"
-        )
-
-    return SCOUT_PROMPT.format(
-        files="\n---\n".join(formatted_files),
-        cwes=", ".join(cwes)
-    )
-
-
-# PoV Refinement Prompt - Used to fix failed PoV scripts
-POV_REFINEMENT_PROMPT = """You are fixing a failed Proof-of-Vulnerability (PoV) script.
-
-VULNERABILITY DETAILS:
-- Classification: {cwe_type}
-- File: {filepath}
-- Line: {line_number}
-- Vulnerable Code: {vulnerable_code}
-- Explanation: {explanation}
-- Target Language: {target_language}
-- Existing Exploit Goal: {exploit_goal}
-- Existing Success Indicators: {success_indicators}
-
-TARGET CODE:
-```
-{code_context}
-```
-
-FAILED POV SCRIPT:
-```python
-{failed_pov}
-```
-
-VALIDATION ERRORS:
-{validation_errors}
-
-ATTEMPT: {attempt_number}
-
-TASK:
-Fix the PoV script and refresh the exploit contract so the proof is more likely to succeed.
-The script must:
-1. Use only Python standard library
-2. Print "VULNERABILITY TRIGGERED" when successful
-3. Include error handling
-4. Be deterministic
-5. Avoid network calls
-
-Respond in JSON only with this exact shape:
-{{
-  "pov_script": "corrected python script",
-  "exploit_contract": {{
-    "goal": "one sentence description of what the exploit proves",
-    "target_entrypoint": "function, method, route, or code path to exercise",
-    "preconditions": ["required setup or assumptions"],
-    "inputs": ["important attacker-controlled inputs or payloads"],
-    "trigger_steps": ["ordered exploit steps"],
-    "success_indicators": ["observable outputs or strings that prove success"],
-    "side_effects": ["files, state changes, or other concrete effects expected on success"],
-    "expected_outcome": "what should happen if the vulnerability is real"
-  }}
-}}
-"""
-
-
-def format_pov_refinement_prompt(
-    cwe_type: str,
-    filepath: str,
-    line_number: int,
-    vulnerable_code: str,
-    explanation: str,
-    code_context: str,
-    failed_pov: str,
-    validation_errors: list,
-    attempt_number: int,
-    target_language: str = "python",
-    exploit_contract: dict | None = None
-) -> str:
-    """Format the PoV refinement prompt"""
+def format_pov_refinement_prompt(cwe_type: str, filepath: str, line_number: int, vulnerable_code: str, explanation: str, code_context: str, failed_pov: str, validation_errors, attempt_number: int, target_language: str = 'python', exploit_contract=None) -> str:
+    rendered_errors = ''
+    if validation_errors:
+        if isinstance(validation_errors, (list, tuple)):
+            rendered_errors = '\n'.join(f'- {x}' for x in validation_errors)
+        else:
+            rendered_errors = str(validation_errors)
     return POV_REFINEMENT_PROMPT.format(
-        cwe_type=cwe_type,
+        cwe_type=cwe_type or 'UNCLASSIFIED',
         filepath=filepath,
         line_number=line_number,
-        vulnerable_code=vulnerable_code,
-        explanation=explanation,
-        code_context=code_context,
-        failed_pov=failed_pov,
-        validation_errors="\n".join(f"- {e}" for e in validation_errors),
+        vulnerable_code=vulnerable_code or '',
+        explanation=explanation or '',
+        code_context=code_context or '',
+        failed_pov=failed_pov or '',
+        validation_errors=rendered_errors or '[No validation errors supplied]',
         attempt_number=attempt_number,
-        target_language=target_language
+        target_language=target_language or 'python',
+        exploit_contract=json.dumps(exploit_contract or {}, indent=2)
     )
+
+
+def format_scout_prompt(file_snippets, cwes) -> str:
+    taxonomy_hint = 'No predefined taxonomy focus. Discover any credible vulnerability class and use UNCLASSIFIED when no precise known mapping is justified.'
+    if cwes:
+        taxonomy_hint = 'Optional taxonomy focus labels: ' + ', '.join(cwes)
+    rendered = []
+    for item in file_snippets:
+        rendered.append(
+            f"FILE: {item.get('filepath','unknown')}\nLANGUAGE: {item.get('language','unknown')}\n```\n{item.get('code','')}\n```"
+        )
+    return (
+        'You are scouting a codebase for security vulnerabilities.\n\n'
+        f'{taxonomy_hint}\n\n'
+        'Return JSON with this shape: {"findings": [{"filepath": str, "language": str, "line": int, "cwe": "CWE-XXX or UNCLASSIFIED", "cve_id": null or str, "snippet": str, "reason": str, "confidence": float}]}\n\n'
+        'Prioritize exploitable issues, dangerous sinks, memory/lifecycle mistakes, unsafe trust boundaries, and missing controls.\n\n'
+        + '\n\n'.join(rendered)
+    )
+
+
+def format_scout_triage_prompt(file_snippets, cwes) -> str:
+    """Prompt for LLM triage of pre-selected candidate signals from static tools.
+    
+    Each file_snippet includes candidate_lines and candidate_cwes from prior tools,
+    so the LLM focuses its analysis on flagged locations rather than full-file scanning.
+    """
+    taxonomy_hint = 'No predefined taxonomy focus. Validate and refine each candidate — use UNCLASSIFIED when no precise known mapping exists.'
+    if cwes:
+        taxonomy_hint = 'Optional taxonomy context from prior tools: ' + ', '.join(cwes)
+    rendered = []
+    for item in file_snippets:
+        candidate_info = ''
+        lines = item.get('candidate_lines', [])
+        cwes_hint = item.get('candidate_cwes', [])
+        if lines or cwes_hint:
+            candidate_info = f'\nCANDIDATE SIGNALS: lines {lines}, prior labels {cwes_hint}'
+        rendered.append(
+            f"FILE: {item.get('filepath','unknown')}\nLANGUAGE: {item.get('language','unknown')}{candidate_info}\n```\n{item.get('code','')}\n```"
+        )
+    return (
+        'You are triaging pre-flagged vulnerability candidates from static analysis tools.\n\n'
+        f'{taxonomy_hint}\n\n'
+        'For each file, review the CANDIDATE SIGNALS (flagged lines/labels) and the full code context. '
+        'Determine: is each signal a real exploitable vulnerability, a false positive, or something different?\n\n'
+        'Return JSON with this shape: {"findings": [{"filepath": str, "language": str, "line": int, "cwe": "CWE-XXX or UNCLASSIFIED", "cve_id": null or str, "snippet": str, "reason": str, "confidence": float}]}\n\n'
+        'Rules:\n'
+        '- confidence >= 0.8 means you are certain it is exploitable\n'
+        '- confidence < 0.5 means likely false positive (still include it)\n'
+        '- Use UNCLASSIFIED for real issues that do not map to a known CWE\n'
+        '- Do not invent taxonomy labels; accuracy over completeness\n\n'
+        + '\n\n'.join(rendered)
+    )
+
+
+def format_summary_report_prompt(**kwargs) -> str:
+    return SUMMARY_REPORT_PROMPT.format(**kwargs)
+
+
+def format_code_analysis_prompt(code: str, language: str, filepath: str) -> str:
+    return CODE_ANALYSIS_PROMPT.format(code=code or '', language=language or 'unknown', filepath=filepath or 'unknown')
+
+
+__all__ = [
+    'INVESTIGATION_PROMPT',
+    'POV_GENERATION_PROMPT',
+    'POV_VALIDATION_PROMPT',
+    'CODE_ANALYSIS_PROMPT',
+    'RAG_CONTEXT_PROMPT',
+    'RETRY_ANALYSIS_PROMPT',
+    'SUMMARY_REPORT_PROMPT',
+    'format_investigation_prompt',
+    'format_pov_generation_prompt',
+    'format_pov_validation_prompt',
+    'format_rag_context_prompt',
+    'format_retry_analysis_prompt',
+    'format_pov_refinement_prompt',
+    'format_scout_prompt',
+    'format_scout_triage_prompt',
+    'format_summary_report_prompt',
+    'format_code_analysis_prompt',
+]

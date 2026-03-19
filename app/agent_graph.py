@@ -10,6 +10,8 @@ import shutil
 from typing import Dict, Any, List, Optional, TypedDict, Annotated
 from datetime import datetime
 from enum import Enum
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
@@ -17,9 +19,6 @@ from langgraph.graph.message import add_messages
 import subprocess
 
 from app.config import settings
-from app.policy import get_policy_router
-from app.learning_store import get_learning_store
-from agents.heuristic_scout import get_heuristic_scout
 from agents.llm_scout import get_llm_scout
 from agents.ingest_codebase import get_code_ingester
 from agents.investigator import get_investigator
@@ -59,7 +58,7 @@ class VulnerabilityState(TypedDict):
     retry_count: int
     inference_time_s: float
     cost_usd: float
-    final_status: str
+    final_status: Optional[str]
     # Language tracking
     detected_language: Optional[str]  # Language of the file
     source: Optional[str]  # How the finding was detected (codeql, llm, heuristic)
@@ -86,6 +85,7 @@ class ScanState(TypedDict):
     status: str
     codebase_path: str
     model_name: str
+    model_mode: str
     cwes: List[str]
     findings: List[VulnerabilityState]
     preloaded_findings: Optional[List[VulnerabilityState]]
@@ -101,9 +101,11 @@ class ScanState(TypedDict):
     error: Optional[str]
 
     proofs_attempted: int
+    confirmed_count: int  # Track confirmed findings for early termination
     openrouter_api_key: Optional[str]
-    proofs_attempted: int
-    openrouter_api_key: Optional[str]
+    rag_ready: bool
+    rag_stats: Optional[Dict[str, Any]]
+    scan_openrouter_usage: List[Dict[str, Any]]
 
 
 class AgentGraph:
@@ -124,6 +126,13 @@ class AgentGraph:
             if scan_info and scan_info.get("status") == "cancelled":
                 return True
         return False
+
+    def _get_selected_model(self, state: ScanState) -> str:
+        model_name = (state.get("model_name") or "").strip()
+        if not model_name:
+            raise ValueError("Scan has no selected model. Choose one in Settings or pass an explicit CLI override.")
+        settings.resolve_model_mode(model_name)
+        return model_name
     
     def _build_graph(self) -> StateGraph:
         """Build the LangGraph workflow"""
@@ -178,7 +187,14 @@ class AgentGraph:
         # Refiner loop: refinement goes back to validation
         workflow.add_edge("refine_pov", "validate_pov")
         
-        workflow.add_edge("run_in_docker", "log_confirmed")
+        workflow.add_conditional_edges(
+            "run_in_docker",
+            self._after_runtime_proof,
+            {
+                "log_confirmed": "log_confirmed",
+                "log_failure": "log_failure"
+            }
+        )
         
         # After logging, check if there are more findings to process
         # Loop back to investigate to process the next finding
@@ -221,11 +237,14 @@ class AgentGraph:
         return state
     
     def _node_ingest_code(self, state: ScanState) -> ScanState:
-        """Ingest codebase into vector store"""
+        """Ingest the codebase into the vector store and require it for downstream RAG."""
+        if settings.SKIP_CHROMADB and settings.RAG_REQUIRED:
+            self._log(state, "RAG_REQUIRED=true overrides SKIP_CHROMADB; vector ingestion is mandatory for this scan")
+
         self._log(state, "Ingesting codebase into vector store...")
         state["status"] = ScanStatus.INGESTING
-        self._update_scan_runtime(state, status=ScanStatus.INGESTING, progress=25)
-        
+        self._update_scan_runtime(state, status=ScanStatus.INGESTING, progress=25, rag_ready=False)
+
         try:
             ingester = get_code_ingester()
             stats = ingester.ingest_directory(
@@ -235,44 +254,28 @@ class AgentGraph:
                     state, f"  Processed {count} files: {path}"
                 )
             )
-            
+
+            if stats.get("files_processed", 0) <= 0 or stats.get("chunks_created", 0) <= 0:
+                raise RuntimeError("RAG ingestion completed without indexing any source chunks")
+
+            state["rag_ready"] = True
+            state["rag_stats"] = stats
             self._log(state, f"Ingested {stats['chunks_created']} chunks from {stats['files_processed']} files")
-            self._update_scan_runtime(state, progress=35)
-            
+            self._update_scan_runtime(state, progress=35, rag_ready=True, rag_stats=stats)
+
             if stats["errors"]:
-                for error in stats["errors"][:5]:  # Log first 5 errors
+                for error in stats["errors"][:5]:
                     self._log(state, f"  Warning: {error}")
-        
+
         except Exception as e:
-            # Ingestion failure is non-fatal - scan continues without vector store context
-            self._log(state, f"Warning: Ingestion failed ({e}). Scan will continue without vector store context.")
-            # Do NOT set state["error"] - let scan proceed
-        
+            state["rag_ready"] = False
+            state["rag_stats"] = {"error": str(e)}
+            self._update_scan_runtime(state, rag_ready=False, rag_stats=state["rag_stats"])
+            self._log(state, f"ERROR: Mandatory code ingestion failed: {e}")
+            raise RuntimeError(f"Mandatory code ingestion failed: {e}") from e
+
         return state
     
-    def _run_autonomous_discovery(self, state: ScanState) -> List[VulnerabilityState]:
-        """Run autonomous discovery using heuristics and optional LLM scout."""
-        findings: List[VulnerabilityState] = []
-        if not settings.SCOUT_ENABLED:
-            return findings
-
-        try:
-            findings.extend(get_heuristic_scout().scan_directory(state["codebase_path"], state["cwes"]))
-            self._log(state, f"Heuristic scout found {len(findings)} candidates")
-        except Exception as e:
-            self._log(state, f"Heuristic scout failed: {e}")
-
-        if settings.SCOUT_LLM_ENABLED:
-            try:
-                model = get_policy_router().select_model("investigate", cwe=None, language=state.get("detected_language"))
-                llm_findings = get_llm_scout().scan_directory(state["codebase_path"], state["cwes"], model_name=model)
-                findings.extend(llm_findings)
-                self._log(state, f"LLM scout found {len(llm_findings)} candidates")
-            except Exception as e:
-                self._log(state, f"LLM scout failed: {e}")
-
-        return findings
-
     def _merge_findings(self, base: List[VulnerabilityState], extra: List[VulnerabilityState]) -> List[VulnerabilityState]:
         """Merge findings and deduplicate by (filepath, line, cwe)."""
         merged: List[VulnerabilityState] = []
@@ -284,6 +287,48 @@ class AgentGraph:
             seen.add(key)
             merged.append(item)
         return merged
+    
+    def _is_security_finding(self, finding: VulnerabilityState) -> bool:
+        """
+        Filter out obvious non-security findings (code quality, style issues).
+        
+        IMPORTANT: We do NOT filter based on CWE classification. 
+        A vulnerability is defined by exploitability, not by its CWE label.
+        All findings deserve investigation - the PoV process will determine exploitability.
+        """
+        code_chunk = finding.get("code_chunk", "").lower()
+        
+        # Only filter out obvious code quality/style issues from static analyzers
+        # These are clearly not security issues
+        non_security_patterns = [
+            "empty block",
+            "switch has at least one case that is too long",
+            "multiple forward and backward goto",
+            "code quality",
+            "style",
+            "comment",
+            "readability",
+            "complexity",
+            "maintainability",
+            "duplicate code",
+            "unused variable",
+            "naming convention",
+            "magic number",
+            "todo",
+            "fixme",
+            "indentation",
+            "whitespace",
+            "line length",
+        ]
+        
+        # Skip if code_chunk matches non-security patterns
+        for pattern in non_security_patterns:
+            if pattern in code_chunk:
+                return False
+        
+        # Keep ALL other findings for investigation
+        # The PoV generation and validation process will determine exploitability
+        return True
 
     def _node_run_codeql(self, state: ScanState) -> ScanState:
         """
@@ -336,7 +381,7 @@ class AgentGraph:
                             retry_count=0,
                             inference_time_s=0.0,
                             cost_usd=0.0,
-                            final_status="pending",
+                            final_status="",
                             detected_language=finding_data.get("detected_language", state.get("detected_language", "unknown")),
                             source=finding_data.get("source", "unknown"),
                             model_used=None,
@@ -348,7 +393,7 @@ class AgentGraph:
                             architect_model=None,
                             architect_tokens=None,
                             validation_result=None,
-                            refinement_history=None,
+                            refinement_history=[],
                             exploit_contract=None,
                             execution_profile=None
                         )
@@ -358,11 +403,22 @@ class AgentGraph:
             
             # Deduplicate findings
             deduped = self._merge_findings([], all_findings)
-            deduped.sort(key=lambda item: item.get("confidence", 0.0), reverse=True)
-            if len(deduped) > settings.DISCOVERY_MAX_FINDINGS:
-                self._log(state, f"Capping discovery set from {len(deduped)} to {settings.DISCOVERY_MAX_FINDINGS} findings for stable downstream processing")
-                deduped = deduped[:settings.DISCOVERY_MAX_FINDINGS]
-            state["findings"] = deduped
+            
+            # Filter out non-security findings (code quality, style issues)
+            security_findings = [f for f in deduped if self._is_security_finding(f)]
+            filtered_count = len(deduped) - len(security_findings)
+            if filtered_count > 0:
+                self._log(state, f"Filtered out {filtered_count} non-security findings (code quality/style issues)")
+            
+            # Sort by confidence descending
+            security_findings.sort(key=lambda item: item.get("confidence", 0.0), reverse=True)
+            
+            if len(security_findings) > settings.DISCOVERY_MAX_FINDINGS:
+                self._log(state, f"Capping discovery set from {len(security_findings)} to {settings.DISCOVERY_MAX_FINDINGS} findings for stable downstream processing")
+                security_findings = security_findings[:settings.DISCOVERY_MAX_FINDINGS]
+            state["findings"] = security_findings
+            for finding in state["findings"]:
+                self._append_scan_openrouter_usage(state, finding.get("scout_openrouter_usage"), "llm_scout", finding=finding)
             self._update_scan_runtime(state, progress=45, findings=state["findings"])
             self._log(state, f"Agentic discovery completed: {len(state['findings'])} total unique findings")
             
@@ -376,383 +432,12 @@ class AgentGraph:
             merged = self._merge_findings(findings, auto_findings)
             merged.sort(key=lambda item: item.get("confidence", 0.0), reverse=True)
             state["findings"] = merged[:settings.DISCOVERY_MAX_FINDINGS]
+            for finding in state["findings"]:
+                self._append_scan_openrouter_usage(state, finding.get("scout_openrouter_usage"), "llm_scout", finding=finding)
             self._update_scan_runtime(state, progress=45, findings=state["findings"])
 
         return state
 
-    def _create_codeql_database(self, state: ScanState, language: str, db_path: str) -> bool:
-        """Create CodeQL database for the codebase. Returns True if successful."""
-        if os.path.exists(db_path):
-            self._log(state, f"Using existing CodeQL database at {db_path}")
-            return True
-        
-        self._log(state, f"Creating CodeQL database for {language}...")
-        
-        try:
-            result = subprocess.run(
-                [
-                    settings.CODEQL_CLI_PATH,
-                    "database", "create",
-                    db_path,
-                    f"--language={language}",
-                    "--source-root", state["codebase_path"]
-                ],
-                capture_output=True,
-                text=True,
-                timeout=300
-            )
-            
-            if result.returncode != 0:
-                self._log(state, f"CodeQL database creation failed: {result.stderr}")
-                return False
-            
-            self._log(state, f"CodeQL database created successfully at {db_path}")
-            return True
-            
-        except Exception as e:
-            self._log(state, f"Exception during CodeQL database creation: {e}")
-            return False
-    
-    def _detect_all_languages(self, codebase_path: str) -> Dict[str, Any]:
-        """
-        Detect all languages in the codebase with statistics.
-        
-        Returns:
-            Dict with:
-            - primary: Primary language (most files)
-            - all_languages: List of detected languages
-            - language_stats: Dict with file counts per language
-            - file_mappings: Dict mapping file paths to languages
-        """
-        extensions = {}
-        file_mappings = {}
-        
-        for root, _, files in os.walk(codebase_path):
-            for file in files:
-                ext = os.path.splitext(file)[1].lower()
-                extensions[ext] = extensions.get(ext, 0) + 1
-                
-                # Map file to language
-                full_path = os.path.join(root, file)
-                rel_path = os.path.relpath(full_path, codebase_path)
-                lang = self._get_language_from_extension(ext)
-                if lang:
-                    file_mappings[rel_path] = lang
-        
-        # Map extensions to CodeQL languages
-        lang_map = {
-            '.py': 'python',
-            '.js': 'javascript',
-            '.ts': 'typescript',
-            '.tsx': 'typescript',
-            '.jsx': 'javascript',
-            '.java': 'java',
-            '.c': 'cpp',
-            '.cpp': 'cpp',
-            '.cc': 'cpp',
-            '.h': 'cpp',
-            '.go': 'go',
-            '.rb': 'ruby',
-            '.php': 'php',
-            '.phtml': 'php',
-            '.php3': 'php',
-            '.php4': 'php',
-            '.php5': 'php',
-            '.cs': 'csharp',
-            '.swift': 'swift',
-            '.kt': 'kotlin',
-            '.scala': 'scala',
-            '.rs': 'rust',
-        }
-        
-        # Find all languages with counts
-        lang_counts = {}
-        for ext, count in extensions.items():
-            lang = lang_map.get(ext)
-            if lang:
-                lang_counts[lang] = lang_counts.get(lang, 0) + count
-        
-        # Sort by count
-        sorted_langs = sorted(lang_counts.items(), key=lambda x: x[1], reverse=True)
-        
-        primary = sorted_langs[0][0] if sorted_langs else 'python'
-        all_languages = [lang for lang, _ in sorted_langs]
-        
-        return {
-            'primary': primary,
-            'all_languages': all_languages,
-            'language_stats': lang_counts,
-            'file_mappings': file_mappings,
-            'total_files': sum(lang_counts.values())
-        }
-    
-    def _get_language_from_extension(self, ext: str) -> Optional[str]:
-        """Get language from file extension"""
-        lang_map = {
-            '.py': 'python',
-            '.js': 'javascript',
-            '.ts': 'typescript',
-            '.tsx': 'typescript',
-            '.jsx': 'javascript',
-            '.java': 'java',
-            '.c': 'cpp',
-            '.cpp': 'cpp',
-            '.cc': 'cpp',
-            '.h': 'cpp',
-            '.go': 'go',
-            '.rb': 'ruby',
-            '.php': 'php',
-            '.phtml': 'php',
-            '.php3': 'php',
-            '.php4': 'php',
-            '.php5': 'php',
-            '.cs': 'csharp',
-            '.swift': 'swift',
-            '.kt': 'kotlin',
-            '.scala': 'scala',
-            '.rs': 'rust',
-        }
-        return lang_map.get(ext)
-    
-    def _detect_language(self, codebase_path: str) -> str:
-        """Detect the primary language of the codebase (backward compatible)"""
-        result = self._detect_all_languages(codebase_path)
-        return result['primary']
-    
-    def _get_cwe_query(self, cwe: str, language: str) -> Optional[str]:
-        """Get CodeQL query for a CWE based on language using local file paths"""
-        # Map detected languages to actual CodeQL language packs
-        # PHP uses javascript pack, TypeScript uses javascript pack, etc.
-        language_pack_map = {
-            'python': 'python',
-            'javascript': 'javascript',
-            'java': 'java',
-            'cpp': 'cpp',
-            'go': 'go',
-            'ruby': 'ruby',
-            'php': 'javascript',  # PHP uses JavaScript pack for CodeQL
-            'typescript': 'javascript',
-        }
-        
-        # Get the actual CodeQL language pack to use
-        actual_language = language_pack_map.get(language, language)
-        
-        # Map CWEs to CodeQL query file paths (local filesystem paths)
-        # Each language has its own pack directory
-        base_paths = {
-            'javascript': os.path.join(settings.CODEQL_PACKS_BASE, 'codeql/javascript-queries'),
-            'python': os.path.join(settings.CODEQL_PACKS_BASE, 'codeql/python-queries'),
-            'java': os.path.join(settings.CODEQL_PACKS_BASE, 'codeql/java-queries'),
-            'cpp': os.path.join(settings.CODEQL_PACKS_BASE, 'codeql/cpp-queries'),
-            'go': os.path.join(settings.CODEQL_PACKS_BASE, 'codeql/go-queries'),
-            'ruby': os.path.join(settings.CODEQL_PACKS_BASE, 'codeql/ruby-queries'),
-        }
-        
-        cwe_query_map = {
-            'javascript': {
-                'CWE-79': 'Security/CWE-079/Xss.ql',
-                'CWE-89': 'Security/CWE-089/SqlInjection.ql',
-                'CWE-94': 'Security/CWE-094/CodeInjection.ql',
-                'CWE-502': 'Security/CWE-502/UnsafeDeserialization.ql',
-                'CWE-22': 'Security/CWE-022/TaintedPath.ql',
-                'CWE-312': 'Security/CWE-312/CleartextStorage.ql',
-                'CWE-327': 'Security/CWE-327/BrokenCryptoAlgorithm.ql',
-                'CWE-601': 'Security/CWE-601/UrlRedirection.ql',
-                'CWE-611': 'Security/CWE-611/Xxe.ql',
-                'CWE-918': 'Security/CWE-918/RequestForgery.ql',
-                'CWE-352': 'Security/CWE-352/MissingCsrfToken.ql',
-                'CWE-78': 'Security/CWE-078/CommandInjection.ql',
-                'CWE-200': 'Security/CWE-200/InformationExposure.ql',
-                'CWE-209': 'Security/CWE-209/StackTraceExposure.ql',
-                'CWE-384': 'Security/CWE-384/SessionFixation.ql',
-                'CWE-400': 'Security/CWE-400/ResourceExhaustion.ql',
-                'CWE-798': 'Security/CWE-798/HardcodedCredentials.ql',
-            },
-            'python': {
-                'CWE-89': 'Security/CWE-089/SqlInjection.ql',
-                'CWE-94': 'Security/CWE-094/CodeInjection.ql',
-                'CWE-22': 'Security/CWE-022/PathInjection.ql',
-                'CWE-502': 'Security/CWE-502/UnsafeDeserialization.ql',
-                'CWE-78': 'Security/CWE-078/CommandInjection.ql',
-            },
-            'java': {
-                'CWE-89': 'Security/CWE-089/SqlInjection.ql',
-                'CWE-79': 'Security/CWE-079/Xss.ql',
-                'CWE-502': 'Security/CWE-502/UnsafeDeserialization.ql',
-            },
-            'cpp': {
-                'CWE-119': 'Security/CWE/CWE-119/BufferOverflow.ql',
-                'CWE-190': 'Security/CWE/CWE-190/IntegerOverflow.ql',
-                'CWE-416': 'Security/CWE/CWE-416/UseAfterFree.ql',
-            }
-        }
-        
-        # Get the relative query path for the ACTUAL language pack (not detected language)
-        queries = cwe_query_map.get(actual_language, {})
-        relative_path = queries.get(cwe)
-        
-        if not relative_path:
-            self._log(None, f"No query available for {cwe} in {actual_language} (detected: {language})")
-            return None
-            
-        # Construct full path using the correct base path for the actual language
-        base_path = base_paths.get(actual_language)
-        if not base_path:
-            self._log(None, f"No base path for language pack: {actual_language}")
-            return None
-            
-        query_path = f"{base_path}/{relative_path}"
-        
-        # Check if the query file exists
-        if query_path and os.path.exists(query_path):
-            self._log(None, f"Found query for {cwe} using {actual_language} pack: {query_path}")
-            return query_path
-        
-        # Fallback: try to find query in alternative locations
-        self._log(None, f"Query not found at {query_path}, trying fallback")
-        return self._find_fallback_query(cwe, actual_language)
-    
-    def _find_fallback_query(self, cwe: str, language: str) -> Optional[str]:
-        """Find a fallback query file if the standard one doesn't exist"""
-        # Try alternative base paths (configurable base first, then common locations)
-        base_paths = [
-            settings.CODEQL_PACKS_BASE,
-            os.path.join(settings.CODEQL_PACKS_BASE, "javascript/javascript"),
-            os.path.join(settings.CODEQL_PACKS_BASE, "javascript"),
-            os.path.join(settings.CODEQL_PACKS_BASE, "codeql-main"),
-            "/app/codeql_queries",
-            "codeql_queries"
-        ]
-        
-        # Map CWE to custom query files
-        custom_queries = {
-            "CWE-119": "BufferOverflow.ql",
-            "CWE-89": "SqlInjection.ql",
-            "CWE-416": "UseAfterFree.ql",
-            "CWE-190": "IntegerOverflow.ql"
-        }
-        
-        query_file = custom_queries.get(cwe)
-        if not query_file:
-            return None
-            
-        for base_path in base_paths:
-            query_path = os.path.join(base_path, query_file)
-            if os.path.exists(query_path):
-                return query_path
-        
-        return None
-    
-    def _run_codeql_query(self, state: ScanState, cwe: str, language: str, db_path: str) -> List[VulnerabilityState]:
-        """Run a specific CodeQL query against an existing database"""
-        query_path = self._get_cwe_query(cwe, language)
-        
-        if not query_path:
-            # Fall back to custom query files for basic CWEs
-            query_map = {
-                "CWE-119": "BufferOverflow.ql",
-                "CWE-89": "SqlInjection.ql",
-                "CWE-416": "UseAfterFree.ql",
-                "CWE-190": "IntegerOverflow.ql"
-            }
-            query_file = query_map.get(cwe)
-            if not query_file:
-                return []
-            query_path = os.path.join("codeql_queries", query_file)
-            if not os.path.exists(query_path):
-                return []
-        
-        try:
-            
-            # Run query
-            result_path = os.path.join(settings.TEMP_DIR, f"codeql_results_{cwe}.json")
-            
-            self._log(state, f"Query path for {cwe}: {query_path}")
-            self._log(state, f"Query file exists: {os.path.exists(query_path) if query_path else False}")
-            
-            if not query_path or not os.path.exists(query_path):
-                self._log(state, f"No query available for {cwe}, skipping")
-                return []
-            
-            # Use database analyze command which supports SARIF output
-            cmd = [
-                settings.CODEQL_CLI_PATH,
-                "database", "analyze",
-                db_path,
-                query_path,
-                "--format=sarifv2.1.0",
-                f"--output={result_path}"
-            ]
-            
-            self._log(state, f"Running command: {' '.join(cmd)}")
-            
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=300  # 5 minutes for query compilation + execution
-            )
-            
-            self._log(state, f"CodeQL exit code: {result.returncode}")
-            if result.stderr:
-                self._log(state, f"CodeQL stderr: {result.stderr[:500]}")
-            
-            # Parse SARIF results
-            findings = []
-            if os.path.exists(result_path):
-                try:
-                    with open(result_path, 'r') as f:
-                        sarif = json.load(f)
-                        # SARIF format: runs[0].results
-                        runs = sarif.get("runs", [])
-                        if runs:
-                            results = runs[0].get("results", [])
-                            for res in results:
-                                locations = res.get("locations", [])
-                                if locations:
-                                    loc = locations[0].get("physicalLocation", {})
-                                    artifact = loc.get("artifactLocation", {})
-                                    region = loc.get("region", {})
-                                    
-                                    filepath = artifact.get("uri", "")
-                                    
-                                    # Detect language for this specific file
-                                    file_lang = self._get_language_from_extension(
-                                        os.path.splitext(filepath)[1].lower()
-                                    ) or state.get("detected_language", "unknown")
-                                    
-                                    finding = VulnerabilityState(
-                                        cve_id=None,
-                                        filepath=filepath,
-                                        line_number=region.get("startLine", 0),
-                                        cwe_type=cwe,
-                                        code_chunk=res.get("message", {}).get("text", ""),
-                                        llm_verdict="",
-                                        llm_explanation="",
-                                        confidence=0.8,  # CodeQL findings have high confidence
-                                        pov_script=None,
-                                        pov_path=None,
-                                        pov_result=None,
-                                        retry_count=0,
-                                        inference_time_s=0.0,
-                                        cost_usd=0.0,
-                                        final_status="pending",
-                                        detected_language=file_lang,
-                                        source="codeql"
-                                    )
-                                    findings.append(finding)
-                except Exception as e:
-                    self._log(state, f"Error parsing SARIF results: {e}")
-            
-            return findings
-            
-        except subprocess.TimeoutExpired as e:
-            self._log(state, f"CodeQL query timeout for {cwe}: Query compilation took too long")
-            return []
-        except Exception as e:
-            self._log(state, f"CodeQL query error for {cwe}: {e}")
-            return []
-    
     def _run_llm_only_analysis(self, state: ScanState) -> List[VulnerabilityState]:
         """
         Run LLM-only analysis when CodeQL is not available.
@@ -800,37 +485,44 @@ class AgentGraph:
             if not content.strip():
                 continue
 
-            # Use heuristic patterns as a pre-filter to avoid LLM calls on clean files
-            from agents.heuristic_scout import get_heuristic_scout
-            scout = get_heuristic_scout()
+            # Use simple pattern matching as a pre-filter to avoid LLM calls on clean files
+            # Basic dangerous function patterns
+            dangerous_patterns = [
+                r'eval\s*\(', r'exec\s*\(', r'system\s*\(', r'popen\s*\(',
+                r'strcpy\s*\(', r'strcat\s*\(', r'sprintf\s*\(',
+                r'malloc\s*\([^)]*\)\s*;',  # malloc without size check
+                r'sqlite3_exec\s*\(', r'mysql_query\s*\(',
+                r'innerHTML\s*=', r'document\.write\s*\(',
+            ]
+            import re
             heuristic_hits = []
             try:
                 lines = content.split('\n')
                 for line_idx, line in enumerate(lines, start=1):
-                    for cwe in state["cwes"]:
-                        for pattern in scout._patterns.get(cwe, []):
-                            if pattern.search(line):
-                                heuristic_hits.append({
-                                    "cwe_type": cwe,
-                                    "filepath": rel_path,
-                                    "line_number": line_idx,
-                                    "code_chunk": line.strip(),
-                                    "llm_verdict": "",
-                                    "llm_explanation": "",
-                                    "confidence": 0.35,
-                                    "pov_script": None,
-                                    "pov_path": None,
-                                    "pov_result": None,
-                                    "retry_count": 0,
-                                    "inference_time_s": 0.0,
-                                    "cost_usd": 0.0,
-                                    "final_status": "pending",
-                                    "alert_message": "LLM-only heuristic",
-                                    "source": "llm_only",
-                                    "language": state.get("detected_language", "unknown")
-                                })
+                    for pattern_str in dangerous_patterns:
+                        if re.search(pattern_str, line):
+                            heuristic_hits.append({
+                                "cwe_type": "UNCLASSIFIED",
+                                "filepath": rel_path,
+                                "line_number": line_idx,
+                                "code_chunk": line.strip(),
+                                "llm_verdict": "",
+                                "llm_explanation": "",
+                                "confidence": 0.35,
+                                "pov_script": None,
+                                "pov_path": None,
+                                "pov_result": None,
+                                "retry_count": 0,
+                                "inference_time_s": 0.0,
+                                "cost_usd": 0.0,
+                                "final_status": "",
+                                "alert_message": "LLM-only pattern match",
+                                "source": "llm_only",
+                                "language": state.get("detected_language", "unknown")
+                            })
+                            break  # Only add each line once
             except Exception as e:
-                self._log(state, f"Heuristic pre-filter error on {rel_path}: {e}")
+                self._log(state, f"Pattern pre-filter error on {rel_path}: {e}")
 
             findings.extend(heuristic_hits)
 
@@ -838,12 +530,20 @@ class AgentGraph:
         return findings
     
     def _node_investigate(self, state: ScanState) -> ScanState:
-        """Investigate ONE finding with LLM (at current_finding_idx)"""
+        """Investigate ONE finding with LLM (at current_finding_idx) or ALL in parallel"""
         # Check for cancellation
         if self._check_cancelled(state):
             self._log(state, "Scan cancelled by user")
             state["status"] = ScanStatus.CANCELLED
             return state
+        
+        # Use parallel processing if enabled and this is the first finding
+        # But only if there are pending findings that haven't been investigated yet
+        if settings.PARALLEL_PROCESSING_ENABLED and state.get("current_finding_idx", 0) == 0:
+            pending_findings = [f for f in state["findings"] if not f.get("llm_verdict")]
+            if pending_findings:
+                return self._node_investigate_parallel(state)
+            # If all findings already have llm_verdict, skip parallel and let routing handle it
         
         state["status"] = ScanStatus.INVESTIGATING
         
@@ -860,11 +560,8 @@ class AgentGraph:
             return state
         
         self._log(state, f"Investigating {finding['cwe_type']} at {finding['filepath']}:{finding['line_number']}")
-        self._log(state, "Selecting model via policy...")
-        
-        policy = get_policy_router()
-        model_to_use = policy.select_model("investigate", cwe=finding["cwe_type"], language=state.get("detected_language"))
-        self._log(state, f"Using model (policy): {model_to_use}")
+        model_to_use = self._get_selected_model(state)
+        self._log(state, f"Using selected model: {model_to_use}")
         investigator = get_investigator()
 
         # Pass the model name and optional per-request API key from scan state
@@ -906,6 +603,8 @@ class AgentGraph:
         model_used = result.get("model_used", model_to_use)
         
         finding["model_used"] = model_used
+        finding["openrouter_usage"] = result.get("openrouter_usage", {})
+        self._append_scan_openrouter_usage(state, finding["openrouter_usage"], "investigator", finding=finding)
         finding["prompt_tokens"] = token_usage.get("prompt_tokens", 0)
         finding["completion_tokens"] = token_usage.get("completion_tokens", 0)
         finding["total_tokens"] = token_usage.get("total_tokens", 0)
@@ -940,23 +639,197 @@ class AgentGraph:
         if finding["total_tokens"] > 0:
             self._log(state, f"  Tokens: {finding['total_tokens']} (prompt: {finding['prompt_tokens']}, completion: {finding['completion_tokens']})")
 
-        try:
-            get_learning_store().record_investigation(
-                scan_id=state["scan_id"],
-                cwe=finding.get("cwe_type", ""),
-                filepath=finding.get("filepath", ""),
-                language=state.get("detected_language", "unknown"),
-                source=finding.get("source", "codeql"),
-                verdict=finding.get("llm_verdict", "UNKNOWN"),
-                confidence=finding.get("confidence", 0.0),
-                model=model_to_use,
-                cost_usd=finding.get("cost_usd", 0.0)
-            )
-        except Exception as e:
-            self._log(state, f"Learning store record failed: {e}")
-
         return state
     
+    def _investigate_finding_batch(self, findings_batch: List[Dict[str, Any]], state: ScanState, model_name: str) -> List[Dict[str, Any]]:
+        """Investigate a batch of findings in parallel. Thread-safe."""
+        investigator = get_investigator()
+        results = []
+        
+        for finding in findings_batch:
+            try:
+                result = investigator.investigate(
+                    scan_id=state["scan_id"],
+                    codebase_path=state["codebase_path"],
+                    cwe_type=finding["cwe_type"],
+                    filepath=finding["filepath"],
+                    line_number=finding["line_number"],
+                    alert_message=finding.get("alert_message", ""),
+                    model_name=model_name,
+                    api_key_override=state.get("openrouter_api_key")
+                )
+                
+                finding["llm_verdict"] = result.get("verdict", "UNKNOWN")
+                finding["llm_explanation"] = result.get("explanation", "")
+                finding["confidence"] = result.get("confidence", 0.0)
+                finding["inference_time_s"] = result.get("inference_time_s", 0.0)
+                finding["code_chunk"] = result.get("vulnerable_code", "") or finding.get("code_chunk", "")
+                finding["cwe_type"] = result.get("cwe_type") or finding.get("cwe_type") or "UNCLASSIFIED"
+                finding["cve_id"] = result.get("cve_id")
+                
+                # Track tokens
+                token_usage = result.get("token_usage", {})
+                model_used = result.get("model_used", model_name)
+                finding["model_used"] = model_used
+                finding["openrouter_usage"] = result.get("openrouter_usage", {})
+                finding["prompt_tokens"] = token_usage.get("prompt_tokens", 0)
+                finding["completion_tokens"] = token_usage.get("completion_tokens", 0)
+                finding["total_tokens"] = token_usage.get("total_tokens", 0)
+                finding["cost_usd"] = result.get("cost_usd", 0.0)
+                
+            except Exception as e:
+                finding["llm_verdict"] = "UNKNOWN"
+                finding["llm_explanation"] = f"Investigation failed: {str(e)}"
+                finding["confidence"] = 0.0
+            
+            results.append(finding)
+        
+        return results
+    
+    def _node_investigate_parallel(self, state: ScanState) -> ScanState:
+        """Investigate ALL findings in parallel batches for faster processing"""
+        if not settings.PARALLEL_PROCESSING_ENABLED:
+            return self._node_investigate(state)
+        
+        state["status"] = ScanStatus.INVESTIGATING
+        
+        # Get findings that haven't been investigated yet
+        pending_findings = [f for f in state["findings"] if not f.get("llm_verdict")]
+        
+        if not pending_findings:
+            self._log(state, "No pending findings to investigate")
+            return state
+        
+        self._log(state, f"Starting parallel investigation of {len(pending_findings)} findings with {settings.PARALLEL_MAX_WORKERS} workers")
+        
+        model_to_use = self._get_selected_model(state)
+        
+        # Split findings into batches for parallel processing
+        batch_size = max(1, len(pending_findings) // settings.PARALLEL_MAX_WORKERS)
+        batches = [pending_findings[i:i + batch_size] for i in range(0, len(pending_findings), batch_size)]
+        
+        all_results = []
+        total_tokens = 0
+        total_cost = 0.0
+        
+        with ThreadPoolExecutor(max_workers=settings.PARALLEL_MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(self._investigate_finding_batch, batch, state, model_to_use): i
+                for i, batch in enumerate(batches)
+            }
+            
+            for future in as_completed(futures):
+                batch_idx = futures[future]
+                try:
+                    batch_results = future.result()
+                    all_results.extend(batch_results)
+                    self._log(state, f"Completed batch {batch_idx + 1}/{len(batches)}")
+                except Exception as e:
+                    self._log(state, f"Batch {batch_idx} failed: {e}")
+        
+        # Update state with results
+        for result in all_results:
+            # Find and update the corresponding finding in state
+            for i, f in enumerate(state["findings"]):
+                if (f["filepath"] == result["filepath"] and 
+                    f["line_number"] == result["line_number"]):
+                    state["findings"][i] = result
+                    self._append_scan_openrouter_usage(state, result.get("openrouter_usage"), "investigator", finding=result)
+                    total_tokens += result.get("total_tokens", 0)
+                    total_cost += result.get("cost_usd", 0.0)
+                    break
+        
+        state["total_tokens"] = state.get("total_tokens", 0) + total_tokens
+        state["total_cost_usd"] = state.get("total_cost_usd", 0.0) + total_cost
+        
+        # Keep current_finding_idx at 0 to start routing through decision logic
+        # All findings now have llm_verdict, so the workflow will route each through _should_generate_pov
+        state["current_finding_idx"] = 0
+        
+        self._log(state, f"Parallel investigation complete. Total tokens: {total_tokens}, Cost: ${total_cost:.4f}")
+        
+        return state
+    
+    def _build_pov_context(self, finding: Dict[str, Any], code_context: str, state: ScanState) -> str:
+        if not code_context:
+            return ''
+        vulnerable = str(finding.get('code_chunk') or '').strip()
+        if not vulnerable:
+            return code_context[:2400]
+        idx = code_context.find(vulnerable)
+        if idx == -1:
+            return code_context[:2400]
+        offline = state.get('model_mode') == 'offline'
+        window = 1200 if offline else 3000
+        start = max(0, idx - window)
+        end = min(len(code_context), idx + len(vulnerable) + window)
+        return code_context[start:end]
+
+
+    def _infer_runtime_profile(self, finding: Dict[str, Any], state: ScanState) -> str:
+        """Infer the best runtime harness from exploit contract, explicit profile, and file language."""
+        exploit_contract = finding.get('exploit_contract') or {}
+        explicit = str(finding.get('execution_profile') or exploit_contract.get('runtime_profile') or '').strip().lower()
+        if explicit:
+            return explicit
+
+        target_entrypoint = str(exploit_contract.get('target_entrypoint') or '').strip().lower()
+        target_url = str(exploit_contract.get('target_url') or exploit_contract.get('base_url') or '').strip().lower()
+        if target_url.startswith('http://') or target_url.startswith('https://') or target_entrypoint.startswith('/') or target_entrypoint.startswith('http'):
+            return 'web'
+
+        filepath = str(finding.get('filepath') or '').lower()
+        _, ext = os.path.splitext(filepath)
+        if ext in {'.c', '.h'}:
+            return 'c'
+        if ext in {'.cc', '.cpp', '.cxx', '.hpp'}:
+            return 'cpp'
+        if ext in {'.js', '.jsx'}:
+            return 'javascript'
+        if ext in {'.ts', '.tsx'}:
+            return 'node'
+        if ext == '.py':
+            return 'python'
+
+        detected = str(finding.get('detected_language') or state.get('detected_language') or '').strip().lower()
+        if detected in {'c', 'cpp', 'python', 'javascript', 'typescript', 'node'}:
+            return 'node' if detected == 'typescript' else detected
+
+        return 'python'
+
+    def _infer_runtime_profile(self, finding: Dict[str, Any], state: ScanState) -> str:
+        """Infer the best runtime harness from the exploit contract, file path, and detected language."""
+        exploit_contract = finding.get('exploit_contract') or {}
+        explicit = str(finding.get('execution_profile') or exploit_contract.get('runtime_profile') or '').strip().lower()
+        if explicit:
+            return explicit
+
+        target_entrypoint = str(exploit_contract.get('target_entrypoint') or '').strip().lower()
+        target_url = str(exploit_contract.get('target_url') or exploit_contract.get('base_url') or '').strip().lower()
+        if target_url.startswith('http://') or target_url.startswith('https://') or target_entrypoint.startswith('/') or target_entrypoint.startswith('http'):
+            return 'web'
+
+        filepath = str(finding.get('filepath') or '').lower()
+        _, ext = os.path.splitext(filepath)
+        if ext in {'.c', '.h'}:
+            return 'c'
+        if ext in {'.cc', '.cpp', '.cxx', '.hpp'}:
+            return 'cpp'
+        if ext in {'.js', '.jsx'}:
+            return 'javascript'
+        if ext in {'.ts', '.tsx'}:
+            return 'node'
+        if ext == '.py':
+            return 'python'
+
+        detected = str(finding.get('detected_language') or state.get('detected_language') or '').strip().lower()
+        if detected in {'c', 'cpp', 'python', 'javascript', 'node'}:
+            return detected
+        if detected == 'typescript':
+            return 'node'
+
+        return 'python'
+
     def _node_generate_pov(self, state: ScanState) -> ScanState:
         """Generate PoV script for a finding"""
         # Check for cancellation
@@ -976,19 +849,42 @@ class AgentGraph:
         
         if finding["llm_verdict"] != "REAL":
             return state
+        confidence = float(finding.get("confidence", 0.0) or 0.0)
+        if confidence < settings.MIN_CONFIDENCE_FOR_POV:
+            self._log(state, f"Skipping PoV generation because confidence {confidence:.2f} is below the proof threshold {settings.MIN_CONFIDENCE_FOR_POV:.2f}")
+            finding["final_status"] = "unproven_low_confidence"
+            state["findings"][idx] = finding
+            return state
         
         self._log(state, f"Generating PoV for {finding['cwe_type']}...")
 
-        policy = get_policy_router()
-        model_to_use = policy.select_model("pov", cwe=finding["cwe_type"], language=state.get("detected_language"))
-        self._log(state, f"Using model (policy) for PoV: {model_to_use}")
+        model_to_use = self._get_selected_model(state)
+        self._log(state, f"Using selected model for PoV: {model_to_use}")
         
         verifier = get_verifier()
         
-        # Get code context
-        code_context = get_code_ingester().get_file_content(
-            finding["filepath"], state["scan_id"]
-        ) or ""
+        # Get code context - try ChromaDB first, then fall back to disk
+        full_code_context = None
+        try:
+            full_code_context = get_code_ingester().get_file_content(
+                finding["filepath"], state["scan_id"]
+            )
+        except Exception:
+            pass
+        
+        # Fallback: read directly from disk
+        if not full_code_context:
+            try:
+                abs_path = os.path.join(state["codebase_path"], finding["filepath"]) if not os.path.isabs(finding["filepath"]) else finding["filepath"]
+                if os.path.isfile(abs_path):
+                    with open(abs_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        full_code_context = f.read()
+            except Exception:
+                pass
+        
+        full_code_context = full_code_context or ""
+        code_context = self._build_pov_context(finding, full_code_context, state)
+        self._log(state, f"Using PoV context window: {len(code_context)} chars")
         
         # Get target language for language-aware PoV generation
         target_language = state.get("detected_language", "python")
@@ -1002,7 +898,8 @@ class AgentGraph:
             explanation=finding["llm_explanation"],
             code_context=code_context,
             target_language=target_language,
-            model_name=model_to_use
+            model_name=model_to_use,
+            exploit_contract=finding.get("exploit_contract") or {}
         )
         
         # Log model and token info
@@ -1041,6 +938,8 @@ class AgentGraph:
             finding["execution_profile"] = ((result.get("exploit_contract") or {}).get("runtime_profile") or finding.get("execution_profile"))
             finding["exploit_contract"] = result.get("exploit_contract")
             finding["pov_model_used"] = model_used
+            finding["pov_openrouter_usage"] = result.get("openrouter_usage", {})
+            self._append_scan_openrouter_usage(state, finding["pov_openrouter_usage"], "pov_generation", finding=finding)
             finding["pov_prompt_tokens"] = prompt_tokens
             finding["pov_completion_tokens"] = completion_tokens
             finding["pov_total_tokens"] = total_tokens
@@ -1066,6 +965,17 @@ class AgentGraph:
         finding = state["findings"][idx]
         
         if not finding.get("pov_script"):
+            self._log(state, "No PoV script available for validation")
+            finding["validation_result"] = {
+                "is_valid": False,
+                "issues": ["No PoV script generated"],
+                "suggestions": [],
+                "will_trigger": "NO",
+                "validation_method": "missing_pov",
+                "static_result": None,
+                "unit_test_result": None,
+            }
+            state["findings"][idx] = finding
             return state
         
         self._log(state, "Validating PoV script...")
@@ -1075,13 +985,15 @@ class AgentGraph:
         # Get vulnerable code for unit test validation
         vulnerable_code = finding.get("code_chunk", "")
         
+        model_to_use = self._get_selected_model(state)
         result = verifier.validate_pov(
             pov_script=finding["pov_script"],
             cwe_type=finding["cwe_type"],
             filepath=finding["filepath"],
             line_number=finding["line_number"],
             vulnerable_code=vulnerable_code,
-            exploit_contract=finding.get("exploit_contract") or {}
+            exploit_contract=finding.get("exploit_contract") or {},
+            model_name=model_to_use
         )
         
         # Log validation method used
@@ -1115,6 +1027,7 @@ class AgentGraph:
         
         # Store validation result in finding
         finding["validation_result"] = result
+        self._append_scan_openrouter_usage(state, result.get("openrouter_usage"), "llm_validation", finding=finding)
         
         state["findings"][idx] = finding
         return state
@@ -1144,19 +1057,34 @@ class AgentGraph:
         self._log(state, f"  Errors: {validation_errors[:2]}")
         
         # Get code context
-        code_context = get_code_ingester().get_file_content(
-            finding["filepath"], state["scan_id"]
-        ) or ""
+        full_code_context = ""
+        try:
+            full_code_context = get_code_ingester().get_file_content(
+                finding["filepath"], state["scan_id"]
+            ) or ""
+        except Exception:
+            full_code_context = ""
+
+        if not full_code_context:
+            try:
+                candidate_path = finding["filepath"]
+                abs_path = candidate_path if os.path.isabs(candidate_path) else os.path.join(state["codebase_path"], candidate_path)
+                if os.path.isfile(abs_path):
+                    with open(abs_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        full_code_context = f.read()
+            except Exception:
+                full_code_context = full_code_context or ""
+
+        code_context = self._build_pov_context(finding, full_code_context, state)
+        self._log(state, f"Using PoV context window: {len(code_context)} chars")
         
         # Get target language
         target_language = state.get("detected_language", "python")
         
-        # Select model for refinement (use architect model in hierarchical mode)
-        policy = get_policy_router()
-        model_to_use = policy.select_model("pov", cwe=finding["cwe_type"], language=target_language)
+        model_to_use = self._get_selected_model(state)
         
         # Initialize refinement history
-        if "refinement_history" not in finding:
+        if not isinstance(finding.get("refinement_history"), list):
             finding["refinement_history"] = []
         
         # Call verifier to refine the PoV
@@ -1172,13 +1100,15 @@ class AgentGraph:
             validation_errors=validation_errors,
             attempt_number=finding["retry_count"] + 1,
             target_language=target_language,
-            model_name=model_to_use
+            model_name=model_to_use,
+            exploit_contract=finding.get("exploit_contract") or {}
         )
         
         # Track refinement in history with tokens
         model_used = result.get("model_used", model_to_use)
         token_usage = result.get("token_usage", {})
         
+        self._append_scan_openrouter_usage(state, result.get("openrouter_usage"), "pov_refinement", finding=finding, attempt=finding["retry_count"] + 1)
         finding["refinement_history"].append({
             "attempt": finding["retry_count"] + 1,
             "errors": validation_errors,
@@ -1186,7 +1116,8 @@ class AgentGraph:
             "timestamp": result.get("timestamp", ""),
             "model_used": model_used,
             "tokens": token_usage,
-            "cost_usd": result.get("cost_usd", 0.0)
+            "cost_usd": result.get("cost_usd", 0.0),
+            "openrouter_usage": result.get("openrouter_usage", {})
         })
         
         # Track tokens
@@ -1229,7 +1160,7 @@ class AgentGraph:
         return state
 
     def _node_run_in_docker(self, state: ScanState) -> ScanState:
-        """Run PoV - uses validation results instead of Docker execution"""
+        """Run PoV proof and only confirm findings when exploit evidence is observed."""
         state["status"] = ScanStatus.RUNNING_POV
 
         idx = state.get("current_finding_idx", 0)
@@ -1259,45 +1190,13 @@ class AgentGraph:
                 "execution_time_s": unit_test_result.get("execution_time_s", 0)
             }
             self._log(state, "VULNERABILITY CONFIRMED")
-            try:
-                get_learning_store().record_pov(
-                    scan_id=state["scan_id"],
-                    cwe=finding.get("cwe_type", ""),
-                    model=finding.get("pov_model_used", ""),
-                    cost_usd=finding.get("cost_usd", 0.0),
-                    success=True,
-                    validation_method="unit_test"
-                )
-            except Exception as e:
-                self._log(state, f"Learning store PoV record failed: {e}")
             state["findings"][idx] = finding
             return state
 
-        # If static validation has high confidence, trust it
+        # Static validation is advisory only; runtime evidence is still required
         static_result = validation_result.get("static_result", {})
         if static_result.get("is_valid") and static_result.get("confidence", 0) >= 0.8:
-            self._log(state, "Using static validation result (high confidence)")
-            finding["pov_result"] = {
-                "success": True,
-                "vulnerability_triggered": True,  # Assume triggered based on static analysis
-                "validation_method": "static_analysis",
-                "confidence": static_result.get("confidence", 0),
-                "note": "Vulnerability confirmed via static analysis"
-            }
-            self._log(state, "VULNERABILITY CONFIRMED (static analysis)")
-            try:
-                get_learning_store().record_pov(
-                    scan_id=state["scan_id"],
-                    cwe=finding.get("cwe_type", ""),
-                    model=finding.get("pov_model_used", ""),
-                    cost_usd=finding.get("cost_usd", 0.0),
-                    success=True,
-                    validation_method="static_analysis"
-                )
-            except Exception as e:
-                self._log(state, f"Learning store PoV record failed: {e}")
-            state["findings"][idx] = finding
-            return state
+            self._log(state, "Static validation looks strong, but runtime exploit evidence is still required before confirmation")
 
         # Fall back to runtime execution for cases where validation was inconclusive
         if not finding.get("pov_script"):
@@ -1314,7 +1213,8 @@ class AgentGraph:
             state["findings"][idx] = finding
             return state
 
-        execution_profile = finding.get("execution_profile") or ((finding.get("exploit_contract") or {}).get("runtime_profile")) or finding.get("detected_language") or state.get("detected_language") or "python"
+        execution_profile = self._infer_runtime_profile(finding, state)
+        target_language = execution_profile if execution_profile in {"c", "cpp", "python", "javascript", "typescript", "node"} else (finding.get("detected_language") or state.get("detected_language") or "python")
         self._log(state, f"Using execution profile: {execution_profile}")
 
         specialized_result = get_pov_tester().test_with_contract(
@@ -1323,13 +1223,19 @@ class AgentGraph:
             cwe_type=finding.get("cwe_type", ""),
             codebase_path=state["codebase_path"],
             exploit_contract=finding.get("exploit_contract") or {},
-            target_language=finding.get("detected_language") or state.get("detected_language") or "python"
+            target_language=target_language,
+            vulnerable_code=finding.get("code_chunk", ""),
+            filepath=finding.get("filepath", "")
         )
 
         if specialized_result.get("success"):
             self._log(state, f"Specialized runtime harness used: {specialized_result.get('validation_method', 'runtime_harness')}")
             finding["pov_result"] = specialized_result
             result = specialized_result
+        elif specialized_result.get("proof_infrastructure_error"):
+            self._log(state, f"Native/runtime proof harness failed: {specialized_result.get('stderr', 'unknown error')}")
+            result = specialized_result
+            finding["pov_result"] = result
         else:
             self._log(state, f"Specialized runtime harness unavailable: {specialized_result.get('stderr', 'unknown error')}")
             self._log(state, "Running PoV in Docker (generic fallback)...")
@@ -1339,7 +1245,7 @@ class AgentGraph:
                 scan_id=state["scan_id"],
                 pov_id=str(idx),
                 execution_profile=execution_profile,
-                target_language=finding.get("detected_language") or state.get("detected_language"),
+                target_language=target_language,
                 exploit_contract=finding.get("exploit_contract") or {}
             )
             finding["pov_result"] = result
@@ -1351,17 +1257,6 @@ class AgentGraph:
         else:
             self._log(state, f"  PoV did not trigger vulnerability (exit code: {result['exit_code']})")
 
-        try:
-            get_learning_store().record_pov(
-                scan_id=state["scan_id"],
-                cwe=finding.get("cwe_type", ""),
-                model=finding.get("pov_model_used", ""),
-                cost_usd=finding.get("cost_usd", 0.0),
-                success=bool(result.get("vulnerability_triggered")),
-                validation_method="docker"
-            )
-        except Exception as e:
-            self._log(state, f"Learning store PoV record failed: {e}")
 
         state["findings"][idx] = finding
         return state
@@ -1371,6 +1266,9 @@ class AgentGraph:
         idx = state.get("current_finding_idx", 0)
         if idx < len(state["findings"]):
             state["findings"][idx]["final_status"] = "confirmed"
+            # Track confirmed count for early termination
+            state["confirmed_count"] = state.get("confirmed_count", 0) + 1
+            self._log(state, f"Confirmed vulnerability #{state['confirmed_count']}: {state['findings'][idx].get('cwe_type', 'UNCLASSIFIED')}")
         
         # Move to next finding
         state["current_finding_idx"] = idx + 1
@@ -1389,7 +1287,8 @@ class AgentGraph:
         """Log skipped finding"""
         idx = state.get("current_finding_idx", 0)
         if idx < len(state["findings"]):
-            state["findings"][idx]["final_status"] = "skipped"
+            if not state["findings"][idx].get("final_status"):
+                state["findings"][idx]["final_status"] = "skipped"
         
         # Move to next finding
         state["current_finding_idx"] = idx + 1
@@ -1426,14 +1325,51 @@ class AgentGraph:
             self._log(state, "No findings to process, ending workflow")
             return "log_skip"
         
+        # Early termination: Stop after N confirmed findings
+        confirmed_count = state.get("confirmed_count", 0)
+        if settings.EARLY_STOP_AFTER_CONFIRMED > 0 and confirmed_count >= settings.EARLY_STOP_AFTER_CONFIRMED:
+            self._log(state, f"Early termination: {confirmed_count} confirmed findings reached (limit: {settings.EARLY_STOP_AFTER_CONFIRMED})")
+            # Mark remaining findings as skipped
+            for i in range(idx, len(state["findings"])):
+                state["findings"][i]["final_status"] = "skipped_early_stop"
+            state["status"] = ScanStatus.COMPLETED
+            state["end_time"] = datetime.utcnow().isoformat()
+            return "log_skip"
+        
+        # Lite mode: Skip PoV generation entirely, just report findings
+        if settings.LITE_MODE:
+            finding = state["findings"][idx]
+            verdict = finding.get("llm_verdict", "UNKNOWN")
+            confidence = finding.get("confidence", 0.0)
+            if verdict == "REAL" or confidence >= settings.MIN_CONFIDENCE_FOR_POV:
+                finding["final_status"] = "unproven_lite"
+            else:
+                finding["final_status"] = "skipped_lite"
+            self._log(state, f"LITE MODE: Finding {idx} status={finding['final_status']} (no exploit proof attempted)")
+            return "log_skip"
+        
         finding = state["findings"][idx]
         verdict = finding.get("llm_verdict", "UNKNOWN")
         confidence = finding.get("confidence", 0.0)
+        source = finding.get("source", "unknown")
         
-        self._log(state, f"Decision for finding {idx}: verdict={verdict}, confidence={confidence:.2f}")
+        self._log(state, f"Decision for finding {idx}: verdict={verdict}, confidence={confidence:.2f}, source={source}")
         
-        if verdict == "REAL" and confidence >= 0.7:
+        # Trust high-confidence findings from static analyzers (CodeQL, Semgrep)
+        # Skip re-investigation if confidence >= 0.8 and source is a trusted static analyzer
+        trusted_sources = {"codeql", "semgrep"}
+        if source in trusted_sources and confidence >= 0.8 and verdict in ["UNKNOWN", ""]:
+            self._log(state, f"Finding {idx} from {source} has high confidence ({confidence:.2f}), trusting static analysis result")
+            # Mark as REAL to proceed to PoV generation
+            finding["llm_verdict"] = "REAL"
+            finding["llm_explanation"] = f"Trusted finding from {source} static analysis with {confidence:.0%} confidence"
+            state["findings"][idx] = finding
+            verdict = "REAL"
+        
+        # Only generate PoV for findings that meet minimum confidence threshold
+        if verdict == "REAL" and confidence >= settings.MIN_CONFIDENCE_FOR_POV:
             if state.get("proofs_attempted", 0) >= settings.PROOF_MAX_FINDINGS:
+                finding["final_status"] = "unproven_budget_exhausted"
                 self._log(state, f"Proof budget reached ({settings.PROOF_MAX_FINDINGS}); recording finding without runtime proof")
                 return "log_skip"
             state["proofs_attempted"] = state.get("proofs_attempted", 0) + 1
@@ -1441,6 +1377,8 @@ class AgentGraph:
             self._update_scan_runtime(state, status=ScanStatus.GENERATING_POV, progress=min(92, 50 + idx * 3))
             return "generate_pov"
         else:
+            if verdict == "REAL":
+                finding["final_status"] = "unproven_low_confidence"
             self._log(state, f"Finding {idx} skipped (verdict={verdict}, confidence={confidence:.2f})")
             return "log_skip"
     
@@ -1451,7 +1389,14 @@ class AgentGraph:
             return "log_failure"
         
         finding = state["findings"][idx]
-        validation_result = finding.get("validation_result", {})
+        validation_result = finding.get("validation_result") or {}
+        if not isinstance(validation_result, dict):
+            validation_result = {}
+
+        pov_script = (finding.get("pov_script") or "").strip()
+        if not pov_script:
+            self._log(state, "No PoV script available after generation/validation; marking finding as failed")
+            return "log_failure"
         
         # Check if validation passed
         if validation_result.get("is_valid"):
@@ -1465,6 +1410,18 @@ class AgentGraph:
             self._log(state, f"PoV validation failed after {settings.MAX_RETRIES} attempts")
             return "log_failure"
     
+    def _after_runtime_proof(self, state: ScanState) -> str:
+        """Route based on whether runtime proof actually triggered the vulnerability."""
+        idx = state.get("current_finding_idx", 0)
+        if idx >= len(state.get("findings", [])):
+            return "log_failure"
+        finding = state["findings"][idx]
+        pov_result = finding.get("pov_result") or {}
+        if isinstance(pov_result, dict) and pov_result.get("vulnerability_triggered"):
+            return "log_confirmed"
+        self._log(state, "Runtime proof did not trigger the vulnerability")
+        return "log_failure"
+
     def _has_more_findings(self, state: ScanState) -> str:
         """Check if there are more findings to process after logging"""
         idx = state.get("current_finding_idx", 0)
@@ -1472,15 +1429,30 @@ class AgentGraph:
         
         self._log(state, f"Checking for more findings: current={idx}, total={total}")
         
-        if idx < total:
-            self._log(state, f"Processing next finding ({idx + 1}/{total})")
-            return "investigate"  # More findings to process
-        else:
+        # Safety check: prevent infinite loop if idx is not advancing
+        if idx >= total:
             # All findings processed, mark as completed
             self._log(state, f"All {total} findings processed, completing scan")
             state["status"] = ScanStatus.COMPLETED
             state["end_time"] = datetime.utcnow().isoformat()
             return "end"
+        
+        # Check if current finding has already been processed (has final_status or was investigated in parallel)
+        finding = state["findings"][idx]
+        if finding.get("final_status"):
+            self._log(state, f"Finding {idx} already processed with status={finding['final_status']}, advancing index")
+            state["current_finding_idx"] = idx + 1
+            # Recursively check again after advancing
+            return self._has_more_findings(state)
+        
+        # Check if finding was already investigated (e.g., via parallel processing) but doesn't have final_status yet
+        # In this case, we need to route it through the decision logic to set final_status
+        if finding.get("llm_verdict") and not finding.get("final_status"):
+            self._log(state, f"Finding {idx} was investigated (verdict={finding['llm_verdict']}), routing to decision")
+            return "investigate"  # Route through investigate -> should_generate_pov -> log_skip to set final_status
+        
+        self._log(state, f"Processing next finding ({idx + 1}/{total})")
+        return "investigate"  # More findings to process
     
     def _update_scan_runtime(self, state: Optional[ScanState], **updates):
         if state is None or not state.get("scan_id"):
@@ -1520,6 +1492,50 @@ class AgentGraph:
                 print(f"[AgentGraph] Failed to log to scan manager: {e}")
                 pass
     
+    def _append_scan_openrouter_usage(self, state: Optional[ScanState], usage: Any, agent_role: str, finding: Optional[Dict[str, Any]] = None, attempt: Optional[int] = None):
+        if state is None:
+            return
+        if "scan_openrouter_usage" not in state or state["scan_openrouter_usage"] is None:
+            state["scan_openrouter_usage"] = []
+
+        entries: List[Dict[str, Any]] = []
+        if isinstance(usage, dict) and usage:
+            entries = [dict(usage)]
+        elif isinstance(usage, list):
+            entries = [dict(item) for item in usage if isinstance(item, dict) and item]
+        elif isinstance(usage, str) and usage.strip():
+            try:
+                parsed = json.loads(usage)
+                if isinstance(parsed, dict):
+                    entries = [dict(parsed)]
+                elif isinstance(parsed, list):
+                    entries = [dict(item) for item in parsed if isinstance(item, dict) and item]
+            except Exception:
+                entries = []
+
+        if not entries:
+            return
+
+        existing_generation_ids = {
+            str(item.get("generation_id")) for item in (state.get("scan_openrouter_usage") or [])
+            if isinstance(item, dict) and item.get("generation_id")
+        }
+
+        for entry in entries:
+            generation_id = str(entry.get("generation_id") or "").strip()
+            if generation_id and generation_id in existing_generation_ids:
+                continue
+            entry.setdefault("agent_role", agent_role)
+            if finding:
+                entry.setdefault("filepath", finding.get("filepath", ""))
+                entry.setdefault("line_number", finding.get("line_number", 0))
+                entry.setdefault("cwe_type", finding.get("cwe_type", "UNCLASSIFIED"))
+            if attempt is not None:
+                entry.setdefault("attempt", attempt)
+            state["scan_openrouter_usage"].append(entry)
+            if generation_id:
+                existing_generation_ids.add(generation_id)
+
     def _estimate_cost(self, inference_time_s: float) -> float:
         """
         DEPRECATED: Use actual token-based cost calculation instead.
@@ -1542,6 +1558,7 @@ class AgentGraph:
         scan_id: Optional[str] = None,
         preloaded_findings: Optional[List[VulnerabilityState]] = None,
         detected_language: Optional[str] = None,
+        model_mode: Optional[str] = None,
         openrouter_api_key: Optional[str] = None
     ) -> ScanState:
         """
@@ -1566,6 +1583,7 @@ class AgentGraph:
             status=ScanStatus.PENDING,
             codebase_path=codebase_path,
             model_name=model_name,
+            model_mode=model_mode or settings.resolve_model_mode(model_name),
             cwes=cwes,
             findings=[],
             preloaded_findings=preloaded_findings,
@@ -1578,13 +1596,18 @@ class AgentGraph:
             tokens_by_model={},
             logs=[],
             error=None,
-            proofs_attempted=0
-            openrouter_api_key=openrouter_api_key
-            openrouter_api_key=openrouter_api_key
+            proofs_attempted=0,
+            confirmed_count=0,
+            openrouter_api_key=openrouter_api_key,
+            rag_ready=False,
+            rag_stats=None,
+            scan_openrouter_usage=[]
         )
         
-        # Run the graph
-        final_state = self.graph.invoke(initial_state)
+        # Run the graph with recursion limit
+        from langchain_core.runnables import RunnableConfig
+        config = RunnableConfig(recursion_limit=500)
+        final_state = self.graph.invoke(initial_state, config=config)
         
         return final_state
 
@@ -1596,6 +1619,7 @@ agent_graph = AgentGraph()
 def get_agent_graph() -> AgentGraph:
     """Get the global agent graph instance"""
     return agent_graph
+
 
 
 

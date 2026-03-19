@@ -25,6 +25,7 @@ except ImportError:
     OLLAMA_AVAILABLE = False
 
 from app.config import settings
+from app.openrouter_client import OpenRouterReasoningChat, extract_usage_details
 from agents.ingest_codebase import get_code_ingester
 from prompts import format_investigation_prompt, format_rag_context_prompt
 
@@ -49,11 +50,7 @@ class VulnerabilityInvestigator:
     
     def _get_llm(self, model_name: Optional[str] = None, api_key_override: Optional[str] = None):
         """Get LLM instance based on configuration"""
-        # Always create new instance if model_name or key override is specified
-        if model_name is None and api_key_override is None and self._llm is not None:
-            return self._llm
-
-        llm_config = settings.get_llm_config()
+        llm_config = settings.get_llm_config(model_name=model_name)
 
         # Use provided model_name or fall back to config
         actual_model = model_name or llm_config["model"]
@@ -70,12 +67,13 @@ class VulnerabilityInvestigator:
             
             callbacks = [self._tracer] if self._tracer else None
             
-            llm = ChatOpenAI(
+            llm = OpenRouterReasoningChat(
                 model=actual_model,
                 api_key=api_key,
                 base_url=llm_config["base_url"],
                 temperature=0.1,
-                callbacks=callbacks,
+                timeout=settings.LLM_REQUEST_TIMEOUT_S,
+                reasoning_enabled=llm_config.get("reasoning_enabled", True),
                 default_headers={
                     "HTTP-Referer": "https://autopov.local",
                     "X-OpenRouter-Title": "AutoPoV"
@@ -98,7 +96,8 @@ class VulnerabilityInvestigator:
                 model=actual_model,
                 base_url=llm_config["base_url"],
                 temperature=0.1,
-                callbacks=callbacks
+                callbacks=callbacks,
+                client_kwargs={"timeout": (settings.OLLAMA_CONNECT_TIMEOUT_S, settings.OLLAMA_READ_TIMEOUT_S)}
             )
             
             llm._autopov_model_name = actual_model
@@ -115,19 +114,21 @@ class VulnerabilityInvestigator:
         cwe_type: str
     ) -> Optional[str]:
         """
-        Run Joern analysis for use-after-free (CWE-416) vulnerabilities
+        Run Joern analysis for memory-safety vulnerabilities
         
         Args:
             codebase_path: Path to codebase
             filepath: Target file path
             line_number: Target line number
-            cwe_type: CWE type
+            cwe_type: CWE type (for reference only, not used for decision-making)
         
         Returns:
             Joern analysis results or None if skipped
         """
-        # Only run Joern for CWE-416 (Use After Free)
-        if cwe_type != "CWE-416":
+        # Joern is useful for native code (C/C++) regardless of CWE label
+        native_extensions = {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"}
+        _, ext = os.path.splitext(filepath or "")
+        if ext.lower() not in native_extensions:
             return None
         
         if not settings.is_joern_available():
@@ -223,8 +224,28 @@ class VulnerabilityInvestigator:
         Returns:
             Code context string
         """
-        # Try to get full file content first
-        full_content = get_code_ingester().get_file_content(filepath, scan_id)
+        # Try to get full file content first from ChromaDB
+        full_content = None
+        try:
+            full_content = get_code_ingester().get_file_content(filepath, scan_id)
+        except Exception:
+            pass  # ChromaDB may not be available or file not ingested
+        
+        # Fallback: read file directly from disk
+        if not full_content:
+            try:
+                # Get codebase path from scan_id
+                from app.scan_manager import get_scan_manager
+                scan_info = get_scan_manager().get_scan(scan_id)
+                if scan_info:
+                    codebase_path = scan_info.get("codebase_path", "")
+                    if codebase_path:
+                        abs_path = os.path.join(codebase_path, filepath) if not os.path.isabs(filepath) else filepath
+                        if os.path.isfile(abs_path):
+                            with open(abs_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                full_content = f.read()
+            except Exception:
+                pass
         
         if full_content:
             lines = full_content.split('\n')
@@ -242,14 +263,17 @@ class VulnerabilityInvestigator:
             return '\n'.join(numbered_lines)
         
         # Fallback: use RAG to get related code
-        query = f"Code around line {line_number} in {filepath}"
-        results = get_code_ingester().retrieve_context(query, scan_id, top_k=3)
-        
-        if results:
-            contexts = []
-            for r in results:
-                contexts.append(f"// File: {r['metadata']['filepath']}\n{r['content']}")
-            return '\n\n'.join(contexts)
+        try:
+            query = f"Code around line {line_number} in {filepath}"
+            results = get_code_ingester().retrieve_context(query, scan_id, top_k=3)
+            
+            if results:
+                contexts = []
+                for r in results:
+                    contexts.append(f"// File: {r['metadata']['filepath']}\n{r['content']}")
+                return '\n\n'.join(contexts)
+        except Exception:
+            pass
         
         return "[Code context not available]"
     
@@ -304,12 +328,45 @@ class VulnerabilityInvestigator:
             # Get code context
             code_context = self._get_code_context(scan_id, filepath, line_number)
             
+            # Detect language from filepath
+            ext = os.path.splitext(filepath)[1].lower()
+            lang_map = {
+                '.py': 'python', '.js': 'javascript', '.ts': 'typescript',
+                '.java': 'java', '.c': 'c', '.cpp': 'cpp', '.go': 'go',
+                '.rs': 'rust', '.rb': 'ruby', '.php': 'php'
+            }
+            language = lang_map.get(ext, 'unknown')
+            
+            # Check cache first
+            from app.analysis_cache import get_analysis_cache
+            cache = get_analysis_cache()
+            cached = cache.get_cached_analysis(code_context, filepath, language)
+            
+            if cached:
+                # Return cached result
+                return {
+                    "verdict": cached.verdict,
+                    "cwe_type": cached.cwe_type,
+                    "cve_id": None,
+                    "confidence": cached.confidence,
+                    "explanation": f"[CACHED] {cached.explanation}",
+                    "vulnerable_code": cached.vulnerable_code,
+                    "root_cause": "",
+                    "impact": "",
+                    "inference_time_s": 0.0,
+                    "cost_usd": 0.0,
+                    "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                    "model_used": "cache",
+                    "from_cache": True
+                }
+            
             # Get RAG context
             rag_context = self._get_rag_context(scan_id, cwe_type, filepath)
             
-            # Run Joern for CWE-416
+            # Run Joern for native code (C/C++) - CWE-agnostic
             joern_context = ""
-            if cwe_type == "CWE-416":
+            ext = os.path.splitext(filepath)[1].lower()
+            if ext in {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"}:
                 joern_result = self._run_joern_analysis(
                     codebase_path, filepath, line_number, cwe_type
                 )
@@ -336,51 +393,10 @@ class VulnerabilityInvestigator:
             response = llm.invoke(messages)
             response_text = response.content
             
-            # Get actual token usage and cost from response
-            actual_cost = 0.0
-            token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-            
-
-            
-            # Try multiple ways to extract token usage from LangChain/OpenRouter response
-            try:
-                # Method 1: Check for usage_metadata (newer LangChain versions)
-                if hasattr(response, 'usage_metadata') and response.usage_metadata:
-                    um = response.usage_metadata
-                    token_usage = {
-                        "prompt_tokens": um.get('input_tokens', 0) or um.get('prompt_tokens', 0),
-                        "completion_tokens": um.get('output_tokens', 0) or um.get('completion_tokens', 0),
-                        "total_tokens": um.get('total_tokens', 0)
-                    }
-                # Method 2: Check for response_metadata (older LangChain versions)
-                elif hasattr(response, 'response_metadata') and response.response_metadata:
-                    rm = response.response_metadata
-                    # Try to get usage from response_metadata
-                    if 'token_usage' in rm:
-                        usage = rm['token_usage']
-                        token_usage = {
-                            "prompt_tokens": usage.get('prompt_tokens', 0),
-                            "completion_tokens": usage.get('completion_tokens', 0),
-                            "total_tokens": usage.get('total_tokens', 0)
-                        }
-                    elif 'usage' in rm:
-                        usage = rm['usage']
-                        token_usage = {
-                            "prompt_tokens": usage.get('prompt_tokens', 0) or usage.get('input_tokens', 0),
-                            "completion_tokens": usage.get('completion_tokens', 0) or usage.get('output_tokens', 0),
-                            "total_tokens": usage.get('total_tokens', 0)
-                        }
-                
-                # Calculate cost if we have token usage
-                if token_usage["total_tokens"] > 0:
-                    actual_cost = self._calculate_actual_cost(
-                        model_name or llm._autopov_model_name,
-                        token_usage["prompt_tokens"],
-                        token_usage["completion_tokens"]
-                    )
-                    print(f"[CostTracking] Model: {model_name or llm._autopov_model_name}, Tokens: {token_usage}, Cost: ${actual_cost:.6f}")
-            except Exception as e:
-                print(f"[CostTracking] Error extracting token usage: {e}")
+            usage_details = extract_usage_details(response, agent_role="investigator")
+            actual_cost = usage_details["cost_usd"]
+            token_usage = usage_details["token_usage"]
+            openrouter_usage = usage_details["openrouter_usage"]
             
             # Parse JSON response
             try:
@@ -416,6 +432,23 @@ class VulnerabilityInvestigator:
             result["model_used"] = model_name or llm._autopov_model_name
             result["cost_usd"] = actual_cost
             result["token_usage"] = token_usage
+            result["openrouter_usage"] = openrouter_usage
+            
+            # Cache the result for future use (only for confident results)
+            if result.get("confidence", 0) >= 0.7:
+                try:
+                    cache.cache_analysis(
+                        code=code_context,
+                        filepath=filepath,
+                        language=language,
+                        verdict=result.get("verdict", "UNKNOWN"),
+                        cwe_type=result.get("cwe_type", "UNCLASSIFIED"),
+                        confidence=result.get("confidence", 0.5),
+                        explanation=result.get("explanation", ""),
+                        vulnerable_code=result.get("vulnerable_code", "")
+                    )
+                except Exception:
+                    pass  # Cache failure is non-critical
             
             return result
             
@@ -442,6 +475,9 @@ class VulnerabilityInvestigator:
         Calculate actual cost based on OpenRouter pricing
         Prices per 1M tokens (as of March 2025)
         """
+        if not settings.COST_TRACKING_ENABLED:
+            return 0.0
+
         # OpenRouter pricing per 1M tokens (input/output)
         pricing = {
             # OpenAI models
@@ -522,3 +558,4 @@ investigator = VulnerabilityInvestigator()
 def get_investigator() -> VulnerabilityInvestigator:
     """Get the global investigator instance"""
     return investigator
+

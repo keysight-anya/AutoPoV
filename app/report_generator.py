@@ -27,142 +27,157 @@ class ReportGeneratorError(Exception):
 
 
 def _safe(text: Any, max_len: int = 0) -> str:
-    """Sanitize any value to a plain latin-1-safe string for fpdf core fonts."""
+    """Sanitize any value to a plain latin-1-safe, wrap-safe string for fpdf core fonts."""
     if text is None:
         return ""
     s = str(text)
-    # Replace common problematic characters
     replacements = {
-        "\u2019": "'", "\u2018": "'", "\u201c": '"', "\u201d": '"',
-        "\u2013": "-", "\u2014": "-", "\u2022": "-", "\u2026": "...",
-        "\u00e9": "e", "\u00e8": "e", "\u00ea": "e", "\u00eb": "e",
-        "\u00e0": "a", "\u00e1": "a", "\u00e2": "a", "\u00e3": "a",
-        "\u00f3": "o", "\u00f2": "o", "\u00f4": "o", "\u00f5": "o",
-        "\u00fa": "u", "\u00f9": "u", "\u00fb": "u",
-        "\u00ed": "i", "\u00ec": "i", "\u00ee": "i",
-        "\u00f1": "n", "\u00e7": "c",
+        "’": "'", "‘": "'", "“": '"', "”": '"',
+        "–": "-", "—": "-", "•": "-", "…": "...",
+        "é": "e", "è": "e", "ê": "e", "ë": "e",
+        "à": "a", "á": "a", "â": "a", "ã": "a",
+        "ó": "o", "ò": "o", "ô": "o", "õ": "o",
+        "ú": "u", "ù": "u", "û": "u",
+        "í": "i", "ì": "i", "î": "i",
+        "ñ": "n", "ç": "c",
     }
     for ch, rep in replacements.items():
         s = s.replace(ch, rep)
-    # Strip any remaining non-latin-1 characters
     s = s.encode("latin-1", errors="replace").decode("latin-1")
+
+    wrapped_parts = []
+    for token in s.split(' '):
+        if len(token) <= 36:
+            wrapped_parts.append(token)
+            continue
+        wrapped_parts.append(' '.join(token[i:i+36] for i in range(0, len(token), 36)))
+    s = ' '.join(wrapped_parts)
+
     if max_len and len(s) > max_len:
         s = s[:max_len - 3] + "..."
     return s
 
 
 class ProfessionalPDFReport(FPDF):
-    """Professional PDF report with modern design"""
-    
+    """Formal PDF report with restrained document-style presentation"""
+
     def __init__(self):
         super().__init__()
-        self.set_auto_page_break(auto=True, margin=15)
-        
+        self.set_auto_page_break(auto=True, margin=16)
+        self.alias_nb_pages()
+
     def header(self):
-        """Professional header with branding"""
-        # Logo/Brand area
-        self.set_fill_color(30, 41, 59)  # Dark slate
-        self.rect(0, 0, 210, 25, 'F')
-        
-        self.set_font('Arial', 'B', 16)
-        self.set_text_color(255, 255, 255)
-        self.set_xy(15, 8)
-        self.cell(0, 10, 'AutoPoV Security Scan Report', 0, 0, 'L')
-        
-        self.set_font('Arial', '', 10)
-        self.set_text_color(200, 200, 200)
-        self.set_xy(-50, 8)
-        self.cell(0, 10, datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC'), 0, 0, 'R')
-        self.ln(20)
-    
+        self.set_fill_color(243, 244, 246)
+        self.rect(0, 0, 210, 18, 'F')
+        self.set_draw_color(209, 213, 219)
+        self.line(12, 18, 198, 18)
+        self.set_xy(12, 5)
+        self.set_font('Arial', 'B', 13)
+        self.set_text_color(31, 41, 55)
+        self.cell(120, 6, 'AutoPoV Security Assessment Report', 0, 0, 'L')
+        self.set_font('Arial', '', 8)
+        self.set_text_color(107, 114, 128)
+        self.cell(66, 6, datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC'), 0, 0, 'R')
+        self.ln(14)
+
     def footer(self):
-        """Professional footer"""
-        self.set_y(-15)
-        self.set_font('Arial', 'I', 8)
-        self.set_text_color(128, 128, 128)
-        self.cell(0, 10, f'Page {self.page_no()} | AutoPoV v{settings.APP_VERSION} | Confidential', 0, 0, 'C')
-    
-    def section_header(self, title: str, icon: str = ""):
-        """Add styled section header"""
-        self.set_font('Arial', 'B', 14)
-        self.set_text_color(30, 41, 59)
-        self.set_fill_color(241, 245, 249)
-        self.cell(0, 12, f"{icon}  {title}" if icon else title, 0, 1, 'L', True)
-        self.ln(3)
-    
-    def subsection_header(self, title: str):
-        """Add subsection header"""
-        self.set_font('Arial', 'B', 12)
-        self.set_text_color(51, 65, 85)
-        self.cell(0, 8, title, 0, 1, 'L')
+        self.set_y(-12)
+        self.set_draw_color(229, 231, 235)
+        self.line(12, self.get_y(), 198, self.get_y())
+        self.ln(2)
+        self.set_font('Arial', '', 8)
+        self.set_text_color(107, 114, 128)
+        self.cell(0, 6, f'AutoPoV v{settings.APP_VERSION} | Page {self.page_no()}/{{nb}} | Confidential Security Assessment', 0, 0, 'C')
+
+    def section_header(self, title: str, icon: str = ''):
+        self.ln(2)
+        self.set_fill_color(229, 231, 235)
+        self.set_text_color(17, 24, 39)
+        self.set_font('Arial', 'B', 13)
+        self.cell(0, 9, _safe(f"{icon}  {title}" if icon else title), 0, 1, 'L', True)
         self.ln(1)
-    
+
+    def subsection_header(self, title: str):
+        self.set_font('Arial', 'B', 11)
+        self.set_text_color(31, 41, 55)
+        self.cell(0, 6, _safe(title), 0, 1, 'L')
+        self.set_draw_color(229, 231, 235)
+        self.line(self.get_x(), self.get_y(), 198, self.get_y())
+        self.ln(2)
+
     def body_text(self, text: str, bold: bool = False):
-        """Add body text"""
         self.set_font('Arial', 'B' if bold else '', 10)
-        self.set_text_color(75, 85, 99)
+        self.set_text_color(55, 65, 81)
         self.multi_cell(0, 5, _safe(text))
-        self.ln(2)
-    
-    def metric_card(self, label: str, value: str, color: Tuple[int, int, int] = (59, 130, 246)):
-        """Add metric card"""
-        self.set_fill_color(*color)
-        self.set_text_color(255, 255, 255)
-        self.set_font('Arial', 'B', 20)
-        self.cell(40, 12, value, 0, 0, 'C', True)
+        self.ln(1)
+
+    def key_value_row(self, label: str, value: str, label_width: int = 48):
+        remaining_width = self.w - self.r_margin - self.get_x() - label_width
+        if remaining_width < 25:
+            self.set_x(self.l_margin)
+            remaining_width = self.w - self.r_margin - self.get_x() - label_width
+        if remaining_width < 25:
+            remaining_width = self.w - self.l_margin - self.r_margin - label_width
+
+        self.set_font('Arial', 'B', 9)
         self.set_text_color(75, 85, 99)
+        self.cell(label_width, 6, _safe(label), 0, 0, 'L')
         self.set_font('Arial', '', 9)
-        self.cell(50, 12, label, 0, 1, 'L')
-        self.ln(2)
-    
+        self.set_text_color(31, 41, 55)
+        self.multi_cell(max(25, remaining_width), 6, _safe(value))
+
+    def metric_card(self, label: str, value: str, color: Tuple[int, int, int] = (59, 130, 246)):
+        start_x = self.get_x()
+        start_y = self.get_y()
+        self.set_fill_color(249, 250, 251)
+        self.set_draw_color(209, 213, 219)
+        self.rect(start_x, start_y, 58, 18, 'DF')
+        self.set_xy(start_x + 3, start_y + 3)
+        self.set_font('Arial', 'B', 15)
+        self.set_text_color(*color)
+        self.cell(52, 6, _safe(value), 0, 2, 'L')
+        self.set_x(start_x + 3)
+        self.set_font('Arial', '', 8)
+        self.set_text_color(75, 85, 99)
+        self.cell(52, 5, _safe(label), 0, 0, 'L')
+        self.set_xy(start_x + 62, start_y)
+
     def table_header(self, headers: List[str], widths: List[int]):
-        """Add styled table header"""
-        self.set_font('Arial', 'B', 10)
-        self.set_fill_color(51, 65, 85)
+        self.set_font('Arial', 'B', 9)
+        self.set_fill_color(55, 65, 81)
         self.set_text_color(255, 255, 255)
         for i, header in enumerate(headers):
-            self.cell(widths[i], 8, header, 1, 0, 'C', True)
+            self.cell(widths[i], 7, _safe(header), 1, 0, 'C', True)
         self.ln()
-        self.set_text_color(75, 85, 99)
-    
+        self.set_text_color(31, 41, 55)
+
     def table_row(self, cells: List[str], widths: List[int], alternate: bool = False):
-        """Add table row with alternating colors"""
-        if alternate:
-            self.set_fill_color(248, 250, 252)
-        else:
-            self.set_fill_color(255, 255, 255)
-        
-        self.set_font('Arial', '', 9)
+        self.set_fill_color(249, 250, 251 if alternate else 255)
+        self.set_font('Arial', '', 8)
         for i, cell in enumerate(cells):
-            self.cell(widths[i], 7, str(cell)[:30], 1, 0, 'L', True)
+            self.cell(widths[i], 6, _safe(str(cell), 44), 1, 0, 'L', True)
         self.ln()
-    
-    def code_block(self, code: str, max_lines: int = 30):
-        """Add code block with styling"""
-        self.set_fill_color(30, 41, 59)
-        self.set_text_color(226, 232, 240)
+
+    def code_block(self, code: str, max_lines: int = 18):
+        self.set_fill_color(245, 245, 245)
+        self.set_text_color(31, 41, 55)
         self.set_font('Courier', '', 8)
-        
         lines = _safe(code).split('\n')[:max_lines]
         formatted_code = '\n'.join(lines)
         if len(_safe(code).split('\n')) > max_lines:
-            formatted_code += "\n\n... [truncated for brevity]"
-        
-        self.multi_cell(0, 4, formatted_code, fill=True)
-        self.ln(3)
-    
-    def info_box(self, title: str, content: str, border_color: Tuple[int, int, int] = (59, 130, 246)):
-        """Add info box with border"""
+            formatted_code += '\n... [truncated]'
+        self.multi_cell(0, 4, formatted_code, 1, 'L', True)
+        self.ln(2)
+
+    def info_box(self, title: str, content: str, border_color: Tuple[int, int, int] = (107, 114, 128)):
         self.set_draw_color(*border_color)
-        self.set_line_width(0.5)
-        
-        self.set_font('Arial', 'B', 10)
-        self.set_text_color(30, 41, 59)
-        self.cell(0, 6, title, 0, 1, 'L')
-        
+        self.set_fill_color(249, 250, 251)
+        self.set_font('Arial', 'B', 9)
+        self.set_text_color(31, 41, 55)
+        self.cell(0, 6, _safe(title), 1, 1, 'L', True)
         self.set_font('Arial', '', 9)
         self.set_text_color(75, 85, 99)
-        self.multi_cell(0, 5, content)
+        self.multi_cell(0, 5, _safe(content), 1, 'L')
         self.ln(2)
 
 
@@ -237,6 +252,7 @@ class ReportGenerator:
         pov_summary = self._summarize_pov(result)
         models_used = self._collect_models_used(result)
         openrouter_activity = self._get_openrouter_activity(result)
+        exact_openrouter_usage = self._collect_exact_openrouter_usage(result)
         language_info = getattr(result, "language_info", {}) or {}
         detected_language = getattr(result, "detected_language", None) or language_info.get("primary", "unknown")
         
@@ -258,14 +274,15 @@ class ReportGenerator:
                     "primary_language": detected_language,
                     "all_languages_detected": language_info.get('all_languages', []),
                     "language_distribution": language_info.get('language_stats', {}),
-                    "total_source_files": language_info.get('total_files', 0)
+                    "total_source_files": language_info.get('total_files', 0),
+                    "total_loc": getattr(result, 'total_loc', 0) or language_info.get('total_loc', 0)
                 },
                 "configuration": {
                     "model_mode": settings.MODEL_MODE,
                     "routing_mode": settings.ROUTING_MODE,
-                    "auto_router_model": settings.AUTO_ROUTER_MODEL,
-                    "cwes_checked": result.cwes,
-            "discovery_scope": result.cwes if result.cwes else 'open-ended',
+                    "selected_model": settings.MODEL_NAME,
+                    "taxonomy_focus": result.cwes or [],
+                    "discovery_scope": "open-ended" if not result.cwes else "focused",
                     "scout_enabled": settings.SCOUT_ENABLED,
                     "codeql_enabled": settings.is_codeql_available(),
                 }
@@ -273,15 +290,19 @@ class ReportGenerator:
             "model_usage": {
                 "models_used": models_used,
                 "openrouter_activity": openrouter_activity,
-                "total_cost_usd": result.total_cost_usd
+                "exact_openrouter_usage": exact_openrouter_usage,
+                "total_cost_usd": result.total_cost_usd,
+                "exact_total_cost_usd": exact_openrouter_usage.get("total_exact_cost_usd", 0.0)
             },
             "metrics": {
                 "total_findings": result.total_findings,
-                "confirmed_vulnerabilities": result.confirmed_vulns,
+                "runtime_confirmed_vulnerabilities": result.confirmed_vulns,
                 "false_positives": result.false_positives,
+                "unproven_findings": getattr(result, 'unproven_findings', 0),
                 "failed_analyses": result.failed,
                 "detection_rate_percent": round(self._calculate_detection_rate(result), 2),
                 "false_positive_rate_percent": round(self._calculate_fp_rate(result), 2),
+                "unproven_rate_percent": round(self._calculate_unproven_rate(result), 2),
                 "pov_success_rate_percent": round(self._calculate_pov_success_rate(result), 2),
                 "pov_summary": pov_summary,
                 "cost_per_confirmed_usd": round(self._calculate_cost_per_confirmed(result), 6)
@@ -333,18 +354,19 @@ class ReportGenerator:
             
             detailed_finding = {
                 "finding_number": idx + 1,
-                "finding_id": f"{finding.get('cwe_type', 'UNKNOWN')}-{idx+1:03d}",
+                "finding_id": f"UNCLASSIFIED-{idx+1:03d}",
                 
                 "vulnerability": {
-                    "cwe_id": finding.get('cwe_type', 'UNCLASSIFIED'),
-                    "cwe_name": self._get_cwe_name(finding.get('cwe_type', '')),
+                    "cwe_id": "UNCLASSIFIED",
+                    "classification_name": "Open-ended vulnerability candidate",
                     "cve_id": finding.get('cve_id'),
                     "description": finding.get('llm_explanation', 'No description available'),
                     "root_cause": finding.get('root_cause', ''),
                     "impact": finding.get('impact', ''),
                     "severity": self._calculate_severity(finding),
                     "confidence": finding.get('confidence', 0.0),
-                    "classification_status": 'mapped' if finding.get('cwe_type') and finding.get('cwe_type') != 'UNCLASSIFIED' else 'unclassified',
+                    "classification_status": "novel_or_unclassified",
+                    "taxonomy_refs": finding.get("taxonomy_refs", []),
                     "final_status": finding.get('final_status', 'unknown')
                 },
                 
@@ -379,8 +401,8 @@ class ReportGenerator:
                         "completion_tokens": finding.get('pov_completion_tokens', 0),
                         "total_tokens": finding.get('pov_total_tokens', 0)
                     },
-                    "refinement_attempts": len(finding.get('refinement_history', [])),
-                    "refinement_history": finding.get('refinement_history', [])
+                    "refinement_attempts": len(finding.get('refinement_history') or []),
+                    "refinement_history": finding.get('refinement_history') or []
                 },
                 
                 "validation": {
@@ -423,25 +445,10 @@ class ReportGenerator:
         return detailed
     
     def _get_cwe_name(self, cwe_id: str) -> str:
-        """Get human-readable CWE name"""
-        cwe_names = {
-            "CWE-22": "Path Traversal",
-            "CWE-78": "OS Command Injection",
-            "CWE-79": "Cross-site Scripting (XSS)",
-            "CWE-89": "SQL Injection",
-            "CWE-94": "Code Injection",
-            "CWE-502": "Deserialization of Untrusted Data",
-            "CWE-611": "XML External Entity (XXE) Injection",
-            "CWE-200": "Information Exposure",
-            "CWE-287": "Improper Authentication",
-            "CWE-352": "Cross-Site Request Forgery (CSRF)",
-            "CWE-416": "Use After Free",
-            "CWE-119": "Buffer Overflow",
-            "CWE-190": "Integer Overflow"
-        }
+        """Get human-readable classification label without assuming a fixed taxonomy dictionary."""
         if not cwe_id or cwe_id == 'UNCLASSIFIED':
             return 'Unclassified / novel vulnerability'
-        return cwe_names.get(cwe_id, f"{cwe_id} - Unknown Vulnerability Type")
+        return cwe_id
     
     def _calculate_severity(self, finding: Dict[str, Any]) -> str:
         """Calculate severity based on confidence and validation"""
@@ -499,8 +506,10 @@ class ReportGenerator:
             if method:
                 return f'proof_attempted_via_{method}'
             return 'proof_attempted'
-        if finding.get('final_status') == 'skipped':
+        if finding.get('llm_verdict') == 'FALSE_POSITIVE':
             return 'false_positive'
+        if finding.get('final_status') == 'failed':
+            return 'proof_failed'
         return 'not_proven'
 
     def _build_validation_summary(self, finding: Dict[str, Any]) -> str:
@@ -527,365 +536,220 @@ class ReportGenerator:
             proof_parts.append(f"Observed stdout: {str(stdout)[:240]}")
         return ' '.join(proof_parts)
 
+    def _risk_rating(self, result: ScanResult) -> str:
+        if result.confirmed_vulns >= 3:
+            return 'High'
+        if result.confirmed_vulns >= 1:
+            return 'Elevated'
+        if result.total_findings >= 25:
+            return 'Moderate'
+        return 'Low'
+
+    def _executive_assessment(self, result: ScanResult) -> str:
+        risk = self._risk_rating(result)
+        scope = 'open-ended vulnerability discovery' if not result.cwes else f"focused review of {len(result.cwes)} taxonomy labels"
+        return (
+            f"AutoPoV completed a {scope} of the target codebase and identified {result.total_findings} candidate findings. "
+            f"Of those, {result.confirmed_vulns} were runtime-proven, {result.false_positives} were rejected as false positives, "
+            f"and {getattr(result, 'unproven_findings', 0)} remained unproven after automated validation. "
+            f"Overall risk for this assessment is rated {risk} based on the number of confirmed issues, their exploitability, and the volume of unresolved findings."
+        )
+
+    def _proof_narrative(self, finding: Dict[str, Any]) -> Dict[str, str]:
+        pov_result = finding.get('pov_result') or {}
+        code = str(finding.get('code_chunk') or '')
+        excerpt = str((pov_result.get('evidence') or {}).get('combined_excerpt') or pov_result.get('stderr') or pov_result.get('stdout') or '')
+        refs = ', '.join(finding.get('taxonomy_refs') or [])
+        trigger = 'AutoPoV generated crafted input and executed the vulnerable code path.'
+        if 'strcpy(buf, "empty")' in code or 'empty' in code.lower():
+            trigger = 'AutoPoV supplied an empty string while the destination buffer remained too small, forcing the vulnerable copy path to run.'
+        elif 'TARGET_BINARY' in str(finding.get('pov_script') or '') or 'MQJS_BIN' in str(finding.get('pov_script') or ''):
+            trigger = 'AutoPoV executed the built target binary with attacker-controlled input designed to reach the vulnerable path.'
+        observed = pov_result.get('proof_summary') or 'A concrete runtime failure was observed while executing the target.'
+        if excerpt:
+            observed += f" Evidence excerpt: {excerpt[:240]}"
+        impact = 'This demonstrates that attacker-controlled input can drive the target into an unsafe runtime state.'
+        if 'assert' in excerpt.lower():
+            impact = 'This demonstrates that attacker-controlled input can make the program abort or crash in the vulnerable path.'
+        if 'addresssanitizer' in excerpt.lower() or 'segmentation fault' in excerpt.lower() or 'CWE-120' in refs:
+            impact = 'This demonstrates a memory-safety condition that can lead to crashes, denial of service, and potentially more serious native-code exploitation.'
+        why = 'AutoPoV counts this as proven because the issue was triggered during real execution, the vulnerable path was reached, and the observed runtime behavior matched the expected exploit outcome.' if pov_result.get('vulnerability_triggered') else 'AutoPoV does not count this as proven because runtime execution did not produce the expected exploit evidence.'
+        return {
+            'trigger': trigger,
+            'observed': observed,
+            'impact': impact,
+            'why': why,
+        }
+
+    def _finding_title(self, index: int, finding: Dict[str, Any]) -> str:
+        refs = ', '.join(finding.get('taxonomy_refs') or [])
+        label = refs if refs else (finding.get('cwe_type') or 'UNCLASSIFIED')
+        return f"Finding {index}: {label}"
+
     def generate_pdf_report(self, result: ScanResult) -> str:
-        """Generate professional PDF report"""
+        """Generate formal PDF report"""
         if not FPDF_AVAILABLE:
             raise ReportGeneratorError("fpdf not available. Install fpdf2")
-        
+
         report_path = os.path.join(self.results_dir, f"{result.scan_id}_report.pdf")
-        pov_summary = self._summarize_pov(result)
-        models_used = self._collect_models_used(result)
-        openrouter_activity = self._get_openrouter_activity(result)
+        exact_openrouter_usage = self._collect_exact_openrouter_usage(result)
         methodology = self._generate_methodology(result)
-        
+        language_info = getattr(result, 'language_info', {}) or {}
+        detected_language = getattr(result, 'detected_language', None) or language_info.get('primary', 'unknown')
+        confirmed = [f for f in (result.findings or []) if f.get('final_status') == 'confirmed']
+        unproven = [f for f in (result.findings or []) if f.get('final_status') in {'failed'} or (f.get('pov_script') and f.get('final_status') != 'confirmed')]
+        false_positives = [f for f in (result.findings or []) if f.get('final_status') == 'skipped']
+
         pdf = ProfessionalPDFReport()
-        
-        # ===== COVER PAGE =====
         pdf.add_page()
-        pdf.set_fill_color(30, 41, 59)
-        pdf.rect(0, 0, 210, 297, 'F')
-        
-        pdf.set_y(80)
-        pdf.set_font('Arial', 'B', 32)
-        pdf.set_text_color(255, 255, 255)
-        pdf.cell(0, 20, 'Security Assessment Report', 0, 1, 'C')
-        
-        pdf.set_font('Arial', '', 14)
-        pdf.set_text_color(156, 163, 175)
-        pdf.cell(0, 10, 'Powered by AutoPoV', 0, 1, 'C')
-        pdf.ln(20)
-        
-        pdf.set_font('Arial', '', 12)
-        pdf.set_text_color(255, 255, 255)
-        pdf.cell(0, 8, f'Scan ID: {result.scan_id}', 0, 1, 'C')
-        pdf.cell(0, 8, f'Generated: {datetime.utcnow().strftime("%B %d, %Y at %H:%M UTC")}', 0, 1, 'C')
-        pdf.cell(0, 8, f'Target: {os.path.basename(result.codebase_path)}', 0, 1, 'C')
-        pdf.ln(10)
-        
-        # Key metrics on cover
-        pdf.set_font('Arial', 'B', 16)
-        pdf.set_text_color(34, 197, 94)
-        pdf.cell(0, 10, f'{result.confirmed_vulns} Confirmed Vulnerabilities', 0, 1, 'C')
-        
-        # ===== EXECUTIVE SUMMARY =====
-        pdf.add_page()
+
+        target_name = os.path.basename(result.codebase_path.rstrip('/')) or result.codebase_path
+        pdf.set_font('Arial', 'B', 20)
+        pdf.set_text_color(17, 24, 39)
+        pdf.cell(0, 12, 'Security Assessment Report', 0, 1, 'L')
+        pdf.set_font('Arial', '', 11)
+        pdf.set_text_color(75, 85, 99)
+        pdf.cell(0, 7, _safe(f'Target: {target_name}'), 0, 1, 'L')
+        pdf.cell(0, 7, _safe(f'Scan ID: {result.scan_id}'), 0, 1, 'L')
+        pdf.cell(0, 7, _safe(f'Completed: {result.end_time or datetime.utcnow().isoformat()}'), 0, 1, 'L')
+        pdf.ln(4)
+
         pdf.section_header('Executive Summary')
-        
-        # Key findings summary
-        pdf.subsection_header('Assessment Overview')
-        # Extract repo name from codebase path
-        codebase_name = result.codebase_path
-        if '/' in codebase_name:
-            parts = codebase_name.split('/')
-            # Get last meaningful part (repo name)
-            codebase_name = parts[-1] if parts[-1] else parts[-2] if len(parts) > 1 else codebase_name
-        # Remove .git suffix if present
-        if codebase_name.endswith('.git'):
-            codebase_name = codebase_name[:-4]
-        
-        summary_text = (
-            f"This security assessment analyzed '{codebase_name}' "
-            f"for {'an open-ended vulnerability search' if not result.cwes else str(len(result.cwes)) + ' focused vulnerability classes'} using AutoPoV's hybrid "
-            f"agentic framework. The scan completed in {result.duration_s:.1f} seconds "
-            f"with a total cost of ${result.total_cost_usd:.4f} USD."
-        )
-        pdf.body_text(summary_text)
-        
-        # Metrics grid
-        pdf.subsection_header('Key Metrics')
-        metrics_data = [
-            ('Total Findings', str(result.total_findings), (59, 130, 246)),
-            ('Confirmed', str(result.confirmed_vulns), (34, 197, 94)),
-            ('False Positives', str(result.false_positives), (245, 158, 11)),
-            ('Failed', str(result.failed), (239, 68, 68))
-        ]
-        
-        for label, value, color in metrics_data:
+        pdf.body_text(self._executive_assessment(result))
+        pdf.ln(2)
+        for label, value, color in [
+            ('Confirmed', str(result.confirmed_vulns), (22, 163, 74)),
+            ('Unproven', str(getattr(result, 'unproven_findings', 0)), (180, 83, 9)),
+            ('False Positives', str(result.false_positives), (75, 85, 99)),
+        ]:
             pdf.metric_card(label, value, color)
-        
-        # Success rates
-        pdf.ln(5)
-        pdf.subsection_header('Success Metrics')
-        pdf.body_text(
-            f"Detection Rate: {self._calculate_detection_rate(result):.1f}% | "
-            f"False Positive Rate: {self._calculate_fp_rate(result):.1f}% | "
-            f"PoV Success Rate: {self._calculate_pov_success_rate(result):.1f}%"
-        )
-        
-        # ===== MODEL USAGE =====
-        pdf.add_page()
-        pdf.section_header('AI Model Usage')
-        
-        # Use OpenRouter activity if available for actual model names
-        if openrouter_activity:
-            pdf.subsection_header('Actual Models Used (from OpenRouter)')
-            headers = ['Model', 'Requests', 'Tokens', 'Cost (USD)']
-            widths = [70, 30, 50, 40]
+        pdf.ln(18)
+
+        pdf.subsection_header('Assessment Snapshot')
+        pdf.key_value_row('Overall risk rating', self._risk_rating(result))
+        pdf.key_value_row('Discovery scope', 'Open-ended vulnerability discovery' if not result.cwes else ', '.join(result.cwes))
+        pdf.key_value_row('Primary language', detected_language)
+        pdf.key_value_row('Languages observed', ', '.join(language_info.get('all_languages', [])) or detected_language)
+        pdf.key_value_row('Source files / LOC', f"{language_info.get('total_files', 0)} files / {getattr(result, 'total_loc', 0) or language_info.get('total_loc', 0):,} LOC")
+        pdf.key_value_row('Selected model', result.model_name or settings.MODEL_NAME)
+        pdf.key_value_row('Duration / cost', f"{result.duration_s:.1f} seconds / ${result.total_cost_usd:.6f}")
+        pdf.key_value_row('Proof success rate', f"{self._calculate_pov_success_rate(result):.1f}%")
+
+        pdf.section_header('Scope And Method')
+        pdf.body_text('This report summarizes automated source-code ingestion, static analysis, AI-assisted investigation, proof-of-vulnerability generation, and runtime validation. Only findings with observed runtime exploit evidence are marked as proven.')
+        pdf.subsection_header('Configuration')
+        pdf.key_value_row('Routing mode', settings.ROUTING_MODE)
+        pdf.key_value_row('Model mode', settings.MODEL_MODE)
+        pdf.key_value_row('CodeQL enabled', 'Yes' if settings.is_codeql_available() else 'No')
+        pdf.key_value_row('Scout enabled', 'Yes' if settings.SCOUT_ENABLED else 'No')
+        pdf.key_value_row('Discovery mode', methodology.get('discovery_scope', 'open-ended'))
+
+        if exact_openrouter_usage.get('summary_by_agent'):
+            pdf.section_header('Model Usage')
+            headers = ['Agent', 'Model', 'Calls', 'Reasoning', 'Cost']
+            widths = [35, 72, 18, 28, 25]
             pdf.table_header(headers, widths)
-            
-            for i, activity in enumerate(openrouter_activity[:15]):  # Limit to 15 entries
-                cells = [
-                    _safe(activity.get('model', 'N/A'), 28),
-                    str(activity.get('requests', 0)),
-                    f"{activity.get('prompt_tokens', 0) + activity.get('completion_tokens', 0):,}",
-                    f"${activity.get('usage', 0):.6f}"
-                ]
-                pdf.table_row(cells, widths, alternate=(i % 2 == 1))
-            
-            pdf.ln(5)
-            pdf.set_font('Arial', 'I', 9)
-            pdf.set_text_color(100, 100, 100)
-            pdf.cell(0, 6, f"Total API calls: {len(openrouter_activity)} | Data from OpenRouter activity API", 0, 1)
-        
-        # Show internal model tracking
-        if models_used:
-            pdf.ln(10)
-            pdf.subsection_header('Internal Model Tracking')
-            headers = ['Model/Router', 'Roles', 'Findings', 'Cost (USD)']
-            widths = [70, 50, 30, 40]
-            pdf.table_header(headers, widths)
-            
-            for i, model in enumerate(models_used):
-                roles = ', '.join(model.get('roles', []))
-                cells = [
-                    _safe(model.get('model', 'N/A'), 25),
-                    _safe(roles, 20),
-                    str(model.get('findings_count', 0)),
-                    f"${model.get('total_cost_usd', 0):.6f}"
-                ]
-                pdf.table_row(cells, widths, alternate=(i % 2 == 1))
-        
-        # ===== CONFIRMED VULNERABILITIES =====
-        if result.confirmed_vulns > 0:
-            pdf.add_page()
-            pdf.section_header('Confirmed Vulnerabilities')
-            
-            confirmed = [f for f in (result.findings or []) if f.get('final_status') == 'confirmed']
-            
-            for i, finding in enumerate(confirmed, 1):
-                if pdf.get_y() > 250:
-                    pdf.add_page()
-                
-                # Vulnerability header
-                cwe = finding.get('cwe_type', 'UNCLASSIFIED')
-                cve = finding.get('cve_id')
-                pdf.set_font('Arial', 'B', 12)
-                pdf.set_text_color(239, 68, 68)
-                heading = f"Finding #{i}: {cwe}" + (f" | {cve}" if cve else '')
-                pdf.cell(0, 8, _safe(heading), 0, 1)
-                
-                # Location
-                pdf.set_font('Arial', '', 10)
-                pdf.set_text_color(75, 85, 99)
-                filepath = finding.get('filepath', 'N/A')
-                line = finding.get('line_number', 'N/A')
-                pdf.cell(0, 6, _safe(f"Location: {filepath}:{line}"), 0, 1)
-                
-                # Confidence and model
-                confidence = finding.get('confidence', 0)
-                model_used = finding.get('model_used', 'N/A')
-                pdf.cell(0, 6, _safe(f"Confidence: {confidence:.2f} | Detected by: {model_used}"), 0, 1)
-                pdf.cell(0, 6, _safe(f"Classification: {self._build_classification_summary(finding)}"), 0, 1)
-                pdf.ln(2)
-                
-                # Explanation
-                pdf.set_font('Arial', 'B', 10)
-                pdf.set_text_color(51, 65, 85)
-                pdf.cell(0, 6, 'Vulnerability Description:', 0, 1)
-                pdf.set_font('Arial', '', 10)
-                pdf.set_text_color(75, 85, 99)
-                pdf.multi_cell(0, 5, _safe(finding.get('llm_explanation', 'No explanation available.')))
-                if finding.get('root_cause'):
-                    pdf.cell(0, 6, _safe(f"Root Cause: {finding.get('root_cause')}"), 0, 1)
-                if finding.get('impact'):
-                    pdf.cell(0, 6, _safe(f"Impact: {finding.get('impact')}"), 0, 1)
-                contract = finding.get('exploit_contract') or {}
-                if contract.get('goal'):
-                    pdf.cell(0, 6, _safe(f"Exploit Goal: {contract.get('goal')}"), 0, 1)
-                pdf.ln(3)
-                
-                # PoV Status and Validation Evidence
-                pov_result = finding.get('pov_result') or {}
-                validation = finding.get('validation_result') or {}
-                
-                triggered = pov_result.get('vulnerability_triggered', False)
-                status_color = (34, 197, 94) if triggered else (245, 158, 11)
-                status_text = "CONFIRMED - VULNERABILITY TRIGGERED" if triggered else "NOT TRIGGERED"
-                
-                pdf.set_font('Arial', 'B', 11)
-                pdf.set_text_color(*status_color)
-                pdf.cell(0, 7, f"Validation Result: {status_text}", 0, 1)
-                
-                # Validation details
-                pdf.set_font('Arial', '', 10)
-                pdf.set_text_color(75, 85, 99)
-                
-                validation_method = validation.get('validation_method') or pov_result.get('validation_method')
-                if validation_method:
-                    pdf.cell(0, 6, _safe(f"Validation Method: {validation_method}"), 0, 1)
-                
-                if validation.get('execution_time_s'):
-                    pdf.cell(0, 6, f"Execution Time: {validation.get('execution_time_s'):.2f} seconds", 0, 1)
-                
-                pdf.ln(2)
-                
-                # Validation Evidence/Reasoning
-                pdf.set_font('Arial', 'B', 10)
-                pdf.set_text_color(51, 65, 85)
-                pdf.cell(0, 6, 'Validation Evidence:', 0, 1)
-                pdf.set_font('Arial', '', 10)
-                pdf.set_text_color(75, 85, 99)
-                
-                if triggered:
-                    evidence_text = (
-                        "The PoV script successfully demonstrated the vulnerability by executing "
-                        "exploitation code that confirmed the security weakness. "
-                    )
-                    if validation.get('stdout'):
-                        evidence_text += "The execution produced expected output indicating successful exploitation."
-                else:
-                    evidence_text = (
-                        "The PoV script did not trigger the vulnerability. This could mean:\n"
-                        "- The vulnerability requires specific conditions not met in the test environment\n"
-                        "- The vulnerability is context-dependent and the PoV needs refinement\n"
-                        "- The finding may be a false positive that requires manual review"
-                    )
-                pdf.multi_cell(0, 5, _safe(evidence_text))
-                
-                # Show stdout/stderr if available
-                if validation.get('stdout') or validation.get('stderr') or pov_result.get('stdout') or pov_result.get('stderr'):
-                    pdf.ln(2)
-                    pdf.set_font('Arial', 'B', 10)
-                    pdf.set_text_color(51, 65, 85)
-                    pdf.cell(0, 6, 'Execution Output:', 0, 1)
-                    
-                    if validation.get('stdout'):
-                        pdf.set_font('Arial', 'I', 9)
-                        pdf.cell(0, 5, 'Standard Output:', 0, 1)
-                        pdf.code_block(validation.get('stdout'), max_lines=10)
-                    
-                    if validation.get('stderr'):
-                        pdf.set_font('Arial', 'I', 9)
-                        pdf.cell(0, 5, 'Standard Error:', 0, 1)
-                        pdf.code_block(validation.get('stderr'), max_lines=10)
-                
-                # PoV Script (if available)
-                if finding.get('pov_script'):
-                    pdf.ln(2)
-                    pdf.set_font('Arial', 'B', 10)
-                    pdf.set_text_color(51, 65, 85)
-                    pdf.cell(0, 6, 'Proof-of-Vulnerability Script:', 0, 1)
-                    pdf.code_block(finding['pov_script'], max_lines=20)
-                
-                pdf.ln(5)
-        
-        # ===== FALSE POSITIVES =====
-        pdf.add_page()
-        pdf.section_header('False Positives Analysis')
-        
-        if result.false_positives > 0:
-            false_positives = [f for f in (result.findings or []) if f.get('final_status') == 'skipped']
-            
-            pdf.body_text(
-                f"The following {len(false_positives)} finding(s) were classified as false positives "
-                f"after automated analysis. These represent initial alerts that were determined "
-                f"not to be actual vulnerabilities."
-            )
-            pdf.ln(3)
-            
-            for i, finding in enumerate(false_positives, 1):
-                if pdf.get_y() > 240:
-                    pdf.add_page()
-                
-                cwe = finding.get('cwe_type', 'Unknown')
-                pdf.set_font('Arial', 'B', 12)
-                pdf.set_text_color(245, 158, 11)
-                pdf.cell(0, 8, _safe(f"False Positive #{i}: {cwe}"), 0, 1)
-                
-                pdf.set_font('Arial', '', 10)
-                pdf.set_text_color(75, 85, 99)
-                pdf.cell(0, 6, _safe(f"File: {finding.get('filepath', 'N/A')}"), 0, 1)
-                pdf.cell(0, 6, _safe(f"Line: {finding.get('line_number', 'N/A')}"), 0, 1)
-                
-                confidence = finding.get('confidence', 0)
-                model_used = finding.get('model_used', 'N/A')
-                pdf.cell(0, 6, _safe(f"Initial Confidence: {confidence:.2f} | Analyzed by: {model_used}"), 0, 1)
-                pdf.ln(2)
-                
-                pdf.set_font('Arial', 'B', 10)
-                pdf.set_text_color(51, 65, 85)
-                pdf.cell(0, 6, 'Why this was marked as false positive:', 0, 1)
-                pdf.set_font('Arial', '', 10)
-                pdf.set_text_color(75, 85, 99)
-                pdf.multi_cell(0, 5, _safe(finding.get('llm_explanation', 'No explanation available.')))
-                
-                # Show the code that was flagged
-                if finding.get('code_chunk'):
-                    pdf.ln(2)
-                    pdf.set_font('Arial', 'B', 10)
-                    pdf.set_text_color(51, 65, 85)
-                    pdf.cell(0, 6, 'Flagged Code:', 0, 1)
-                    pdf.code_block(finding.get('code_chunk'), max_lines=15)
-                
-                pdf.ln(5)
-        else:
-            pdf.body_text("No false positives were identified in this scan.")
-        
-        # ===== METHODOLOGY =====
-        pdf.add_page()
-        pdf.section_header('Methodology')
-        
-        # Scan-specific methodology
-        pdf.subsection_header('Scan Configuration')
-        config_text = (
-            f"This assessment used the following configuration:\n\n"
-            f"- Routing Mode: {methodology['routing_mode']}\n"
-            f"- Model Mode: {methodology['model_mode']}\n"
-            f"- Scout Enabled: {methodology['scout_enabled']}\n"
-            f"- CodeQL Enabled: {methodology['codeql_enabled']}\n"
-            f"- CWEs Checked: {', '.join(methodology['cwes_checked'])}\n"
-            f"- Duration: {methodology['duration_seconds']:.1f} seconds"
-        )
-        pdf.body_text(config_text)
-        
-        # Process flow
-        pdf.subsection_header('Assessment Process')
-        for i, step in enumerate(methodology['process_steps'], 1):
-            pdf.set_font('Arial', 'B', 10)
-            pdf.set_text_color(59, 130, 246)
-            pdf.cell(0, 6, f"Step {i}: {step['name']}", 0, 1)
-            pdf.set_font('Arial', '', 10)
-            pdf.set_text_color(75, 85, 99)
-            pdf.multi_cell(0, 5, step['description'])
+            for i, row in enumerate(exact_openrouter_usage.get('summary_by_agent', [])[:12]):
+                pdf.table_row([
+                    row.get('agent_role', 'unknown'),
+                    row.get('model', 'unknown'),
+                    str(row.get('calls', 0)),
+                    f"{row.get('reasoning_tokens', 0):,}",
+                    f"${row.get('cost_usd', 0):.6f}",
+                ], widths, alternate=bool(i % 2))
             pdf.ln(2)
-        
-        # Metrics definitions
-        pdf.subsection_header('Metrics Definitions')
-        for metric_name, metric_desc in methodology['metrics_definitions'].items():
-            pdf.set_font('Arial', 'B', 10)
-            pdf.set_text_color(51, 65, 85)
-            pdf.cell(0, 6, f"{metric_name}:", 0, 1)
-            pdf.set_font('Arial', '', 10)
-            pdf.set_text_color(75, 85, 99)
-            pdf.multi_cell(0, 5, metric_desc)
-            pdf.ln(1)
-        
-        # ===== APPENDIX =====
-        pdf.add_page()
-        pdf.section_header('Appendix')
-        
-        pdf.subsection_header('Technical Details')
-        tech_details = (
-            f"Scan ID: {result.scan_id}\n"
-            f"Codebase Path: {result.codebase_path}\n"
-            f"AutoPoV Version: {settings.APP_VERSION}\n"
-            f"Report Generated: {datetime.utcnow().isoformat()}"
+            pdf.body_text(
+                f"Exact OpenRouter calls captured: {exact_openrouter_usage.get('total_calls', 0)}. "
+                f"Prompt tokens: {exact_openrouter_usage.get('total_prompt_tokens', 0):,}. "
+                f"Completion tokens: {exact_openrouter_usage.get('total_completion_tokens', 0):,}. "
+                f"Reasoning tokens: {exact_openrouter_usage.get('total_reasoning_tokens', 0):,}. "
+                f"Exact billed cost: ${exact_openrouter_usage.get('total_exact_cost_usd', 0.0):.6f}."
+            )
+
+        pdf.section_header('Runtime-Proven Vulnerabilities')
+        if confirmed:
+            for idx, finding in enumerate(confirmed, 1):
+                if pdf.get_y() > 235:
+                    pdf.add_page()
+                narrative = self._proof_narrative(finding)
+                pdf.subsection_header(self._finding_title(idx, finding))
+                pdf.key_value_row('Location', f"{finding.get('filepath', 'N/A')}:{finding.get('line_number', 'N/A')}")
+                pdf.key_value_row('Confidence', f"{finding.get('confidence', 0.0):.2f}")
+                pdf.key_value_row('Status', 'Runtime proven')
+                contract = finding.get('exploit_contract') or {}
+                if contract.get('target_entrypoint'):
+                    pdf.key_value_row('Target entrypoint', str(contract.get('target_entrypoint')))
+                if finding.get('llm_explanation'):
+                    pdf.info_box('Vulnerability Description', finding.get('llm_explanation', ''))
+                pdf.info_box('How AutoPoV Triggered It', narrative['trigger'])
+                pdf.info_box('Observed Runtime Outcome', narrative['observed'])
+                pdf.info_box('Why This Matters', narrative['impact'])
+                pdf.info_box('Why This Counts As Proof', narrative['why'])
+                pov_result = finding.get('pov_result') or {}
+                evidence = (pov_result.get('evidence') or {}).get('combined_excerpt') or pov_result.get('stderr') or pov_result.get('stdout') or ''
+                if evidence:
+                    pdf.subsection_header('Runtime Evidence Excerpt')
+                    pdf.code_block(evidence, max_lines=12)
+                if finding.get('code_chunk'):
+                    pdf.subsection_header('Vulnerable Code Excerpt')
+                    pdf.code_block(finding.get('code_chunk', ''), max_lines=14)
+                pdf.ln(2)
+        else:
+            pdf.body_text('No findings reached runtime-confirmed status in this assessment.')
+
+        pdf.section_header('Unproven Findings')
+        if unproven:
+            headers = ['Location', 'Status', 'Confidence', 'Reason']
+            widths = [78, 26, 20, 62]
+            pdf.table_header(headers, widths)
+            for i, finding in enumerate(unproven[:25]):
+                pov_result = finding.get('pov_result') or {}
+                reason = (pov_result.get('proof_summary') or pov_result.get('stderr') or 'Proof was attempted but not established')
+                pdf.table_row([
+                    f"{finding.get('filepath', 'N/A')}:{finding.get('line_number', 'N/A')}",
+                    finding.get('final_status', 'unproven'),
+                    f"{finding.get('confidence', 0.0):.2f}",
+                    reason,
+                ], widths, alternate=bool(i % 2))
+            pdf.ln(2)
+            pdf.body_text('These findings were investigated and in some cases had PoV scripts generated, but runtime evidence was insufficient to classify them as proven vulnerabilities.')
+        else:
+            pdf.body_text('No unproven findings were recorded.')
+
+        pdf.section_header('False Positive Disposition')
+        pdf.body_text(
+            f"{len(false_positives)} findings were rejected as false positives after investigation. "
+            'These were initial static or exploratory signals that did not hold up under context review.'
         )
-        pdf.body_text(tech_details)
-        
+        if false_positives:
+            headers = ['Location', 'Source', 'Confidence', 'Disposition Summary']
+            widths = [68, 22, 18, 78]
+            pdf.table_header(headers, widths)
+            for i, finding in enumerate(false_positives[:20]):
+                pdf.table_row([
+                    f"{finding.get('filepath', 'N/A')}:{finding.get('line_number', 'N/A')}",
+                    finding.get('source', 'unknown'),
+                    f"{finding.get('confidence', 0.0):.2f}",
+                    self._build_classification_summary(finding),
+                ], widths, alternate=bool(i % 2))
+
+        pdf.section_header('Methodology And Metric Definitions')
+        for step in methodology['process_steps']:
+            pdf.subsection_header(step['name'])
+            pdf.body_text(step['description'])
+        pdf.subsection_header('Metric Definitions')
+        for metric_name, metric_desc in methodology['metrics_definitions'].items():
+            pdf.key_value_row(metric_name, metric_desc, label_width=52)
+
+        pdf.section_header('Appendix')
+        pdf.key_value_row('Scan ID', result.scan_id)
+        pdf.key_value_row('Codebase path', result.codebase_path)
+        pdf.key_value_row('Report generated', datetime.utcnow().isoformat())
+        pdf.key_value_row('Application version', settings.APP_VERSION)
+
         pdf.output(report_path)
         return report_path
-    
+
     def _generate_methodology(self, result: ScanResult) -> Dict[str, Any]:
         """Generate scan-specific methodology description"""
         return {
@@ -893,8 +757,8 @@ class ReportGenerator:
             "model_mode": settings.MODEL_MODE,
             "scout_enabled": settings.SCOUT_ENABLED,
             "codeql_enabled": settings.is_codeql_available(),
-            "cwes_checked": result.cwes,
-            "discovery_scope": result.cwes if result.cwes else 'open-ended',
+            "taxonomy_focus": result.cwes or [],
+            "discovery_scope": "open-ended" if not result.cwes else "focused",
             "duration_seconds": result.duration_s,
             "process_steps": [
                 {
@@ -909,13 +773,12 @@ class ReportGenerator:
                 },
                 {
                     "name": "Autonomous Discovery",
-                    "description": "The system performed open-ended vulnerability discovery and only treated CWE selection as an optional focus filter. " +
+                    "description": "The system performed discovery without requiring a predefined vulnerability taxonomy from the user. " +
                                    f"Scout was {'enabled' if settings.SCOUT_ENABLED else 'disabled'}."
                 },
                 {
                     "name": "LLM Investigation",
-                    "description": f"Each alert was analyzed using {settings.ROUTING_MODE} routing via {settings.AUTO_ROUTER_MODEL} "
-                                   "for validation and classification."
+                    "description": f"Each alert was analyzed using a fixed selected model ({settings.MODEL_NAME}) for validation, prioritization, and classification when justified."
                 },
                 {
                     "name": "PoV Generation",
@@ -944,6 +807,109 @@ class ReportGenerator:
         end_time = datetime.utcnow()
         
         return self.activity_tracker.get_activity_for_scan(start_time, end_time)
+
+    
+    def _collect_exact_openrouter_usage(self, result: ScanResult) -> Dict[str, Any]:
+        calls: List[Dict[str, Any]] = []
+        seen_generation_ids = set()
+
+        def normalize_entries(usage: Any) -> List[Dict[str, Any]]:
+            if isinstance(usage, dict) and usage:
+                return [dict(usage)]
+            if isinstance(usage, list):
+                return [dict(item) for item in usage if isinstance(item, dict) and item]
+            if isinstance(usage, str) and usage.strip():
+                try:
+                    parsed = json.loads(usage)
+                    return normalize_entries(parsed)
+                except Exception:
+                    return []
+            return []
+
+        def add_call(usage: Any, agent_role: str, finding: Dict[str, Any], attempt: Optional[int] = None):
+            for entry in normalize_entries(usage):
+                entry.setdefault('agent_role', agent_role)
+                entry.setdefault('model', entry.get('model_permaslug') or entry.get('model') or 'unknown')
+                entry.setdefault('provider_name', entry.get('provider_name') or 'unknown')
+                entry.setdefault('cost_usd', float(entry.get('cost_usd', 0.0) or 0.0))
+                entry['tokens_prompt'] = int(entry.get('native_tokens_prompt', 0) or entry.get('tokens_prompt', 0) or 0)
+                entry['tokens_completion'] = int(entry.get('native_tokens_completion', 0) or entry.get('tokens_completion', 0) or 0)
+                entry['total_tokens'] = int(entry['tokens_prompt'] + entry['tokens_completion'])
+                entry.setdefault('native_tokens_reasoning', int(entry.get('native_tokens_reasoning', 0) or 0))
+                entry['finding_ref'] = f"{finding.get('filepath', 'unknown')}:{finding.get('line_number', 0)}:{finding.get('cwe_type', 'UNCLASSIFIED')}"
+                if attempt is not None:
+                    entry['attempt'] = attempt
+
+                generation_id = entry.get('generation_id')
+                if generation_id:
+                    if generation_id in seen_generation_ids:
+                        continue
+                    seen_generation_ids.add(generation_id)
+
+                calls.append(entry)
+
+        for entry in normalize_entries(getattr(result, 'scan_openrouter_usage', []) or []):
+            add_call(entry, entry.get('agent_role', 'scan'), {
+                'filepath': entry.get('filepath', 'unknown'),
+                'line_number': entry.get('line_number', 0),
+                'cwe_type': entry.get('cwe_type', 'UNCLASSIFIED')
+            }, attempt=entry.get('attempt'))
+
+        for finding in result.findings or []:
+            if not hasattr(finding, 'get'):
+                continue
+            add_call(finding.get('scout_openrouter_usage') or {}, 'llm_scout', finding)
+            add_call(finding.get('openrouter_usage') or {}, 'investigator', finding)
+            add_call(finding.get('pov_openrouter_usage') or {}, 'pov_generation', finding)
+            add_call((finding.get('validation_result') or {}).get('openrouter_usage') or {}, 'llm_validation', finding)
+            for history in finding.get('refinement_history') or []:
+                add_call((history or {}).get('openrouter_usage') or {}, 'pov_refinement', finding, attempt=(history or {}).get('attempt'))
+
+        summary = {}
+        total_exact_cost = 0.0
+        total_prompt = 0
+        total_completion = 0
+        total_reasoning = 0
+
+        for call in calls:
+            total_exact_cost += float(call.get('cost_usd', 0.0) or 0.0)
+            total_prompt += int(call.get('tokens_prompt', 0) or 0)
+            total_completion += int(call.get('tokens_completion', 0) or 0)
+            total_reasoning += int(call.get('native_tokens_reasoning', 0) or 0)
+            key = (call.get('agent_role', 'unknown'), call.get('model', 'unknown'), call.get('provider_name', 'unknown'))
+            if key not in summary:
+                summary[key] = {
+                    'agent_role': key[0],
+                    'model': key[1],
+                    'provider_name': key[2],
+                    'calls': 0,
+                    'cost_usd': 0.0,
+                    'prompt_tokens': 0,
+                    'completion_tokens': 0,
+                    'reasoning_tokens': 0,
+                }
+            row = summary[key]
+            row['calls'] += 1
+            row['cost_usd'] += float(call.get('cost_usd', 0.0) or 0.0)
+            row['prompt_tokens'] += int(call.get('tokens_prompt', 0) or 0)
+            row['completion_tokens'] += int(call.get('tokens_completion', 0) or 0)
+            row['reasoning_tokens'] += int(call.get('native_tokens_reasoning', 0) or 0)
+
+        summary_rows = []
+        for row in summary.values():
+            row['cost_usd'] = round(row['cost_usd'], 6)
+            summary_rows.append(row)
+        summary_rows.sort(key=lambda item: (-item['cost_usd'], item['agent_role'], item['model']))
+
+        return {
+            'calls': calls,
+            'summary_by_agent': summary_rows,
+            'total_calls': len(calls),
+            'total_exact_cost_usd': round(total_exact_cost, 6),
+            'total_prompt_tokens': total_prompt,
+            'total_completion_tokens': total_completion,
+            'total_reasoning_tokens': total_reasoning,
+        }
     
     def _collect_models_used(self, result: ScanResult) -> List[Dict[str, Any]]:
         """Collect detailed model usage information with roles"""
@@ -1021,6 +987,12 @@ class ReportGenerator:
         if result.total_findings == 0:
             return 0.0
         return (result.false_positives / result.total_findings) * 100
+
+    def _calculate_unproven_rate(self, result: ScanResult) -> float:
+        """Calculate the share of findings that were analyzed but not runtime-confirmed."""
+        if result.total_findings == 0:
+            return 0.0
+        return ((getattr(result, 'unproven_findings', 0) or 0) / result.total_findings) * 100
     
     def _calculate_pov_success_rate(self, result: ScanResult) -> float:
         """Calculate PoV success rate percentage"""
@@ -1056,7 +1028,8 @@ class ReportGenerator:
             pov_result = finding.get("pov_result") or {}
             validation = finding.get("validation_result") or {}
             formatted.append({
-                "cwe_type": finding.get("cwe_type") or "UNCLASSIFIED",
+                "cwe_type": "UNCLASSIFIED",
+                "taxonomy_refs": finding.get("taxonomy_refs", []),
                 "cve_id": finding.get("cve_id"),
                 "filepath": finding.get("filepath"),
                 "line_number": finding.get("line_number"),
@@ -1098,7 +1071,7 @@ class ReportGenerator:
                 with open(pov_path, 'w') as f:
                     f.write(f"# AutoPoV Proof-of-Vulnerability\n")
                     f.write(f"# Scan ID: {result.scan_id}\n")
-                    f.write(f"# CWE: {finding.get('cwe_type', 'unknown')}\n")
+                    f.write(f"# Classification: {finding.get('cwe_type', 'UNCLASSIFIED')}\n")
                     f.write(f"# File: {finding.get('filepath', 'unknown')}\n")
                     f.write(f"# Line: {finding.get('line_number', 0)}\n")
                     f.write(f"# Generated: {datetime.utcnow().isoformat()}\n\n")

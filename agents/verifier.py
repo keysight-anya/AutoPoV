@@ -8,6 +8,7 @@ import re
 import ast
 import os
 from typing import Dict, Optional, Any, List
+from pathlib import Path
 from datetime import datetime
 
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -25,6 +26,7 @@ except ImportError:
     OLLAMA_AVAILABLE = False
 
 from app.config import settings
+from app.openrouter_client import OpenRouterReasoningChat, extract_usage_details
 from prompts import (
     format_pov_generation_prompt,
     format_pov_validation_prompt,
@@ -40,28 +42,139 @@ class VerificationError(Exception):
 
 
 class VulnerabilityVerifier:
+    NATIVE_INVALID_ENTRYPOINTS = {
+        "if", "for", "while", "switch", "return", "sizeof", "malloc", "calloc", "realloc", "free",
+        "memcpy", "memmove", "memset", "strcpy", "strncpy", "strcat", "strcmp", "unknown",
+    }
+    NATIVE_INVALID_ENTRYPOINTS = {
+        "if", "for", "while", "switch", "return", "sizeof", "malloc", "calloc", "realloc", "free",
+        "memcpy", "memmove", "memset", "strcpy", "strncpy", "strcat", "strcmp", "main-like",
+    }
     """Generates and validates PoV scripts"""
     
     def __init__(self):
         self._llm = None
 
-    def _default_exploit_contract(self, cwe_type: str, explanation: str, vulnerable_code: str) -> Dict[str, Any]:
+    def _infer_runtime_profile_from_filepath(self, filepath: str) -> str:
+        ext = Path(filepath or '').suffix.lower()
+        if ext in {'.c', '.h'}:
+            return 'c'
+        if ext in {'.cc', '.cpp', '.cxx', '.hpp'}:
+            return 'cpp'
+        if ext in {'.js', '.jsx'}:
+            return 'javascript'
+        if ext in {'.ts', '.tsx'}:
+            return 'node'
+        if ext == '.py':
+            return 'python'
+        return ''
+
+    def _extract_target_entrypoint(self, vulnerable_code: str, filepath: str) -> str:
+        patterns = [
+            r'(?:static\s+)?(?:[\w\*\s]+)\s+(\w+)\s*\([^;]*\)\s*\{',
+            r'def\s+(\w+)\s*\(',
+            r'function\s+(\w+)\s*\(',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, vulnerable_code or '')
+            if match:
+                candidate = match.group(1)
+                if candidate.lower() not in self.NATIVE_INVALID_ENTRYPOINTS:
+                    return candidate
+        return 'unknown'
+
+    def _canonicalize_target_entrypoint(self, value: Any, vulnerable_code: str, explanation: str, filepath: str, runtime_profile: str = '') -> str:
+        candidate = str(value or '').strip()
+        if not candidate or candidate == 'unknown':
+            return self._extract_target_entrypoint(vulnerable_code or explanation, filepath)
+        if candidate.startswith('/') or candidate.startswith('http://') or candidate.startswith('https://'):
+            return candidate
+        if runtime_profile in {'c', 'cpp', 'native', 'binary'}:
+            lowered = candidate.lower()
+            if lowered.startswith('the ') and 'main-like entrypoint' in lowered:
+                return 'main'
+            if re.fullmatch(r'[A-Za-z_]\w*', candidate):
+                return candidate if lowered not in self.NATIVE_INVALID_ENTRYPOINTS else 'unknown'
+            if re.fullmatch(r'[A-Za-z_]\w*\s*\([^\)]*\)', candidate):
+                match = re.match(r'([A-Za-z_]\w*)\s*\(', candidate)
+                if match:
+                    symbol = match.group(1)
+                    if symbol.lower() not in self.NATIVE_INVALID_ENTRYPOINTS:
+                        return symbol
+            backticked = re.search(r'`([A-Za-z_]\w*)\s*\(', candidate)
+            if backticked and backticked.group(1).lower() not in self.NATIVE_INVALID_ENTRYPOINTS:
+                return backticked.group(1)
+            inferred = self._extract_target_entrypoint(vulnerable_code or explanation, filepath)
+            if inferred and inferred.lower() not in self.NATIVE_INVALID_ENTRYPOINTS:
+                return inferred
+            return 'unknown'
+        if re.fullmatch(r'[A-Za-z_]\w*', candidate):
+            return candidate
+        match = re.search(r'([A-Za-z_]\w*)\s*\([^\)]*\)', candidate)
+        if match:
+            return match.group(1)
+        return candidate
+
+    def _default_exploit_contract(self, cwe_type: str, explanation: str, vulnerable_code: str, filepath: str = '') -> Dict[str, Any]:
+        runtime_profile = self._infer_runtime_profile_from_filepath(filepath)
+        target_entrypoint = self._extract_target_entrypoint(vulnerable_code, filepath)
+        inputs = []
+        trigger_steps = ["Invoke the vulnerable code path with attacker-controlled input"]
+        if cwe_type in {'CWE-120', 'CWE-121', 'CWE-122'}:
+            inputs = ['oversized input string', 'undersized destination buffer']
+            trigger_steps = [f'Call {target_entrypoint} with an input longer than the destination buffer', 'Observe memory corruption, crash, or sanitizer evidence']
+        elif cwe_type == 'CWE-690':
+            inputs = ['resource-constrained memory limit', 'oversized allocation request']
+            trigger_steps = [f'Reach {target_entrypoint} with an attacker-controlled size or allocation parameter', 'Force allocation failure deterministically and observe NULL dereference or crash']
         return {
             "goal": explanation or "Demonstrate exploitability of the candidate vulnerability",
-            "target_entrypoint": "unknown",
-            "runtime_profile": "python",
+            "target_entrypoint": target_entrypoint,
+            "runtime_profile": runtime_profile,
             "http_method": "GET",
             "target_url": "",
             "base_url": "",
             "preconditions": [],
-            "inputs": [],
-            "trigger_steps": ["Invoke the vulnerable code path with attacker-controlled input"],
+            "inputs": inputs,
+            "trigger_steps": trigger_steps,
             "success_indicators": ["VULNERABILITY TRIGGERED"],
             "side_effects": [],
             "expected_outcome": "The exploit should trigger observable unsafe behavior"
         }
 
-    def _parse_pov_payload(self, raw_content: str, cwe_type: str, explanation: str, vulnerable_code: str) -> Dict[str, Any]:
+    def _normalize_exploit_contract(self, contract: Optional[Dict[str, Any]], cwe_type: str, explanation: str, vulnerable_code: str, filepath: str = '') -> Dict[str, Any]:
+        defaults = self._default_exploit_contract(cwe_type, explanation, vulnerable_code, filepath=filepath)
+        merged = dict(defaults)
+        if isinstance(contract, dict):
+            for key, value in contract.items():
+                if value not in (None, '', [], {}):
+                    merged[key] = value
+        if not merged.get('runtime_profile'):
+            merged['runtime_profile'] = defaults.get('runtime_profile', '')
+        merged['target_entrypoint'] = self._canonicalize_target_entrypoint(
+            merged.get('target_entrypoint'),
+            vulnerable_code,
+            explanation,
+            filepath,
+            runtime_profile=merged.get('runtime_profile', '')
+        )
+        if not merged.get('success_indicators'):
+            merged['success_indicators'] = defaults.get('success_indicators', ['VULNERABILITY TRIGGERED'])
+        if merged.get('runtime_profile') in {'c', 'cpp', 'native', 'binary'}:
+            native_indicators = [
+                'VULNERABILITY TRIGGERED',
+                'AddressSanitizer',
+                'UndefinedBehaviorSanitizer',
+                'Segmentation fault',
+                'SIGSEGV',
+            ]
+            merged['success_indicators'] = list(dict.fromkeys([*(merged.get('success_indicators') or []), *native_indicators]))
+        if not merged.get('trigger_steps'):
+            merged['trigger_steps'] = defaults.get('trigger_steps', [])
+        if not merged.get('inputs'):
+            merged['inputs'] = defaults.get('inputs', [])
+        return merged
+
+    def _parse_pov_payload(self, raw_content: str, cwe_type: str, explanation: str, vulnerable_code: str, filepath: str = '') -> Dict[str, Any]:
         payload = raw_content.strip()
         if payload.startswith("```"):
             payload = payload.split("```", 2)[1 if "```json" not in payload else 1]
@@ -73,9 +186,11 @@ class VulnerabilityVerifier:
                 cleaned = cleaned.split("```", 1)[1].rsplit("```", 1)[0]
             data = json.loads(cleaned.strip())
             pov_script = (data.get("pov_script") or "").strip()
-            contract = data.get("exploit_contract") or self._default_exploit_contract(cwe_type, explanation, vulnerable_code)
+            contract = self._normalize_exploit_contract(data.get("exploit_contract") or {}, cwe_type, explanation, vulnerable_code, filepath=filepath)
             if pov_script:
                 return {"pov_script": pov_script, "exploit_contract": contract}
+            if isinstance(data, dict) and any(k in data for k in ["failure_reason", "suggested_changes", "different_approach"]):
+                return {"pov_script": "", "exploit_contract": contract}
         except Exception:
             pass
 
@@ -86,15 +201,12 @@ class VulnerabilityVerifier:
             pov_script = pov_script.split("```javascript", 1)[1].split("```", 1)[0].strip()
         elif "```" in pov_script:
             pov_script = pov_script.split("```", 1)[1].split("```", 1)[0].strip()
-        return {"pov_script": pov_script, "exploit_contract": self._default_exploit_contract(cwe_type, explanation, vulnerable_code)}
+        return {"pov_script": pov_script, "exploit_contract": self._normalize_exploit_contract({}, cwe_type, explanation, vulnerable_code, filepath=filepath)}
 
     
     def _get_llm(self, model_name: Optional[str] = None):
         """Get LLM instance based on configuration"""
-        if model_name is None and self._llm is not None:
-            return self._llm
-        
-        llm_config = settings.get_llm_config()
+        llm_config = settings.get_llm_config(model_name=model_name)
         actual_model = model_name or llm_config["model"]
         
         if llm_config["mode"] == "online":
@@ -105,11 +217,13 @@ class VulnerabilityVerifier:
             if not api_key:
                 raise VerificationError("OpenRouter API key not configured")
             
-            llm = ChatOpenAI(
+            llm = OpenRouterReasoningChat(
                 model=actual_model,
                 api_key=api_key,
                 base_url=llm_config["base_url"],
                 temperature=0.2,
+                timeout=settings.LLM_REQUEST_TIMEOUT_S,
+                reasoning_enabled=llm_config.get("reasoning_enabled", True),
                 default_headers={
                     "HTTP-Referer": "https://autopov.local",
                     "X-OpenRouter-Title": "AutoPoV"
@@ -127,7 +241,10 @@ class VulnerabilityVerifier:
             llm = ChatOllama(
                 model=actual_model,
                 base_url=llm_config["base_url"],
-                temperature=0.2
+                temperature=0.2,
+                num_ctx=settings.OLLAMA_NUM_CTX,
+                num_predict=settings.OLLAMA_NUM_PREDICT,
+                client_kwargs={"timeout": (settings.OLLAMA_CONNECT_TIMEOUT_S, settings.OLLAMA_READ_TIMEOUT_S)}
             )
             llm._autopov_model_name = actual_model
             
@@ -144,7 +261,8 @@ class VulnerabilityVerifier:
         explanation: str,
         code_context: str,
         target_language: str = "python",
-        model_name: Optional[str] = None
+        model_name: Optional[str] = None,
+        exploit_contract: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Generate a PoV script for a vulnerability
@@ -190,52 +308,16 @@ class VulnerabilityVerifier:
             ]
             
             response = llm.invoke(messages)
-            parsed = self._parse_pov_payload(response.content, cwe_type, explanation, vulnerable_code)
+            parsed = self._parse_pov_payload(response.content, cwe_type, explanation, vulnerable_code, filepath=filepath)
             pov_script = parsed["pov_script"]
-            exploit_contract = parsed["exploit_contract"]
+            if not pov_script.strip():
+                raise VerificationError("Model did not return executable PoV code")
+            exploit_contract = self._normalize_exploit_contract(parsed["exploit_contract"], cwe_type, explanation, vulnerable_code, filepath=filepath)
             
-            # Get actual cost from response
-            actual_cost = 0.0
-            token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-            
-            try:
-                # Method 1: Check for usage_metadata (newer LangChain versions)
-                if hasattr(response, 'usage_metadata') and response.usage_metadata:
-                    um = response.usage_metadata
-                    token_usage = {
-                        "prompt_tokens": um.get('input_tokens', 0) or um.get('prompt_tokens', 0),
-                        "completion_tokens": um.get('output_tokens', 0) or um.get('completion_tokens', 0),
-                        "total_tokens": um.get('total_tokens', 0)
-                    }
-                # Method 2: Check for response_metadata (older LangChain versions)
-                elif hasattr(response, 'response_metadata') and response.response_metadata:
-                    rm = response.response_metadata
-                    if 'token_usage' in rm:
-                        usage = rm['token_usage']
-                        token_usage = {
-                            "prompt_tokens": usage.get('prompt_tokens', 0),
-                            "completion_tokens": usage.get('completion_tokens', 0),
-                            "total_tokens": usage.get('total_tokens', 0)
-                        }
-                    elif 'usage' in rm:
-                        usage = rm['usage']
-                        token_usage = {
-                            "prompt_tokens": usage.get('prompt_tokens', 0) or usage.get('input_tokens', 0),
-                            "completion_tokens": usage.get('completion_tokens', 0) or usage.get('output_tokens', 0),
-                            "total_tokens": usage.get('total_tokens', 0)
-                        }
-                
-                # Calculate cost if we have token usage
-                if token_usage["total_tokens"] > 0:
-                    from agents.investigator import get_investigator
-                    inv = get_investigator()
-                    actual_cost = inv._calculate_actual_cost(
-                        model_name or llm._autopov_model_name,
-                        token_usage["prompt_tokens"],
-                        token_usage["completion_tokens"]
-                    )
-            except Exception as e:
-                print(f"[CostTracking] Error extracting token usage in verifier: {e}")
+            usage_details = extract_usage_details(response, agent_role="pov_generation")
+            actual_cost = usage_details["cost_usd"]
+            token_usage = usage_details["token_usage"]
+            openrouter_usage = usage_details["openrouter_usage"]
             
             # Clean up markdown code blocks if present
             if "```python" in pov_script:
@@ -258,7 +340,8 @@ class VulnerabilityVerifier:
                 "timestamp": end_time.isoformat(),
                 "model_used": model_name or llm._autopov_model_name,
                 "cost_usd": actual_cost,
-                "token_usage": token_usage
+                "token_usage": token_usage,
+                "openrouter_usage": openrouter_usage
             }
             
         except Exception as e:
@@ -280,7 +363,8 @@ class VulnerabilityVerifier:
         filepath: str,
         line_number: int,
         vulnerable_code: str = "",
-        exploit_contract: Optional[Dict[str, Any]] = None
+        exploit_contract: Optional[Dict[str, Any]] = None,
+        model_name: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Validate a PoV script using hybrid approach:
@@ -336,8 +420,9 @@ class VulnerabilityVerifier:
             result["suggestions"].append(f"Static validation passed with {static_result.confidence:.0%} confidence")
             return result
         
-        # ===== STEP 2: Unit Test Validation (If vulnerable code available) =====
-        if vulnerable_code and len(vulnerable_code) > 10:
+        # ===== STEP 2: Unit Test Validation (If the snippet is executable in the unit harness) =====
+        unit_test_supported = self._infer_runtime_profile_from_filepath(filepath) in {"python", "javascript", "node"} or bool(re.search(r"(^|\n)\s*(def\s+|function\s+|async\s+function\s+)", vulnerable_code or ""))
+        if vulnerable_code and len(vulnerable_code) > 10 and unit_test_supported:
             unit_runner = get_unit_test_runner()
             
             # First check syntax
@@ -393,6 +478,8 @@ class VulnerabilityVerifier:
                 result["suggestions"].append("Unit test ran but did not trigger vulnerability")
             else:
                 result["issues"].append(f"Unit test failed: {unit_result.stderr[:200]}")
+        elif vulnerable_code and len(vulnerable_code) > 10:
+            result["suggestions"].append("Skipped unit-test harness for non-Python/non-JavaScript target code")
         
         # ===== STEP 3: Traditional Validation (Fallback) =====
         # Check 1: Syntax validation using AST
@@ -439,17 +526,21 @@ class VulnerabilityVerifier:
         if result["validation_method"] == "unknown":
             try:
                 llm_result = self._llm_validate_pov(
-                    pov_script, cwe_type, filepath, line_number, exploit_contract or {}
+                    pov_script, cwe_type, filepath, line_number, exploit_contract or {}, model_name
                 )
                 result["will_trigger"] = llm_result.get("will_trigger", "MAYBE")
                 result["suggestions"].extend(llm_result.get("suggestions", []))
                 result["issues"].extend(llm_result.get("issues", []))
                 result["validation_method"] = "llm_analysis"
+                result["token_usage"] = llm_result.get("token_usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+                result["cost_usd"] = llm_result.get("cost_usd", 0.0)
+                result["openrouter_usage"] = llm_result.get("openrouter_usage", {})
             except Exception as e:
                 result["suggestions"].append(f"LLM validation skipped: {str(e)}")
         
         # Final validity check
-        if result["issues"] and not result.get("unit_test_result", {}).get("vulnerability_triggered"):
+        unit_test_result = result.get("unit_test_result") or {}
+        if result["issues"] and not unit_test_result.get("vulnerability_triggered"):
             # If unit test didn't trigger but also didn't fail completely, still might be valid
             critical_issues = [i for i in result["issues"] if "Syntax" in i or "Missing required" in i]
             if critical_issues:
@@ -527,7 +618,8 @@ class VulnerabilityVerifier:
         cwe_type: str,
         filepath: str,
         line_number: int,
-        exploit_contract: Optional[Dict[str, Any]] = None
+        exploit_contract: Optional[Dict[str, Any]] = None,
+        model_name: Optional[str] = None
     ) -> Dict[str, Any]:
         """Use LLM to validate PoV script"""
         prompt = format_pov_validation_prompt(
@@ -538,13 +630,14 @@ class VulnerabilityVerifier:
             exploit_contract=exploit_contract or {}
         )
         
-        llm = self._get_llm()
+        llm = self._get_llm(model_name)
         messages = [
             SystemMessage(content="You are validating security test scripts."),
             HumanMessage(content=prompt)
         ]
         
         response = llm.invoke(messages)
+        usage_details = extract_usage_details(response, agent_role="llm_validation")
         
         try:
             json_text = response.content
@@ -553,13 +646,20 @@ class VulnerabilityVerifier:
             elif "```" in json_text:
                 json_text = json_text.split("```")[1].split("```")[0]
             
-            return json.loads(json_text.strip())
+            parsed = json.loads(json_text.strip())
+            parsed["token_usage"] = usage_details["token_usage"]
+            parsed["cost_usd"] = usage_details["cost_usd"]
+            parsed["openrouter_usage"] = usage_details["openrouter_usage"]
+            return parsed
         except json.JSONDecodeError:
             return {
                 "is_valid": True,
                 "issues": [],
                 "suggestions": [],
-                "will_trigger": "MAYBE"
+                "will_trigger": "MAYBE",
+                "token_usage": usage_details["token_usage"],
+                "cost_usd": usage_details["cost_usd"],
+                "openrouter_usage": usage_details["openrouter_usage"]
             }
     
     def analyze_failure(
@@ -571,7 +671,8 @@ class VulnerabilityVerifier:
         failed_pov: str,
         execution_output: str,
         attempt_number: int,
-        max_retries: int
+        max_retries: int,
+        model_name: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Analyze why a PoV failed and suggest improvements
@@ -600,7 +701,7 @@ class VulnerabilityVerifier:
             max_retries=max_retries
         )
         
-        llm = self._get_llm()
+        llm = self._get_llm(model_name)
         messages = [
             SystemMessage(content="You are analyzing failed security tests."),
             HumanMessage(content=prompt)
@@ -635,7 +736,8 @@ class VulnerabilityVerifier:
         validation_errors: List[str],
         attempt_number: int,
         target_language: str = "python",
-        model_name: Optional[str] = None
+        model_name: Optional[str] = None,
+        exploit_contract: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Refine a failed PoV script based on validation errors
@@ -673,7 +775,7 @@ class VulnerabilityVerifier:
                 validation_errors=validation_errors,
                 attempt_number=attempt_number,
                 target_language=target_language,
-                exploit_contract={}
+                exploit_contract=self._normalize_exploit_contract(exploit_contract or {}, cwe_type, explanation, vulnerable_code, filepath=filepath)
             )
             
             # Call LLM with specified model
@@ -684,49 +786,14 @@ class VulnerabilityVerifier:
             ]
             
             response = llm.invoke(messages)
-            parsed = self._parse_pov_payload(response.content, cwe_type, explanation, vulnerable_code)
+            parsed = self._parse_pov_payload(response.content, cwe_type, explanation, vulnerable_code, filepath=filepath)
             pov_script = parsed["pov_script"]
-            exploit_contract = parsed["exploit_contract"]
+            exploit_contract = self._normalize_exploit_contract(parsed["exploit_contract"], cwe_type, explanation, vulnerable_code, filepath=filepath)
             
-            # Get actual cost from response
-            actual_cost = 0.0
-            token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-            
-            try:
-                if hasattr(response, 'usage_metadata') and response.usage_metadata:
-                    um = response.usage_metadata
-                    token_usage = {
-                        "prompt_tokens": um.get('input_tokens', 0) or um.get('prompt_tokens', 0),
-                        "completion_tokens": um.get('output_tokens', 0) or um.get('completion_tokens', 0),
-                        "total_tokens": um.get('total_tokens', 0)
-                    }
-                elif hasattr(response, 'response_metadata') and response.response_metadata:
-                    rm = response.response_metadata
-                    if 'token_usage' in rm:
-                        usage = rm['token_usage']
-                        token_usage = {
-                            "prompt_tokens": usage.get('prompt_tokens', 0),
-                            "completion_tokens": usage.get('completion_tokens', 0),
-                            "total_tokens": usage.get('total_tokens', 0)
-                        }
-                    elif 'usage' in rm:
-                        usage = rm['usage']
-                        token_usage = {
-                            "prompt_tokens": usage.get('prompt_tokens', 0) or usage.get('input_tokens', 0),
-                            "completion_tokens": usage.get('completion_tokens', 0) or usage.get('output_tokens', 0),
-                            "total_tokens": usage.get('total_tokens', 0)
-                        }
-                
-                if token_usage["total_tokens"] > 0:
-                    from agents.investigator import get_investigator
-                    inv = get_investigator()
-                    actual_cost = inv._calculate_actual_cost(
-                        model_name or llm._autopov_model_name,
-                        token_usage["prompt_tokens"],
-                        token_usage["completion_tokens"]
-                    )
-            except Exception as e:
-                print(f"[CostTracking] Error extracting token usage in refine_pov: {e}")
+            usage_details = extract_usage_details(response, agent_role="pov_refinement")
+            actual_cost = usage_details["cost_usd"]
+            token_usage = usage_details["token_usage"]
+            openrouter_usage = usage_details["openrouter_usage"]
             
             # Clean up markdown code blocks if present
             if "```python" in pov_script:
@@ -748,7 +815,8 @@ class VulnerabilityVerifier:
                 "cost_usd": actual_cost,
                 "token_usage": token_usage,
                 "attempt_number": attempt_number,
-                "exploit_contract": exploit_contract
+                "exploit_contract": exploit_contract,
+                "openrouter_usage": openrouter_usage
             }
             
         except Exception as e:

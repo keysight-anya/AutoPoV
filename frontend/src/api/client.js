@@ -18,9 +18,16 @@ const shouldUseApiKey = (config) => {
   return Boolean(config?.useApiKey)
 }
 
-// Get OpenRouter API key (for per-request LLM key injection)
-const getOpenRouterKey = () => {
-  return localStorage.getItem('openrouter_api_key') || null
+let csrfBootstrapPromise = null
+
+const ensureCsrfCookie = async () => {
+  if (getCsrfToken()) return
+  if (!csrfBootstrapPromise) {
+    csrfBootstrapPromise = axios.get(`${API_URL}/health`, { withCredentials: true })
+      .catch(() => {})
+      .finally(() => { csrfBootstrapPromise = null })
+  }
+  await csrfBootstrapPromise
 }
 
 // Create axios instance
@@ -32,7 +39,7 @@ const apiClient = axios.create({
   }
 })
 
-apiClient.interceptors.request.use((config) => {
+apiClient.interceptors.request.use(async (config) => {
   if (shouldUseApiKey(config)) {
     const apiKey = getApiKey()
     if (apiKey) {
@@ -40,6 +47,10 @@ apiClient.interceptors.request.use((config) => {
     }
   } else if (config.headers?.Authorization) {
     delete config.headers.Authorization
+  }
+
+  if (config.method && !['get', 'head', 'options'].includes(config.method)) {
+    await ensureCsrfCookie()
   }
 
   const csrfToken = getCsrfToken()
@@ -58,24 +69,6 @@ export const scanZip = (formData) => apiClient.post('/scan/zip', formData, {
   }
 })
 export const scanPaste = (data) => apiClient.post('/scan/paste', data)
-
-export const scanGit = (data) => apiClient.post('/scan/git', {
-  ...data,
-  openrouter_api_key: getOpenRouterKey()
-})
-
-export const scanZip = (formData) => {
-  const orKey = getOpenRouterKey()
-  if (orKey) formData.append('openrouter_api_key', orKey)
-  return apiClient.post('/scan/zip', formData, {
-    headers: { 'Content-Type': 'multipart/form-data' }
-  })
-}
-
-export const scanPaste = (data) => apiClient.post('/scan/paste', {
-  ...data,
-  openrouter_api_key: getOpenRouterKey()
-})
 
 export const getScanStatus = (scanId) => apiClient.get(`/scan/${scanId}`)
 
@@ -96,6 +89,12 @@ export const generateApiKey = (name = 'default') => apiClient.post('/keys/genera
 
 export const listApiKeys = () => apiClient.get('/keys')
 export const cancelScan = (scanId) => apiClient.post(`/scan/${scanId}/cancel`)
+export const stopScan = (scanId) => apiClient.post(`/scan/${scanId}/stop`)
+export const deleteScan = (scanId) => apiClient.delete(`/scan/${scanId}`)
+export const getActiveScans = () => apiClient.get('/scans/active')
+export const cleanupStuckScans = () => apiClient.post('/scans/cleanup')
+export const getCacheStats = () => apiClient.get('/cache/stats')
+export const clearCache = () => apiClient.post('/cache/clear')
 export const getLearningSummary = () => apiClient.get('/learning/summary')
 export const replayScan = (scanId, data) => apiClient.post(`/scan/${scanId}/replay`, data)
 

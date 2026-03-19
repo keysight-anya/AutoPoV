@@ -90,6 +90,15 @@ def make_api_request(
         sys.exit(1)
 
 
+def get_effective_backend_model(api_key: str) -> str:
+    """Get the explicitly selected backend model for scans."""
+    config = make_api_request("GET", "/config", api_key)
+    model = (config.get("model_name") or "").strip()
+    if not model:
+        console.print("[red]Error: No model selected on the backend. Choose one in the web settings or pass --model.[/red]")
+        sys.exit(1)
+    return model
+
 @click.group()
 @click.version_option(version="1.0.0")
 def cli():
@@ -791,7 +800,7 @@ def config(api_key: Optional[str]):
                 f"CodeQL       : {'available' if srv.get('codeql_available') else 'not found'}\n"
                 f"Docker       : {'available' if srv.get('docker_available') else 'not found'}\n"
                 f"Discovery    : {srv.get('discovery_mode', 'open-ended')}\n"
-                f"Static rules : {srv.get('internal_static_ruleset_size', 0)} internal checks"
+                f"Static rules : {srv.get('internal_security_ruleset_size', 0)} internal checks"
             )
             console.print(Panel(srv_text, title="Server Configuration"))
         except Exception:

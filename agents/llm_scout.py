@@ -22,7 +22,8 @@ except ImportError:
     OLLAMA_AVAILABLE = False
 
 from app.config import settings
-from prompts import format_scout_prompt
+from app.openrouter_client import OpenRouterReasoningChat, extract_usage_details
+from prompts import format_scout_prompt, format_scout_triage_prompt
 
 
 class LLMScoutError(Exception):
@@ -33,7 +34,7 @@ class LLMScout:
     """LLM-based candidate discovery."""
 
     def _get_llm(self, model_name: Optional[str] = None):
-        llm_config = settings.get_llm_config()
+        llm_config = settings.get_llm_config(model_name=model_name)
         actual_model = model_name or llm_config["model"]
 
         if llm_config["mode"] == "online":
@@ -42,11 +43,13 @@ class LLMScout:
             api_key = llm_config.get("api_key")
             if not api_key:
                 raise LLMScoutError("OpenRouter API key not configured")
-            return ChatOpenAI(
+            return OpenRouterReasoningChat(
                 model=actual_model,
                 api_key=api_key,
                 base_url=llm_config["base_url"],
                 temperature=0.1,
+                timeout=settings.LLM_REQUEST_TIMEOUT_S,
+                reasoning_enabled=llm_config.get("reasoning_enabled", True),
                 default_headers={
                     "HTTP-Referer": "https://autopov.local",
                     "X-OpenRouter-Title": "AutoPoV"
@@ -57,7 +60,8 @@ class LLMScout:
         return ChatOllama(
             model=actual_model,
             base_url=llm_config["base_url"],
-            temperature=0.1
+            temperature=0.1,
+            client_kwargs={"timeout": (settings.OLLAMA_CONNECT_TIMEOUT_S, settings.OLLAMA_READ_TIMEOUT_S)}
         )
 
     def _is_code_file(self, filepath: str) -> bool:
@@ -118,7 +122,7 @@ class LLMScout:
         if not file_snippets:
             return []
 
-        prompt = format_scout_prompt(file_snippets, cwes)
+        prompt = format_scout_prompt(file_snippets, [])
         llm = self._get_llm(model_name)
         messages = [
             SystemMessage(content="You are a security researcher scouting for potential vulnerabilities."),
@@ -127,46 +131,12 @@ class LLMScout:
         response = llm.invoke(messages)
         content = response.content.strip()
 
-        # Estimate cost (if usage available)
-        cost_usd = 0.0
-        try:
-            token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-            if hasattr(response, "usage_metadata") and response.usage_metadata:
-                um = response.usage_metadata
-                token_usage = {
-                    "prompt_tokens": um.get("input_tokens", 0) or um.get("prompt_tokens", 0),
-                    "completion_tokens": um.get("output_tokens", 0) or um.get("completion_tokens", 0),
-                    "total_tokens": um.get("total_tokens", 0)
-                }
-            elif hasattr(response, "response_metadata") and response.response_metadata:
-                rm = response.response_metadata
-                if "token_usage" in rm:
-                    usage = rm["token_usage"]
-                    token_usage = {
-                        "prompt_tokens": usage.get("prompt_tokens", 0),
-                        "completion_tokens": usage.get("completion_tokens", 0),
-                        "total_tokens": usage.get("total_tokens", 0)
-                    }
-                elif "usage" in rm:
-                    usage = rm["usage"]
-                    token_usage = {
-                        "prompt_tokens": usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0),
-                        "completion_tokens": usage.get("completion_tokens", 0) or usage.get("output_tokens", 0),
-                        "total_tokens": usage.get("total_tokens", 0)
-                    }
-            if token_usage["total_tokens"] > 0:
-                from agents.investigator import get_investigator
-                inv = get_investigator()
-                llm_config = settings.get_llm_config()
-                cost_usd = inv._calculate_actual_cost(
-                    model_name or llm_config["model"],
-                    token_usage["prompt_tokens"],
-                    token_usage["completion_tokens"]
-                )
-        except Exception:
-            cost_usd = 0.0
+        usage_details = extract_usage_details(response, agent_role="llm_scout")
+        cost_usd = usage_details["cost_usd"]
+        token_usage = usage_details["token_usage"]
+        openrouter_usage = usage_details["openrouter_usage"]
 
-        if settings.SCOUT_MAX_COST_USD and cost_usd > settings.SCOUT_MAX_COST_USD:
+        if settings.SCOUT_MAX_COST_USD and settings.SCOUT_MAX_COST_USD > 0 and cost_usd > settings.SCOUT_MAX_COST_USD:
             return []
 
         try:
@@ -177,11 +147,10 @@ class LLMScout:
         findings: List[Dict[str, Any]] = []
         for item in data.get("findings", []):
             cwe = item.get("cwe") or "UNCLASSIFIED"
-            if cwes and cwe not in cwes:
-                continue
             findings.append({
                 "cve_id": item.get("cve_id"),
-                "cwe_type": cwe,
+                "cwe_type": "UNCLASSIFIED",
+                "taxonomy_refs": [ref for ref in [cwe, item.get("cve_id")] if ref and ref != "UNCLASSIFIED"],
                 "filepath": item.get("filepath", ""),
                 "line_number": int(item.get("line", 0) or 0),
                 "code_chunk": item.get("snippet", ""),
@@ -194,10 +163,81 @@ class LLMScout:
                 "retry_count": 0,
                 "inference_time_s": 0.0,
                 "cost_usd": 0.0,
-                "final_status": "pending",
+                "final_status": "",
                 "alert_message": "LLM scout",
                 "source": "llm_scout",
-                "language": item.get("language", "unknown")
+                "language": item.get("language", "unknown"),
+                "scout_model_used": model_name or getattr(llm, "_autopov_model_name", ""),
+                "scout_token_usage": token_usage,
+                "scout_openrouter_usage": openrouter_usage
+            })
+            if len(findings) >= max_findings:
+                break
+
+        return findings
+
+    def scan_snippets(self, file_snippets: List[Dict[str, Any]], cwes: List[str], model_name: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Run LLM triage on pre-selected candidate file snippets from prior tools.
+        
+        Unlike scan_directory, this method takes already-enriched snippets (including
+        candidate_lines and candidate_cwes) so the LLM focuses on flagged locations.
+        """
+        if not file_snippets:
+            return []
+
+        max_findings = settings.SCOUT_MAX_FINDINGS
+        prompt = format_scout_triage_prompt(file_snippets, [])
+        llm = self._get_llm(model_name)
+        messages = [
+            SystemMessage(content="You are a security researcher triaging pre-flagged vulnerability signals from static analysis tools."),
+            HumanMessage(content=prompt)
+        ]
+        response = llm.invoke(messages)
+        content = response.content.strip()
+        usage_details = extract_usage_details(response, agent_role="llm_scout")
+        token_usage = usage_details["token_usage"]
+        openrouter_usage = usage_details["openrouter_usage"]
+
+        try:
+            data = json.loads(content)
+        except Exception:
+            # Try to extract JSON block if wrapped in markdown
+            import re
+            match = re.search(r'\{.*\}', content, re.DOTALL)
+            if match:
+                try:
+                    data = json.loads(match.group(0))
+                except Exception:
+                    return []
+            else:
+                return []
+
+        findings: List[Dict[str, Any]] = []
+        for item in data.get("findings", []):
+            cwe = item.get("cwe") or "UNCLASSIFIED"
+            findings.append({
+                "cve_id": item.get("cve_id"),
+                "cwe_type": "UNCLASSIFIED",
+                "taxonomy_refs": [ref for ref in [cwe, item.get("cve_id")] if ref and ref != "UNCLASSIFIED"],
+                "filepath": item.get("filepath", ""),
+                "line_number": int(item.get("line", 0) or 0),
+                "code_chunk": item.get("snippet", ""),
+                "llm_verdict": "",
+                "llm_explanation": item.get("reason", ""),
+                "confidence": float(item.get("confidence", 0.5) or 0.5),
+                "pov_script": None,
+                "pov_path": None,
+                "pov_result": None,
+                "retry_count": 0,
+                "inference_time_s": 0.0,
+                "cost_usd": 0.0,
+                "final_status": "",
+                "alert_message": "LLM triage",
+                "source": "llm_scout",
+                "language": item.get("language", "unknown"),
+                "scout_model_used": model_name or getattr(llm, "_autopov_model_name", ""),
+                "scout_token_usage": token_usage,
+                "scout_openrouter_usage": openrouter_usage,
             })
             if len(findings) >= max_findings:
                 break
@@ -210,3 +250,4 @@ llm_scout = LLMScout()
 
 def get_llm_scout() -> LLMScout:
     return llm_scout
+

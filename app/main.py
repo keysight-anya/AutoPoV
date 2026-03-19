@@ -39,9 +39,6 @@ class ScanGitRequest(BaseModel):
     token: Optional[str] = None
     branch: Optional[str] = None
     model: Optional[str] = Field(default=None)
-    model: str = Field(default="openai/gpt-4o")
-    cwes: List[str] = Field(default=["CWE-89", "CWE-119", "CWE-190", "CWE-416"])
-    openrouter_api_key: Optional[str] = None
 
 
 class ScanPasteRequest(BaseModel):
@@ -49,13 +46,6 @@ class ScanPasteRequest(BaseModel):
     language: Optional[str] = None
     filename: Optional[str] = None
     model: Optional[str] = Field(default=None)
-    model: str = Field(default="openai/gpt-4o")
-    cwes: List[str] = Field(default=["CWE-89", "CWE-119", "CWE-190", "CWE-416"])
-    openrouter_api_key: Optional[str] = None
-    model: str = Field(default="openai/gpt-4o")
-    cwes: List[str] = Field(default=["CWE-89", "CWE-119", "CWE-190", "CWE-416"])
-    openrouter_api_key: Optional[str] = None
-
 
 
 class ReplayRequest(BaseModel):
@@ -105,18 +95,51 @@ class WebhookResponse(BaseModel):
 
 # Helper function to get the configured model
 def get_configured_model() -> str:
-    """Get the configured model name, raising error if not set"""
-    auto_model = settings.AUTO_ROUTER_MODEL or "openrouter/auto"
-    if settings.ROUTING_MODE == "fixed":
-        if settings.MODEL_NAME:
-            return settings.MODEL_NAME
-        if settings.MODEL_MODE == "online":
-            return auto_model
+    """Get the configured model name, raising an error if not explicitly set."""
+    selected_model = (settings.MODEL_NAME or "").strip()
+    if not selected_model:
         raise HTTPException(
             status_code=400,
             detail="No model configured. Please go to Settings > Model Config and select a model before running scans."
         )
-    return auto_model if settings.ROUTING_MODE == "auto" else (settings.AUTO_ROUTER_MODEL or auto_model)
+    try:
+        settings.resolve_model_mode(selected_model)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return selected_model
+
+
+def ensure_model_runtime_ready(model: str) -> None:
+    """Validate that the selected model can actually run before creating a scan."""
+    selected_model = (model or "").strip()
+    if not selected_model:
+        raise HTTPException(status_code=400, detail="No model configured. Select a model in Settings before running scans.")
+
+    try:
+        model_mode = settings.resolve_model_mode(selected_model)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if model_mode == "offline":
+        from urllib.parse import urljoin
+        import requests
+
+        base_url = settings.get_effective_ollama_base_url().rstrip("/")
+        tags_url = urljoin(base_url + "/", "api/tags")
+        try:
+            response = requests.get(tags_url, timeout=5)
+            response.raise_for_status()
+            payload = response.json() or {}
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Offline model runtime is unavailable: {exc}") from exc
+
+        installed = {m.get("name", "").split(":", 1)[0] for m in payload.get("models", [])}
+        if selected_model not in installed:
+            raise HTTPException(status_code=400, detail=f"Offline model '{selected_model}' is not installed in Ollama.")
+        return
+
+    if not settings.get_openrouter_api_key():
+        raise HTTPException(status_code=400, detail="OpenRouter API key is not configured for online scanning.")
 
 
 # Lifespan context manager
@@ -153,7 +176,7 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.FRONTEND_URL.rstrip("/")],
+    allow_origins=settings.get_allowed_frontend_origins(),
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "X-CSRF-Token"]
@@ -167,9 +190,7 @@ def _origin_matches_frontend(request: Request) -> bool:
         return False
     parsed = urlparse(origin)
     origin_base = f"{parsed.scheme}://{parsed.netloc}"
-    front = urlparse(settings.FRONTEND_URL.rstrip("/"))
-    front_base = f"{front.scheme}://{front.netloc}"
-    return origin_base == front_base
+    return origin_base in settings.get_allowed_frontend_origins()
 
 
 @app.middleware("http")
@@ -178,7 +199,7 @@ async def csrf_cookie_middleware(request: Request, call_next):
     if _origin_matches_frontend(request):
         if "autopov_csrf" not in request.cookies:
             token = secrets.token_urlsafe(32)
-            secure = urlparse(settings.FRONTEND_URL).scheme == "https"
+            secure = urlparse(settings.get_frontend_origin() or settings.FRONTEND_URL).scheme == "https"
             response.set_cookie(
                 "autopov_csrf",
                 token,
@@ -253,22 +274,13 @@ async def get_config(auth: Optional[tuple] = Depends(verify_api_key_optional)):
         "app_version": settings.APP_VERSION,
         "codeql_available": settings.is_codeql_available(),
         "docker_available": settings.is_docker_available(),
-        "routing_mode": settings.ROUTING_MODE,
-        "auto_router_model": settings.AUTO_ROUTER_MODEL or "openrouter/auto",
-        "model_mode": settings.MODEL_MODE,
+        "routing_mode": "fixed",
+        "model_mode": settings.resolve_model_mode(settings.MODEL_NAME) if settings.MODEL_NAME else settings.MODEL_MODE,
         "model_name": settings.MODEL_NAME,
         "token_tracking_enabled": settings.TOKEN_TRACKING_ENABLED,
         "discovery_mode": "open-ended",
-        "internal_static_ruleset_size": len(settings.INTERNAL_STATIC_RULESET)
+        "cwe_agnostic": True
     }
-    
-    # Add hierarchical config if applicable
-    if settings.ROUTING_MODE == "hierarchical":
-        config["hierarchical"] = {
-            "sifter_model": settings.HIERARCHICAL_SIFTER_MODEL or (settings.AUTO_ROUTER_MODEL or "openrouter/auto"),
-            "architect_model": settings.HIERARCHICAL_ARCHITECT_MODEL or (settings.AUTO_ROUTER_MODEL or "openrouter/auto"),
-            "confidence_threshold": settings.HIERARCHICAL_SIFTER_CONFIDENCE_THRESHOLD
-        }
     
     return config
 
@@ -282,18 +294,11 @@ async def scan_git(
 ):
     """Scan a Git repository"""
     model = request.model or get_configured_model()
+    ensure_model_runtime_ready(model)
     scan_id = get_scan_manager().create_scan(
         codebase_path="",  # Will be set after clone
         model_name=model,
         cwes=[]
-
-        model_name=settings.MODEL_NAME if settings.ROUTING_MODE == "fixed" else settings.AUTO_ROUTER_MODEL,
-        cwes=request.cwes,
-        openrouter_api_key=request.openrouter_api_key or None 
-   )
-        model_name=settings.MODEL_NAME if settings.ROUTING_MODE == "fixed" else settings.AUTO_ROUTER_MODEL,
-        cwes=request.cwes,
-        openrouter_api_key=request.openrouter_api_key or None
     )
     
     def run_scan():
@@ -374,6 +379,7 @@ async def scan_zip(
 ):
     """Scan a ZIP file upload"""
     model = model or get_configured_model()
+    ensure_model_runtime_ready(model)
     scan_id = get_scan_manager().create_scan(
         codebase_path="",
         model_name=model,
@@ -433,16 +439,11 @@ async def scan_paste(
 ):
     """Scan pasted code"""
     model = request.model or get_configured_model()
+    ensure_model_runtime_ready(model)
     scan_id = get_scan_manager().create_scan(
         codebase_path="",
         model_name=model,
         cwes=[]
-        model_name=settings.MODEL_NAME if settings.ROUTING_MODE == "fixed" else settings.AUTO_ROUTER_MODEL,
-        cwes=request.cwes,
-        openrouter_api_key=request.openrouter_api_key or None
-        model_name=settings.MODEL_NAME if settings.ROUTING_MODE == "fixed" else settings.AUTO_ROUTER_MODEL,
-        cwes=request.cwes,
-        openrouter_api_key=request.openrouter_api_key or None
     )
     
     def run_scan():
@@ -531,7 +532,7 @@ async def replay_scan(
             "retry_count": 0,
             "inference_time_s": 0.0,
             "cost_usd": 0.0,
-            "final_status": "pending",
+            "final_status": "",
             "alert_message": "replay",
             "source": "replay",
             "language": f.get("language", "unknown")
@@ -582,16 +583,126 @@ async def cancel_scan(
     auth: tuple = Depends(verify_api_key_or_system)
 ):
     """Cancel a running scan"""
-    success = get_scan_manager().cancel_scan(scan_id)
+    success, message = get_scan_manager().cancel_scan(scan_id)
     if not success:
-        scan_info = get_scan_manager().get_scan(scan_id)
+        raise HTTPException(status_code=404 if "not found" in message else 409, detail=message)
+    return {"scan_id": scan_id, "status": "cancelled", "message": message}
+
+
+@app.post("/api/scan/{scan_id}/stop")
+async def stop_scan(
+    scan_id: str,
+    auth: tuple = Depends(verify_api_key_or_system)
+):
+    """Force stop a running scan immediately"""
+    success, message = get_scan_manager().stop_scan(scan_id)
+    if not success:
+        raise HTTPException(status_code=404 if "not found" in message else 409, detail=message)
+    return {"scan_id": scan_id, "status": "stopped", "message": message}
+
+
+@app.delete("/api/scan/{scan_id}")
+async def delete_scan(
+    scan_id: str,
+    auth: tuple = Depends(verify_api_key_or_system)
+):
+    """Delete a scan and all its associated data"""
+    success, message = get_scan_manager().delete_scan(scan_id)
+    if not success:
+        raise HTTPException(status_code=404 if "not found" in message else 409, detail=message)
+    return {"scan_id": scan_id, "status": "deleted", "message": message}
+
+
+@app.get("/api/scans/active")
+async def get_active_scans(auth: tuple = Depends(verify_api_key_or_system)):
+    """Get list of all active/in-progress scans"""
+    active_scans = get_scan_manager().get_active_scans()
+    return {"active_scans": active_scans, "count": len(active_scans)}
+
+
+@app.post("/api/scans/cleanup")
+async def cleanup_stuck_scans(auth: tuple = Depends(verify_api_key_or_system)):
+    """Clean up stuck/interrupted scans by deleting them"""
+    scan_manager = get_scan_manager()
+    deleted = []
+    failed = []
+    
+    # Get all scans including stuck ones from active_scans
+    all_scan_ids = list(scan_manager._active_scans.keys())
+    
+    for scan_id in all_scan_ids:
+        scan_info = scan_manager._active_scans.get(scan_id)
         if not scan_info:
-            raise HTTPException(status_code=404, detail="Scan not found")
-        raise HTTPException(
-            status_code=409,
-            detail=f"Scan cannot be cancelled (current status: {scan_info.get('status', 'unknown')})"
-        )
-    return {"scan_id": scan_id, "status": "cancelled", "message": "Scan cancellation requested"}
+            continue
+        
+        status = scan_info.get("status", "unknown")
+        # Clean up stuck/interrupted scans
+        if status in {"interrupted", "stopped"}:
+            success, message = scan_manager.delete_scan(scan_id)
+            if success:
+                deleted.append(scan_id)
+            else:
+                failed.append({"scan_id": scan_id, "error": message})
+    
+    # Also check for stuck scans in results folder (scans with status like investigating, running, etc. but not in active_scans)
+    import os
+    import json
+    runs_dir = scan_manager._runs_dir
+    stuck_statuses = {"investigating", "running", "generating_pov", "validating_pov", "running_pov", "checking", "cloning", "created", "ingesting"}
+    
+    try:
+        for fname in os.listdir(runs_dir):
+            if not fname.endswith(".json") or fname == "scan_history.csv":
+                continue
+            scan_id = fname[:-5]  # Remove .json
+            if scan_id in deleted:
+                continue  # Already deleted
+            
+            try:
+                fpath = os.path.join(runs_dir, fname)
+                with open(fpath, 'r') as f:
+                    data = json.load(f)
+                
+                status = data.get("status", "")
+                if status in stuck_statuses:
+                    # Delete this stuck scan
+                    try:
+                        os.remove(fpath)
+                        deleted.append(scan_id)
+                    except Exception as e:
+                        failed.append({"scan_id": scan_id, "error": str(e)})
+            except Exception:
+                continue  # Skip files that can't be read
+    except Exception:
+        pass  # Ignore errors reading runs_dir
+    
+    return {
+        "deleted": deleted,
+        "failed": failed,
+        "count": len(deleted),
+        "message": f"Cleaned up {len(deleted)} stuck scans"
+    }
+
+
+@app.get("/api/cache/stats")
+async def get_cache_stats(auth: tuple = Depends(verify_api_key_or_system)):
+    """Get cache statistics"""
+    from app.analysis_cache import get_analysis_cache
+    cache = get_analysis_cache()
+    return cache.get_stats()
+
+
+@app.post("/api/cache/clear")
+async def clear_cache(auth: tuple = Depends(verify_api_key_or_system)):
+    """Clear all cache entries"""
+    from app.analysis_cache import get_analysis_cache
+    cache = get_analysis_cache()
+    prompts_cleared, results_cleared = cache.clear_all()
+    return {
+        "prompts_cleared": prompts_cleared,
+        "results_cleared": results_cleared,
+        "message": f"Cleared {prompts_cleared} prompt cache entries and {results_cleared} result cache entries"
+    }
 
 
 # Scan status and results
@@ -601,11 +712,34 @@ async def get_scan_status(
     auth: tuple = Depends(verify_api_key_or_system)
 ):
     """Get scan status and results"""
-    scan_info = get_scan_manager().get_scan(scan_id)
-    
+    scan_manager = get_scan_manager()
+    scan_info = scan_manager.get_scan(scan_id)
+
+    if scan_info and scan_info.get("status") in {"completed", "failed", "cancelled", "stopped"}:
+        result = scan_manager.get_scan_result(scan_id)
+        if result:
+            return ScanStatusResponse(
+                scan_id=scan_id,
+                status=result.status,
+                progress=100,
+                logs=result.logs if hasattr(result, 'logs') else [],
+                result=result.__dict__
+            )
+        fallback_result = scan_info.get("result")
+        if isinstance(fallback_result, dict):
+            return ScanStatusResponse(
+                scan_id=scan_id,
+                status=fallback_result.get("status", scan_info.get("status", "unknown")),
+                progress=100,
+                logs=fallback_result.get("logs") or scan_info.get("logs", []),
+                result=fallback_result,
+                findings=fallback_result.get("findings") or scan_info.get("findings", []),
+                error=scan_info.get("error")
+            )
+
     if not scan_info:
         # Try to load from saved results
-        result = get_scan_manager().get_scan_result(scan_id)
+        result = scan_manager.get_scan_result(scan_id)
         if result:
             return ScanStatusResponse(
                 scan_id=scan_id,
@@ -642,9 +776,14 @@ async def stream_scan_logs(
         last_log_count = 0
         
         while True:
-            scan_info = get_scan_manager().get_scan(scan_id)
+            scan_manager = get_scan_manager()
+            scan_info = scan_manager.get_scan(scan_id)
             
             if not scan_info:
+                result = scan_manager.get_scan_result(scan_id)
+                if result:
+                    yield f"data: {json.dumps({'type': 'complete', 'result': result.__dict__})}\n\n"
+                    break
                 yield f"data: {json.dumps({'type': 'error', 'message': 'Scan not found'})}\n\n"
                 break
             
@@ -841,9 +980,8 @@ async def get_metrics(auth: tuple = Depends(verify_api_key_or_system)):
 async def get_settings(auth: tuple = Depends(verify_api_key_or_system)):
     """Get current system settings (excluding sensitive values)"""
     # Determine current model mode and selected model
-    model_mode = settings.MODEL_MODE
     selected_model = settings.MODEL_NAME
-    effective_model = selected_model or ((settings.AUTO_ROUTER_MODEL or "openrouter/auto") if model_mode == "online" else "")
+    model_mode = settings.resolve_model_mode(selected_model) if selected_model else settings.MODEL_MODE
     
     return {
         # OpenRouter configuration
@@ -854,22 +992,7 @@ async def get_settings(auth: tuple = Depends(verify_api_key_or_system)):
         "model_mode": model_mode,
         "selected_model": selected_model,
         
-        # Legacy fields for backward compatibility
-        "agent_models": {
-            "investigator": effective_model,
-            "pov_generator": effective_model,
-            "verifier": effective_model,
-            "refiner": effective_model,
-            "llm_scout": effective_model,
-        },
-        
-        "hierarchical_models": {
-            "sifter": effective_model,
-            "architect": effective_model,
-        },
-        
-        "routing_mode": settings.ROUTING_MODE,
-        "auto_router_model": settings.AUTO_ROUTER_MODEL or "openrouter/auto",
+        "routing_mode": "fixed",
         "available_online_models": settings.ONLINE_MODELS,
         "available_offline_models": settings.OFFLINE_MODELS,
     }
@@ -886,28 +1009,25 @@ async def update_settings(
         settings.OPENROUTER_API_KEY_UI = request["openrouter_api_key"]
     
     # Update simplified model selection
-    if "model_mode" in request:
-        settings.MODEL_MODE = request["model_mode"]
-    
-    auto_model = settings.AUTO_ROUTER_MODEL or "openrouter/auto"
-
     if "selected_model" in request:
         selected = (request["selected_model"] or "").strip()
-        effective_model = selected or (auto_model if settings.MODEL_MODE == "online" else "")
-
+        if not selected:
+            raise HTTPException(status_code=400, detail="An explicit model selection is required")
+        try:
+            resolved_mode = settings.resolve_model_mode(selected)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        requested_mode = request.get("model_mode")
+        if requested_mode and requested_mode != resolved_mode:
+            raise HTTPException(status_code=400, detail=f"Model '{selected}' must use '{resolved_mode}' mode.")
         settings.MODEL_NAME = selected
-        settings.AGENT_INVESTIGATOR_MODEL = effective_model
-        settings.AGENT_POV_GENERATOR_MODEL = effective_model
-        settings.AGENT_VERIFIER_MODEL = effective_model
-        settings.AGENT_REFINER_MODEL = effective_model
-        settings.AGENT_LLM_SCOUT_MODEL = effective_model
-        settings.HIERARCHICAL_SIFTER_MODEL = effective_model
-        settings.HIERARCHICAL_ARCHITECT_MODEL = effective_model
-
-        if settings.MODEL_MODE == "online" and not selected:
-            settings.ROUTING_MODE = "auto"
-        else:
-            settings.ROUTING_MODE = "fixed"
+        settings.MODEL_MODE = resolved_mode
+        settings.ROUTING_MODE = "fixed"
+    elif "model_mode" in request:
+        requested_mode = request["model_mode"]
+        if requested_mode not in {"online", "offline"}:
+            raise HTTPException(status_code=400, detail="model_mode must be 'online' or 'offline'")
+        settings.MODEL_MODE = requested_mode
     
     return {"status": "updated"}
 

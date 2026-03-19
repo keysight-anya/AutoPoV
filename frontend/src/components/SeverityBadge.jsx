@@ -6,34 +6,25 @@ const SEVERITY = {
   info:     { label: 'Info',     cls: 'bg-gray-800 text-gray-400 border border-gray-700/50' }
 }
 
-const CWE_SEVERITY = {
-  'CWE-89':  'critical',  // SQL Injection
-  'CWE-94':  'critical',  // Code Injection
-  'CWE-78':  'critical',  // Command Injection
-  'CWE-119': 'critical',  // Buffer Overflow
-  'CWE-416': 'critical',  // Use After Free
-  'CWE-502': 'critical',  // Deserialization
-  'CWE-918': 'high',      // SSRF
-  'CWE-22':  'high',      // Path Traversal
-  'CWE-79':  'high',      // XSS
-  'CWE-611': 'high',      // XXE
-  'CWE-434': 'high',      // Unrestricted Upload
-  'CWE-287': 'high',      // Authentication
-  'CWE-306': 'high',      // Missing Auth
-  'CWE-798': 'high',      // Hardcoded Creds
-  'CWE-190': 'medium',    // Integer Overflow
-  'CWE-352': 'medium',    // CSRF
-  'CWE-601': 'medium',    // URL Redirection
-  'CWE-312': 'medium',    // Cleartext Storage
-  'CWE-327': 'medium',    // Broken Crypto
-  'CWE-200': 'medium',    // Info Exposure
-  'CWE-384': 'medium',    // Session Fixation
-  'CWE-400': 'low',       // Resource Exhaustion
-  'CWE-20':  'low',       // Input Validation
+// CWE-agnostic severity based on confidence and verdict
+function getSeverity(finding) {
+  const confidence = finding?.confidence || 0
+  const verdict = finding?.llm_verdict || finding?.final_status
+  
+  // If it's not a real vulnerability, mark as info
+  if (verdict === 'FALSE_POSITIVE' || verdict === 'skipped') {
+    return 'info'
+  }
+  
+  // Use confidence to determine severity (CWE-agnostic)
+  if (confidence >= 0.9) return 'critical'
+  if (confidence >= 0.8) return 'high'
+  if (confidence >= 0.7) return 'medium'
+  return 'low'
 }
 
-function SeverityBadge({ cwe }) {
-  const key = CWE_SEVERITY[cwe] || 'info'
+function SeverityBadge({ finding }) {
+  const key = getSeverity(finding)
   const { label, cls } = SEVERITY[key]
   return (
     <span className={`px-1.5 py-0.5 rounded text-xs font-medium ${cls}`}>

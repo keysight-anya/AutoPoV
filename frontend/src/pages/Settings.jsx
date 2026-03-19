@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 import { useState, useEffect } from 'react'
 import { Settings, Key, Save, Check, Trash2, RefreshCw, AlertCircle, Plus, Cpu } from 'lucide-react'
 import WebhookSetup from '../components/WebhookSetup'
@@ -126,9 +125,9 @@ function SettingsPage() {
 
   // Save settings to backend
   const saveSettings = async () => {
-    if (settings?.model_mode === 'online' && !settings?.selected_model) {
-      const confirmed = window.confirm('No online model is selected. Use OpenRouter automatic routing (openrouter/auto) for all agents?')
-      if (!confirmed) return
+    if (!settings?.selected_model) {
+      setSettingsError('Select an explicit model before saving.')
+      return
     }
 
     setSettingsLoading(true)
@@ -320,8 +319,7 @@ function SettingsPage() {
           {/* Info box */}
           <div className="bg-blue-900/20 border border-blue-800 rounded-lg p-4">
             <p className="text-blue-300 text-sm">
-              Choose one explicit online model or leave the selection empty to use OpenRouter automatic routing by default. When auto is used, the same default route applies across all agents.
-              Changes take effect on the next scan.
+              Select one explicit model for the current mode. The saved selection is used across all agents on the next scan.
             </p>
           </div>
 
@@ -349,7 +347,7 @@ function SettingsPage() {
                 </div>
                 <div className="flex space-x-4">
                   <button
-                    onClick={() => setSettings(prev => ({ ...prev, model_mode: 'online' }))}
+                    onClick={() => setSettings(prev => ({ ...prev, model_mode: 'online', selected_model: (prev?.available_online_models || []).includes(prev?.selected_model) ? prev.selected_model : '' }))}
                     className={`flex-1 py-3 px-4 rounded-lg border transition-colors ${
                       settings.model_mode === 'online'
                         ? 'bg-primary-600 border-primary-500 text-white'
@@ -360,7 +358,7 @@ function SettingsPage() {
                     <div className="text-xs opacity-75">Use cloud-based models via OpenRouter</div>
                   </button>
                   <button
-                    onClick={() => setSettings(prev => ({ ...prev, model_mode: 'offline' }))}
+                    onClick={() => setSettings(prev => ({ ...prev, model_mode: 'offline', selected_model: (prev?.available_offline_models || []).includes(prev?.selected_model) ? prev.selected_model : '' }))}
                     className={`flex-1 py-3 px-4 rounded-lg border transition-colors ${
                       settings.model_mode === 'offline'
                         ? 'bg-primary-600 border-primary-500 text-white'
@@ -375,8 +373,28 @@ function SettingsPage() {
 
               {/* Online Model Selection */}
               {settings.model_mode === 'online' && (
-                <div className="bg-gray-900 rounded-lg border border-gray-800 p-6">
-                  <div className="flex items-center justify-between mb-4 gap-3">
+                <div className="space-y-6">
+                  {!settings.openrouter_key_from_env && (
+                    <div className="bg-gray-900 rounded-lg border border-gray-800 p-6">
+                      <div className="flex items-center space-x-2 mb-4">
+                        <Key className="w-5 h-5 text-primary-500" />
+                        <h2 className="text-lg font-medium">OpenRouter API Key</h2>
+                      </div>
+                      <p className="text-sm text-gray-400 mb-4">
+                        Required for online scans when no server environment key is configured.
+                      </p>
+                      <input
+                        type="password"
+                        value={openRouterKey}
+                        onChange={e => setOpenRouterKey(e.target.value)}
+                        placeholder="sk-or-v1-..."
+                        className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-gray-100 focus:outline-none focus:border-primary-500"
+                      />
+                    </div>
+                  )}
+
+                  <div className="bg-gray-900 rounded-lg border border-gray-800 p-6">
+                    <div className="flex items-center justify-between mb-4 gap-3">
                     <div className="flex items-center space-x-2">
                       <Cpu className="w-5 h-5 text-primary-500" />
                       <h2 className="text-lg font-medium">Select Online Model</h2>
@@ -415,11 +433,7 @@ function SettingsPage() {
                     })}
                   </div>
 
-                  {!settings.selected_model && (
-                    <div className="mt-4 rounded-lg border border-primary-500/30 bg-primary-500/10 p-4 text-sm text-primary-200">
-                      No explicit online model selected. Saving now will use {settings.auto_router_model || 'openrouter/auto'} for all agents after confirmation.
-                    </div>
-                  )}
+                  </div>
                 </div>
               )}
 
@@ -463,14 +477,14 @@ function SettingsPage() {
               {/* Current Selection Display */}
               <div className="bg-green-900/20 border border-green-800 rounded-lg p-4">
                 <p className="text-green-300 text-sm">
-                  <strong>Current Selection:</strong> {settings.selected_model || `${settings.auto_router_model || 'openrouter/auto'} (automatic default)`}
+                  <strong>Current Selection:</strong> {settings.selected_model || 'No model selected'}
                 </p>
               </div>
 
               {/* Save Button */}
               <button
                 onClick={saveSettings}
-                disabled={settingsLoading || (settings.model_mode === 'offline' && !settings.selected_model)}
+                disabled={settingsLoading || !settings.selected_model}
                 className="flex items-center space-x-2 bg-primary-600 hover:bg-primary-700 disabled:bg-gray-700 px-6 py-3 rounded-lg transition-colors"
               >
                 {settingsLoading ? (
@@ -488,203 +502,8 @@ function SettingsPage() {
           )}
         </div>
       )}
-=======
-// frontend/src/pages/Settings.jsx
-import { useState, useEffect, useRef } from 'react'
-import WebhookSetup from '../components/WebhookSetup'
-
-function Panel({ title, children }) {
-  return (
-    <div style={{
-      background: 'var(--surface1)',
-      border: '1px solid var(--border1)',
-      borderLeft: '3px solid var(--accent)',
-      padding: '20px 24px',
-      marginBottom: 16,
-    }}>
-      <div style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: 9, letterSpacing: '.16em', color: 'var(--text3)', marginBottom: 16 }}>
-        {title}
-      </div>
-      {children}
->>>>>>> origin/sandbox/ui-overhaul
     </div>
   )
 }
 
-<<<<<<< HEAD
 export default SettingsPage
-=======
-function KeyField({ label, value, onChange, placeholder, show, onToggleShow, onSave, saved }) {
-  const monoStyle = { fontFamily: '"JetBrains Mono", monospace' }
-  const inputStyle = {
-    width: '100%',
-    background: 'var(--surface2)',
-    border: '1px solid var(--border2)',
-    padding: '10px 14px',
-    color: 'var(--text1)',
-    fontFamily: '"JetBrains Mono", monospace',
-    fontSize: 12,
-    outline: 'none',
-    marginBottom: 12,
-    boxSizing: 'border-box',
-  }
-  const btnStyle = (primary) => ({
-    padding: '8px 20px',
-    background: primary ? 'var(--accent)' : 'none',
-    border: `1px solid ${primary ? 'var(--accent)' : 'var(--border2)'}`,
-    color: primary ? '#fff' : 'var(--text3)',
-    fontFamily: '"JetBrains Mono", monospace',
-    fontSize: 10, letterSpacing: '.1em',
-    cursor: 'pointer',
-  })
-  return (
-    <>
-      <div style={{ position: 'relative', marginBottom: 4 }}>
-        <input
-          type={show ? 'text' : 'password'}
-          value={value}
-          onChange={e => onChange(e.target.value)}
-          placeholder={placeholder}
-          style={inputStyle}
-        />
-        <button
-          type="button"
-          onClick={onToggleShow}
-          style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-62%)', background: 'none', border: 'none', color: 'var(--text3)', cursor: 'pointer', ...monoStyle, fontSize: 9, letterSpacing: '.1em' }}
-        >
-          {show ? 'HIDE' : 'SHOW'}
-        </button>
-      </div>
-      <button type="button" onClick={onSave} style={btnStyle(true)}>
-        {saved ? '✓ SAVED' : 'SAVE KEY'}
-      </button>
-    </>
-  )
-}
-
-export default function Settings() {
-  const [apiKey,        setApiKey]        = useState('')
-  const [orKey,         setOrKey]         = useState('')
-  const [savedApiKey,   setSavedApiKey]   = useState(false)
-  const [savedOrKey,    setSavedOrKey]    = useState(false)
-  const [showApiKey,    setShowApiKey]    = useState(false)
-  const [showOrKey,     setShowOrKey]     = useState(false)
-  const [tab,           setTab]           = useState('api')
-  const apiKeyTimerRef = useRef(null)
-  const orKeyTimerRef  = useRef(null)
-
-  useEffect(() => {
-    setApiKey(localStorage.getItem('autopov_api_key') || '')
-    setOrKey(localStorage.getItem('openrouter_api_key') || '')
-  }, [])
-
-  useEffect(() => () => {
-    clearTimeout(apiKeyTimerRef.current)
-    clearTimeout(orKeyTimerRef.current)
-  }, [])
-
-  const saveKey = (storageKey, value, setSaved, timerRef) => {
-    if (value.trim()) {
-      localStorage.setItem(storageKey, value.trim())
-    } else {
-      localStorage.removeItem(storageKey)
-    }
-    setSaved(true)
-    clearTimeout(timerRef.current)
-    timerRef.current = setTimeout(() => setSaved(false), 2000)
-  }
-
-  const monoStyle = { fontFamily: '"JetBrains Mono", monospace' }
-
-  return (
-    <div style={{ padding: 24, maxWidth: 640 }}>
-      <div style={{ ...monoStyle, fontSize: 9, letterSpacing: '.18em', color: 'var(--text3)', marginBottom: 20 }}>
-        [ SETTINGS ]
-      </div>
-
-      <div className="tabs-row" style={{ marginBottom: 24 }}>
-        <div className="tabs-group">
-          {[
-            { id: 'api',      label: 'API KEY'    },
-            { id: 'llm',      label: 'LLM'        },
-            { id: 'webhooks', label: 'WEBHOOKS'   },
-          ].map(t => (
-            <button key={t.id} type="button" className={`glass-tab${tab === t.id ? ' active' : ''}`} onClick={() => setTab(t.id)}>
-              {t.label}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {tab === 'api' && (
-        <>
-          <Panel title="API KEY CONFIGURATION">
-            <p style={{ fontSize: 12, color: 'var(--text2)', marginBottom: 14, lineHeight: 1.6 }}>
-              Enter your AutoPoV backend API key. Generate one via:
-            </p>
-            <div style={{ background: 'var(--bg)', border: '1px solid var(--border1)', padding: '8px 12px', marginBottom: 16 }}>
-              <code style={{ ...monoStyle, fontSize: 11, color: '#86efac' }}>autopov keys generate</code>
-            </div>
-            <KeyField
-              value={apiKey}
-              onChange={setApiKey}
-              placeholder="apov_..."
-              show={showApiKey}
-              onToggleShow={() => setShowApiKey(s => !s)}
-              onSave={() => saveKey('autopov_api_key', apiKey, setSavedApiKey, apiKeyTimerRef)}
-              saved={savedApiKey}
-            />
-          </Panel>
-
-          <Panel title="ENVIRONMENT VARIABLE">
-            <div style={{ background: 'var(--bg)', border: '1px solid var(--border1)', padding: '8px 12px' }}>
-              <code style={{ ...monoStyle, fontSize: 11, color: '#86efac' }}>
-                export AUTOPOV_API_KEY=your_key_here
-              </code>
-            </div>
-          </Panel>
-        </>
-      )}
-
-      {tab === 'llm' && (
-        <>
-          <Panel title="OPENROUTER API KEY">
-            <p style={{ fontSize: 12, color: 'var(--text2)', marginBottom: 14, lineHeight: 1.6 }}>
-              Enter your OpenRouter API key to power vulnerability analysis.
-              This key is sent with each scan request and takes precedence over the
-              server-side environment variable.
-            </p>
-            <div style={{ background: 'var(--bg)', border: '1px solid var(--border1)', padding: '8px 12px', marginBottom: 16 }}>
-              <code style={{ ...monoStyle, fontSize: 11, color: 'var(--text3)' }}>
-                Get a key at{' '}
-                <a href="https://openrouter.ai/keys" target="_blank" rel="noreferrer" style={{ color: 'var(--accent)' }}>
-                  openrouter.ai/keys
-                </a>
-              </code>
-            </div>
-            <KeyField
-              value={orKey}
-              onChange={setOrKey}
-              placeholder="sk-or-v1-..."
-              show={showOrKey}
-              onToggleShow={() => setShowOrKey(s => !s)}
-              onSave={() => saveKey('openrouter_api_key', orKey, setSavedOrKey, orKeyTimerRef)}
-              saved={savedOrKey}
-            />
-          </Panel>
-
-          <Panel title="FALLBACK BEHAVIOUR">
-            <p style={{ fontSize: 12, color: 'var(--text2)', lineHeight: 1.6 }}>
-              If no key is saved here, the server falls back to the
-              <code style={{ ...monoStyle, fontSize: 11, color: '#86efac', margin: '0 4px' }}>OPENROUTER_API_KEY</code>
-              environment variable configured on the backend.
-            </p>
-          </Panel>
-        </>
-      )}
-
-      {tab === 'webhooks' && <WebhookSetup />}
-    </div>
-  )
-}
->>>>>>> origin/sandbox/ui-overhaul

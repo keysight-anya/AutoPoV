@@ -1,52 +1,73 @@
 rules:
-  - id: php-sqli-simple
-    languages: [php]
-    message: Possible SQL injection (user input used in SQL query).
+  - id: js-command-exec-signal
+    languages: [javascript, typescript]
+    message: Security signal: process execution sink. Review whether attacker-controlled data can reach this call.
     severity: ERROR
-    metadata:
-      cwe: [CWE-89]
     pattern-either:
-      - pattern: mysqli_query(, [])
-      - pattern: mysqli_query(, [])
-      - pattern: ->query([])
-      - pattern: ->query([])
+      - pattern: require("child_process").exec(...)
+      - pattern: require("child_process").execSync(...)
+      - pattern: require("child_process").spawn(...)
+      - pattern: require("child_process").spawnSync(...)
 
-  - id: php-xss-echo
-    languages: [php]
-    message: Possible XSS (unescaped user input echoed).
-    severity: WARNING
-    metadata:
-      cwe: [CWE-79]
-    pattern-either:
-      - pattern: echo [];
-      - pattern: echo [];
-      - pattern: print [];
-      - pattern: print [];
-
-  - id: php-command-injection
-    languages: [php]
-    message: Possible command injection (user input passed to exec).
+  - id: js-dynamic-exec-signal
+    languages: [javascript, typescript]
+    message: Security signal: dynamic code execution sink. Review whether untrusted content can reach this call.
     severity: ERROR
-    metadata:
-      cwe: [CWE-78]
     pattern-either:
-      - pattern: system([]);
-      - pattern: system([]);
-      - pattern: exec([]);
-      - pattern: exec([]);
-      - pattern: shell_exec([]);
-      - pattern: shell_exec([]);
+      - pattern: eval(...)
+      - pattern: Function(...)
 
-  - id: php-path-traversal
-    languages: [php]
-    message: Possible path traversal (user input used in file include/read).
+  - id: js-dom-html-sink
+    languages: [javascript, typescript]
+    message: Security signal: HTML injection sink. Review whether untrusted content can reach this DOM write.
     severity: WARNING
-    metadata:
-      cwe: [CWE-22]
     pattern-either:
-      - pattern: include([]);
-      - pattern: include([]);
-      - pattern: require([]);
-      - pattern: require([]);
-      - pattern: file_get_contents([]);
-      - pattern: file_get_contents([]);
+      - pattern: $EL.innerHTML = $X
+      - pattern: document.write($X)
+      - pattern: $EL.outerHTML = $X
+
+  - id: python-command-exec-signal
+    languages: [python]
+    message: Security signal: process execution sink. Review whether attacker-controlled data can reach this call.
+    severity: ERROR
+    pattern-either:
+      - pattern: os.system(...)
+      - pattern: subprocess.run(..., shell=True, ...)
+      - pattern: subprocess.Popen(..., shell=True, ...)
+      - pattern: subprocess.call(..., shell=True, ...)
+
+  - id: python-dynamic-exec-signal
+    languages: [python]
+    message: Security signal: dynamic code execution sink. Review whether untrusted content can reach this call.
+    severity: ERROR
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: exec(...)
+
+  - id: python-unsafe-deser-signal
+    languages: [python]
+    message: Security signal: unsafe deserialization API. Review whether attacker-controlled data reaches this sink.
+    severity: ERROR
+    pattern-either:
+      - pattern: pickle.loads(...)
+      - pattern: yaml.load(...)
+      - pattern: marshal.loads(...)
+
+  - id: c-unsafe-buffer-copy
+    languages: [c, cpp]
+    message: Security signal: unsafe buffer copy or formatting primitive. Review bounds and caller control over sizes.
+    severity: ERROR
+    pattern-either:
+      - pattern: strcpy(...)
+      - pattern: strcat(...)
+      - pattern: sprintf(...)
+      - pattern: gets(...)
+
+  - id: c-format-string-signal
+    languages: [c, cpp]
+    message: Security signal: possible attacker-controlled format string sink.
+    severity: WARNING
+    pattern-either:
+      - pattern: printf($X)
+      - pattern: fprintf($STREAM, $X)
+      - pattern: syslog($X)

@@ -5,6 +5,7 @@ Pydantic Settings for all environment variables and configuration
 
 import os
 import subprocess
+from urllib.parse import urlparse
 from typing import Optional, List
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field, field_validator
@@ -29,41 +30,34 @@ class Settings(BaseSettings):
     # LLM Configuration - Online (OpenRouter)
     OPENROUTER_API_KEY: str = Field(default="", env="OPENROUTER_API_KEY")
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+    OPENROUTER_ENABLE_REASONING: bool = Field(default=True, env="OPENROUTER_ENABLE_REASONING")
     
     # UI-configured OpenRouter key (stored in learning.db, overrides env if set)
     OPENROUTER_API_KEY_UI: str = ""
     
     # LLM Configuration - Offline (Ollama)
     OLLAMA_BASE_URL: str = Field(default="http://localhost:11434", env="OLLAMA_BASE_URL")
+    OLLAMA_CONNECT_TIMEOUT_S: int = Field(default=10, env="OLLAMA_CONNECT_TIMEOUT_S")
+    OLLAMA_READ_TIMEOUT_S: int = Field(default=180, env="OLLAMA_READ_TIMEOUT_S")
+    LLM_REQUEST_TIMEOUT_S: int = Field(default=180, env="LLM_REQUEST_TIMEOUT_S")
+    OLLAMA_NUM_CTX: int = Field(default=1536, env="OLLAMA_NUM_CTX")
+    OLLAMA_NUM_PREDICT: int = Field(default=384, env="OLLAMA_NUM_PREDICT")
     
     # Model Selection - NO DEFAULTS: Must be configured in Settings
     MODEL_MODE: str = Field(default="online", env="MODEL_MODE")  # 'online' or 'offline'
     MODEL_NAME: str = Field(default="", env="MODEL_NAME")  # Must be set in Settings
 
-    # Routing / Policy
-    ROUTING_MODE: str = Field(default="hierarchical", env="ROUTING_MODE")  # auto|fixed|learning|hierarchical
-    AUTO_ROUTER_MODEL: str = Field(default="", env="AUTO_ROUTER_MODEL")  # Must be set in Settings
+    # Fixed model execution
+    ROUTING_MODE: str = Field(default="fixed", env="ROUTING_MODE")
     LEARNING_DB_PATH: str = Field(default="./data/learning.db", env="LEARNING_DB_PATH")
-    
-    # Hierarchical LLM Configuration - NO DEFAULTS: Must be configured in Settings
-    HIERARCHICAL_SIFTER_MODEL: str = Field(default="", env="HIERARCHICAL_SIFTER_MODEL")  # Must be set in Settings
-    HIERARCHICAL_SIFTER_CONFIDENCE_THRESHOLD: float = Field(default=0.8, env="HIERARCHICAL_SIFTER_CONFIDENCE_THRESHOLD")
-    HIERARCHICAL_ARCHITECT_MODEL: str = Field(default="", env="HIERARCHICAL_ARCHITECT_MODEL")  # Must be set in Settings
-    
-    # Per-Agent Model Configuration - NO DEFAULTS: Must be configured in Settings
-    AGENT_INVESTIGATOR_MODEL: str = Field(default="", env="AGENT_INVESTIGATOR_MODEL")  # Must be set in Settings
-    AGENT_POV_GENERATOR_MODEL: str = Field(default="", env="AGENT_POV_GENERATOR_MODEL")  # Must be set in Settings
-    AGENT_VERIFIER_MODEL: str = Field(default="", env="AGENT_VERIFIER_MODEL")  # Must be set in Settings
-    AGENT_REFINER_MODEL: str = Field(default="", env="AGENT_REFINER_MODEL")  # Must be set in Settings
-    AGENT_LLM_SCOUT_MODEL: str = Field(default="", env="AGENT_LLM_SCOUT_MODEL")  # Must be set in Settings
 
     # Scout Settings
     SCOUT_ENABLED: bool = Field(default=True, env="SCOUT_ENABLED")
-    SCOUT_LLM_ENABLED: bool = Field(default=False, env="SCOUT_LLM_ENABLED")
-    SCOUT_MAX_FILES: int = Field(default=25, env="SCOUT_MAX_FILES")
+    SCOUT_LLM_ENABLED: bool = Field(default=False, env="SCOUT_LLM_ENABLED")  # Disabled - redundant with Investigator
+    SCOUT_MAX_FILES: int = Field(default=100, env="SCOUT_MAX_FILES")  # Increased from 25 to process more candidates
     SCOUT_MAX_CHARS_PER_FILE: int = Field(default=4000, env="SCOUT_MAX_CHARS_PER_FILE")
     SCOUT_MAX_FINDINGS: int = Field(default=200, env="SCOUT_MAX_FINDINGS")
-    SCOUT_MAX_COST_USD: float = Field(default=0.10, env="SCOUT_MAX_COST_USD")
+    SCOUT_MAX_COST_USD: float = Field(default=0.0, env="SCOUT_MAX_COST_USD")
     
     # Available Models - Only these models are supported
     ONLINE_MODELS: List[str] = [
@@ -93,7 +87,7 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL_ONLINE: str = "openai/text-embedding-3-small"  # Must be prefixed for OpenRouter
     EMBEDDING_MODEL_OFFLINE: str = "sentence-transformers/all-MiniLM-L6-v2"
     PREFER_LOCAL_EMBEDDINGS: bool = Field(default=True, env="PREFER_LOCAL_EMBEDDINGS")
-    LOCAL_EMBEDDING_BACKEND: str = Field(default="hash", env="LOCAL_EMBEDDING_BACKEND")
+    LOCAL_EMBEDDING_BACKEND: str = Field(default="sentence-transformers", env="LOCAL_EMBEDDING_BACKEND")
     
     # LangSmith Tracing
     LANGCHAIN_TRACING_V2: bool = Field(default=False, env="LANGCHAIN_TRACING_V2")
@@ -109,13 +103,13 @@ class Settings(BaseSettings):
     # Docker Configuration
     DOCKER_ENABLED: bool = Field(default=True, env="DOCKER_ENABLED")
     DOCKER_IMAGE: str = "python:3.12-slim"
-    DOCKER_TIMEOUT: int = 60
-    DOCKER_MEMORY_LIMIT: str = "512m"
-    DOCKER_CPU_LIMIT: float = 1.0
+    DOCKER_TIMEOUT: int = 180
+    DOCKER_MEMORY_LIMIT: str = "2g"
+    DOCKER_CPU_LIMIT: float = 2.0
     
     # Cost Control
     MAX_COST_USD: float = Field(default=100.0, env="MAX_COST_USD")
-    COST_TRACKING_ENABLED: bool = Field(default=True, env="COST_TRACKING_ENABLED")
+    COST_TRACKING_ENABLED: bool = Field(default=False, env="COST_TRACKING_ENABLED")
     
     # Token Tracking (per model)
     TOKEN_TRACKING_ENABLED: bool = Field(default=True, env="TOKEN_TRACKING_ENABLED")
@@ -124,50 +118,31 @@ class Settings(BaseSettings):
     MAX_CHUNK_SIZE: int = 4000
     CHUNK_OVERLAP: int = 200
     MAX_RETRIES: int = 3  # Increased for self-healing refiner
-    DISCOVERY_MAX_FINDINGS: int = Field(default=75, env="DISCOVERY_MAX_FINDINGS")
-    PROOF_MAX_FINDINGS: int = Field(default=12, env="PROOF_MAX_FINDINGS")
-    CODEQL_TIMEOUT_S: int = Field(default=90, env="CODEQL_TIMEOUT_S")
+    DISCOVERY_MAX_FINDINGS: int = Field(default=150, env="DISCOVERY_MAX_FINDINGS")
+    PROOF_MAX_FINDINGS: int = Field(default=1000, env="PROOF_MAX_FINDINGS")  # Increased from 25 to allow all confirmed findings to get PoVs
+    CODEQL_TIMEOUT_S: int = Field(default=180, env="CODEQL_TIMEOUT_S")
     CODEQL_QUERY_TIMEOUT_S: int = Field(default=90, env="CODEQL_QUERY_TIMEOUT_S")
-    SEMGREP_TIMEOUT_S: int = Field(default=180, env="SEMGREP_TIMEOUT_S")
+    SEMGREP_TIMEOUT_S: int = Field(default=300, env="SEMGREP_TIMEOUT_S")
     
     # Parallel Processing Configuration
-    PARALLEL_PROCESSING_ENABLED: bool = Field(default=False, env="PARALLEL_PROCESSING_ENABLED")
+    PARALLEL_PROCESSING_ENABLED: bool = Field(default=True, env="PARALLEL_PROCESSING_ENABLED")
     PARALLEL_MAX_WORKERS: int = Field(default=5, env="PARALLEL_MAX_WORKERS")
     PARALLEL_RATE_LIMIT_RPS: int = Field(default=10, env="PARALLEL_RATE_LIMIT_RPS")  # Requests per second
     
-    # Internal static analysis ruleset used for broad discovery coverage.
-    # This is not a user-input contract; it is the fallback coverage set for
-    # CodeQL, Semgrep, and heuristic scouts when scans run in open discovery mode.
-    INTERNAL_STATIC_RULESET: List[str] = [
-        # OWASP Top 10 2021
-        "CWE-89",   # A01:2021 - Broken Access Control (SQL Injection)
-        "CWE-79",   # A03:2021 - Injection (XSS)
-        "CWE-20",   # A04:2021 - Insecure Design (Input Validation)
-        "CWE-200",  # A05:2021 - Security Misconfiguration (Info Disclosure)
-        "CWE-22",   # A01:2021 - Broken Access Control (Path Traversal)
-        "CWE-352",  # A01:2021 - Broken Access Control (CSRF)
-        "CWE-502",  # A08:2021 - Software and Data Integrity Failures (Deserialization)
-        "CWE-287",  # A07:2021 - Identification and Authentication Failures
-        "CWE-798",  # A07:2021 - Identification and Authentication Failures (Hardcoded Creds)
-        "CWE-306",  # A07:2021 - Identification and Authentication Failures (Missing Auth)
-        
-        # Additional High-Impact Web Vulnerabilities
-        "CWE-94",   # Code Injection
-        "CWE-78",   # OS Command Injection
-        "CWE-601",  # Open Redirect
-        "CWE-312",  # Cleartext Storage of Sensitive Information
-        "CWE-327",  # Use of Broken or Risky Cryptographic Algorithm
-        "CWE-918",  # Server-Side Request Forgery (SSRF)
-        "CWE-434",  # Unrestricted Upload of File with Dangerous Type
-        "CWE-611",  # XML External Entity (XXE)
-        "CWE-400",  # Uncontrolled Resource Consumption (DoS)
-        "CWE-384",  # Session Fixation
-    ]
-
-    @property
-    def SUPPORTED_CWES(self) -> List[str]:
-        """Backward-compatible alias for older code paths."""
-        return self.INTERNAL_STATIC_RULESET
+    # Cost & Speed Optimization
+    LITE_MODE: bool = Field(default=False, env="LITE_MODE")  # Quick scan without PoV execution
+    EARLY_STOP_AFTER_CONFIRMED: int = Field(default=10, env="EARLY_STOP_AFTER_CONFIRMED")  # Stop after N confirmed findings
+    SKIP_CHROMADB: bool = Field(default=True, env="SKIP_CHROMADB")  # Legacy flag; ignored when RAG_REQUIRED is enabled
+    RAG_REQUIRED: bool = Field(default=True, env="RAG_REQUIRED")
+    REQUIRE_RUNTIME_PROOF: bool = Field(default=True, env="REQUIRE_RUNTIME_PROOF")
+    MIN_CONFIDENCE_FOR_POV: float = Field(default=0.65, env="MIN_CONFIDENCE_FOR_POV")  # Lower threshold for more PoV generation
+    BATCH_SIMILAR_FINDINGS: bool = Field(default=True, env="BATCH_SIMILAR_FINDINGS")  # Group similar findings for analysis
+    
+    # Note: INTERNAL_SECURITY_RULESET has been removed for CWE-agnostic scanning.
+    # CodeQL and Semgrep now run their full security suites without CWE filtering.
+    # The exploratory agent and LLM scout perform open-ended vulnerability discovery.
+    # Findings are still classified with CWE labels when appropriate, but no CWE
+    # is required for detection or validation.
 
     # File Paths
     DATA_DIR: str = "./data"
@@ -179,7 +154,7 @@ class Settings(BaseSettings):
     SNAPSHOT_DIR: str = Field(default="./results/snapshots", env="SNAPSHOT_DIR")
     
     # Snapshot Configuration
-    SAVE_CODEBASE_SNAPSHOT: bool = Field(default=False, env="SAVE_CODEBASE_SNAPSHOT")
+    SAVE_CODEBASE_SNAPSHOT: bool = Field(default=True, env="SAVE_CODEBASE_SNAPSHOT")
     
     # Frontend
     FRONTEND_URL: str = Field(default="http://localhost:5173", env="FRONTEND_URL")
@@ -196,6 +171,33 @@ class Settings(BaseSettings):
             raise ValueError("MODEL_MODE must be 'online' or 'offline'")
         return v
     
+    def get_frontend_origin(self) -> str:
+        raw = (self.FRONTEND_URL or '').rstrip('/')
+        parsed = urlparse(raw)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}"
+        return raw
+
+    def get_allowed_frontend_origins(self) -> List[str]:
+        origin = self.get_frontend_origin()
+        if not origin:
+            return []
+
+        parsed = urlparse(origin)
+        hostname = parsed.hostname or ''
+        port = f":{parsed.port}" if parsed.port else ''
+        scheme = parsed.scheme or 'http'
+
+        origins = {origin}
+        if hostname in {'localhost', '127.0.0.1', '0.0.0.0'}:
+            origins.update({
+                f'{scheme}://localhost{port}',
+                f'{scheme}://127.0.0.1{port}',
+                f'{scheme}://0.0.0.0{port}',
+            })
+
+        return sorted(origins)
+
     def is_docker_available(self) -> bool:
         """Check if Docker is available and running"""
         if not self.DOCKER_ENABLED:
@@ -246,6 +248,14 @@ class Settings(BaseSettings):
         except (subprocess.TimeoutExpired, FileNotFoundError):
             return False
     
+    def get_effective_ollama_base_url(self) -> str:
+        """Use the Docker service URL automatically when running inside Docker."""
+        if self.OLLAMA_BASE_URL and 'localhost:11434' not in self.OLLAMA_BASE_URL:
+            return self.OLLAMA_BASE_URL
+        if os.path.exists('/.dockerenv'):
+            return 'http://ollama:11434'
+        return self.OLLAMA_BASE_URL
+
     def is_kaitai_available(self) -> bool:
         """Check if Kaitai Struct compiler is available"""
         try:
@@ -258,27 +268,53 @@ class Settings(BaseSettings):
         except (subprocess.TimeoutExpired, FileNotFoundError):
             return False
     
-    def get_llm_config(self) -> dict:
-        """Get LLM configuration based on MODEL_MODE"""
-        if self.MODEL_MODE == "online":
-            # Use OpenRouter for all online models
+    def is_online_model(self, model_name: str) -> bool:
+        return bool(model_name) and model_name in self.ONLINE_MODELS
+
+    def is_offline_model(self, model_name: str) -> bool:
+        return bool(model_name) and model_name in self.OFFLINE_MODELS
+
+    def resolve_model_mode(self, model_name: str) -> str:
+        selected_model = (model_name or "").strip()
+        if not selected_model:
+            raise ValueError("No model selected. Choose one in Settings or pass an explicit CLI override.")
+        if self.is_online_model(selected_model):
+            return "online"
+        if self.is_offline_model(selected_model):
+            return "offline"
+        raise ValueError(
+            f"Unsupported model '{selected_model}'. Choose one of the configured online or offline models."
+        )
+
+    def get_llm_config(self, model_name: Optional[str] = None, model_mode: Optional[str] = None) -> dict:
+        """Get LLM configuration for an explicitly selected model."""
+        selected_model = (model_name or self.MODEL_NAME or "").strip()
+        resolved_mode = model_mode or self.resolve_model_mode(selected_model)
+
+        if resolved_mode == "online":
+            if not self.is_online_model(selected_model):
+                raise ValueError(f"Model '{selected_model}' is not configured as an online model.")
             return {
                 "mode": "online",
-                "model": self.MODEL_NAME or self.AUTO_ROUTER_MODEL or "openrouter/auto",
+                "model": selected_model,
                 "api_key": self.get_openrouter_api_key(),
                 "base_url": self.OPENROUTER_BASE_URL,
                 "embedding_model": self.EMBEDDING_MODEL_ONLINE,
-                "provider": "openrouter"
+                "provider": "openrouter",
+                "reasoning_enabled": self.OPENROUTER_ENABLE_REASONING,
             }
-        else:
-            return {
-                "mode": "offline",
-                "model": self.MODEL_NAME,
-                "base_url": self.OLLAMA_BASE_URL,
-                "embedding_model": self.EMBEDDING_MODEL_OFFLINE,
-                "provider": "ollama"
-            }
-    
+
+        if not self.is_offline_model(selected_model):
+            raise ValueError(f"Model '{selected_model}' is not configured as an offline model.")
+        return {
+            "mode": "offline",
+            "model": selected_model,
+            "base_url": self.get_effective_ollama_base_url(),
+            "embedding_model": self.EMBEDDING_MODEL_OFFLINE,
+            "provider": "ollama",
+            "reasoning_enabled": False,
+        }
+
     def ensure_directories(self):
         """Ensure all required directories exist"""
         dirs = [
@@ -300,5 +336,6 @@ settings = Settings()
 
 # Ensure directories on module load
 settings.ensure_directories()
+
 
 
