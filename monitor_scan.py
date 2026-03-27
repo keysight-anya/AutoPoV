@@ -7,9 +7,10 @@ import time
 import json
 sys.path.insert(0, '/home/user/AutoPoV/autopov')
 
+import os
 import requests
 
-API_KEY = "apov_yOBQlf4t_RXfIIDaTKQ51MgPbGbBx_aCJbCs6cORNXw"
+API_KEY = os.environ.get("AUTOPOV_API_KEY", "")
 BASE_URL = "http://localhost:8000/api"
 
 def get_scan_status(scan_id):
