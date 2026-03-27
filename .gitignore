@@ -1,39 +1,70 @@
-# Secrets and local environments
+# Secrets and local environment
 .env
+frontend/.env
 venv/
-node_modules/
+env/
+ENV/
 
-# Python build/runtime artifacts
+# Python build and cache
 __pycache__/
 **/__pycache__/
-*.pyc
+*.py[cod]
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
-# Frontend build artifacts
+# Frontend build and deps
+node_modules/
+frontend/node_modules/
 frontend/dist/
 
-# Runtime outputs and generated reports
-results/
-*_report.json
-*_report.pdf
-.cache_bust
-
-# Local runtime state
-.docker
-data/chroma/
-data/api_keys.json
-data/*.db
-# AutoPoV Temporary Data
-data/chroma/
-results/runs/
+# Runtime outputs
+results/*
+!results/.gitkeep
+!results/runs/
+results/runs/*
+!results/runs/.gitkeep
+!results/povs/
+results/povs/*
+!results/povs/.gitkeep
+!results/proof_artifacts/
+results/proof_artifacts/*
+!results/proof_artifacts/.gitkeep
 results/snapshots/
-results/povs/
+
+# Data and local state
+data/api_keys.json
+data/cache/*.json
+data/chroma/
+data/*.db
+data/*.sqlite3
 *.db
 *.sqlite3
+.docker/
+.cache_bust
 
-# Docker & Environment
-.env
-__pycache__/
-*.py[cod]
+# Generated reports and exported docs
+*_report.json
+*_report.pdf
+DOCS_APPLICATION_FLOW.pdf
+DOCS_APPLICATION_FLOW.docx
+package-lock.json
+
+# Local tooling output
+.qoder/
+.playwright-mcp/
+.superpowers/
+.claude/
+_demo_smoke/
+
+# OS and editor files
 .DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*.tmp
+*.log

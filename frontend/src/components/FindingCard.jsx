@@ -1,5 +1,6 @@
 // frontend/src/components/FindingCard.jsx
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { getFindingArtifacts, getFindingArtifactFile } from '../api/client'
 
 const SEVERITY_COLORS = {
   critical: '#ef4444',
@@ -101,8 +102,15 @@ function buildProofNarrative(finding, povResult) {
   }
 }
 
-export default function FindingCard({ finding, forceExpanded = false }) {
+export default function FindingCard({ finding, forceExpanded = false, scanId = '', findingIndex = null }) {
   const [expanded, setExpanded] = useState(false)
+  const [artifactFiles, setArtifactFiles] = useState([])
+  const [artifactDir, setArtifactDir] = useState('')
+  const [artifactLoading, setArtifactLoading] = useState(false)
+  const [artifactError, setArtifactError] = useState('')
+  const [selectedArtifact, setSelectedArtifact] = useState(null)
+  const [selectedArtifactContent, setSelectedArtifactContent] = useState('')
+  const [artifactContentLoading, setArtifactContentLoading] = useState(false)
   const isExpanded = forceExpanded || expanded
 
   const severity = getSeverity(finding)
@@ -114,6 +122,50 @@ export default function FindingCard({ finding, forceExpanded = false }) {
 
   const taxonomyRefs = Array.isArray(finding.taxonomy_refs) ? finding.taxonomy_refs.filter(Boolean) : []
   const proofNarrative = buildProofNarrative(finding, povResult)
+
+  useEffect(() => {
+    let cancelled = false
+    if (!isExpanded || !scanId || findingIndex === null || findingIndex === undefined) return undefined
+
+    setArtifactLoading(true)
+    setArtifactError('')
+    getFindingArtifacts(scanId, findingIndex)
+      .then((res) => {
+        if (cancelled) return
+        const payload = res?.data || {}
+        setArtifactFiles(payload.files || [])
+        setArtifactDir(payload.artifact_dir || '')
+      })
+      .catch((err) => {
+        if (cancelled) return
+        setArtifactFiles([])
+        setArtifactDir('')
+        setArtifactError(err?.response?.data?.detail || err.message || 'Failed to load proof artifacts')
+      })
+      .finally(() => {
+        if (!cancelled) setArtifactLoading(false)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [isExpanded, scanId, findingIndex])
+
+  const openArtifact = async (name) => {
+    if (!scanId || findingIndex === null || findingIndex === undefined) return
+    setArtifactContentLoading(true)
+    setSelectedArtifact(name)
+    try {
+      const res = await getFindingArtifactFile(scanId, findingIndex, name)
+      setSelectedArtifactContent(res?.data?.content || '')
+      setArtifactError('')
+    } catch (err) {
+      setSelectedArtifactContent('')
+      setArtifactError(err?.response?.data?.detail || err.message || 'Failed to load artifact content')
+    } finally {
+      setArtifactContentLoading(false)
+    }
+  }
 
   const proofLabel =
     finding.final_status === 'confirmed' ? 'PROVEN'
@@ -286,6 +338,60 @@ export default function FindingCard({ finding, forceExpanded = false }) {
                   {typeof povResult?.exit_code !== 'undefined' && <span>EXIT {String(povResult.exit_code)}</span>}
                   {povResult?.execution_time_s && <span>TIME {Number(povResult.execution_time_s).toFixed(2)}s</span>}
                 </div>
+              </div>
+            </div>
+          )}
+
+
+          {(artifactLoading || artifactFiles.length > 0 || artifactError) && (
+            <div style={{ marginBottom: 14 }}>
+              <div style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: 9, letterSpacing: '.12em', color: 'var(--text3)', marginBottom: 6 }}>ARTIFACT FILES</div>
+              <div style={{ background: 'var(--bg)', border: '1px solid var(--border1)', padding: '10px 12px' }}>
+                {artifactDir && (
+                  <div style={{ marginBottom: 10, fontFamily: '"JetBrains Mono", monospace', fontSize: 9, color: 'var(--text3)', wordBreak: 'break-all' }}>
+                    {artifactDir}
+                  </div>
+                )}
+                {artifactLoading ? (
+                  <div style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: 10, color: 'var(--text3)' }}>Loading artifact files...</div>
+                ) : artifactFiles.length > 0 ? (
+                  <div style={{ display: 'grid', gap: 8 }}>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                      {artifactFiles.map((file) => (
+                        <button
+                          key={file.name}
+                          type="button"
+                          onClick={() => openArtifact(file.name)}
+                          style={{
+                            background: selectedArtifact === file.name ? 'rgba(249,115,22,0.12)' : 'var(--surface2)',
+                            border: '1px solid var(--border1)',
+                            color: selectedArtifact === file.name ? 'var(--accent)' : 'var(--text2)',
+                            padding: '6px 10px',
+                            cursor: 'pointer',
+                            fontFamily: '"JetBrains Mono", monospace',
+                            fontSize: 9,
+                            letterSpacing: '.06em',
+                          }}
+                        >
+                          {file.name}
+                        </button>
+                      ))}
+                    </div>
+                    {artifactContentLoading && (
+                      <div style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: 10, color: 'var(--text3)' }}>Loading artifact content...</div>
+                    )}
+                    {selectedArtifact && !artifactContentLoading && (
+                      <pre style={{ background: 'var(--surface2)', border: '1px solid var(--border1)', padding: '10px 12px', margin: 0, overflowX: 'auto', whiteSpace: 'pre-wrap', fontSize: 11, color: 'var(--text2)', fontFamily: '"JetBrains Mono", monospace', maxHeight: 260 }}>
+                        {selectedArtifactContent || '[ EMPTY FILE ]'}
+                      </pre>
+                    )}
+                  </div>
+                ) : (
+                  <div style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: 10, color: 'var(--text3)' }}>No artifact files saved for this finding.</div>
+                )}
+                {artifactError && (
+                  <div style={{ marginTop: 10, fontFamily: '"JetBrains Mono", monospace', fontSize: 10, color: '#fca5a5' }}>{artifactError}</div>
+                )}
               </div>
             </div>
           )}

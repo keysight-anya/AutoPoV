@@ -91,6 +91,44 @@ Respond in JSON only with this exact shape:
 }}
 """
 
+POV_GENERATION_PROMPT_OFFLINE = """You are creating a compact Proof-of-Vulnerability (PoV) script for a local offline model.
+
+VULNERABILITY:
+- Label: {cwe_type}
+- Location: {filepath}:{line_number}
+- Target Language: {target_language}
+- Explanation: {explanation}
+
+VULNERABLE SNIPPET:
+```
+{vulnerable_code}
+```
+
+TARGET EXCERPT:
+```
+{code_context}
+```
+
+TASK:
+Return JSON only. Generate the smallest runnable {pov_language} script that can test the real vulnerable path. Prefer direct local execution, deterministic payloads, and concrete success checks. Do not include prose outside JSON.
+
+JSON SHAPE:
+{{
+  "pov_script": "full runnable {pov_language} script",
+  "exploit_contract": {{
+    "goal": "one sentence exploit goal",
+    "target_entrypoint": "function, route, helper, or binary hint",
+    "runtime_profile": "web|python|javascript|node|c|cpp|native|binary",
+    "preconditions": ["required setup or assumptions"],
+    "inputs": ["attacker-controlled inputs or payloads"],
+    "trigger_steps": ["ordered exploit steps"],
+    "success_indicators": ["observable proof strings or effects"],
+    "side_effects": ["files, state changes, or other effects"],
+    "expected_outcome": "what should happen if the vulnerability is real"
+  }}
+}}
+"""
+
 POV_VALIDATION_PROMPT = """You are validating a Proof-of-Vulnerability (PoV) Python script.
 
 POV SCRIPT:
@@ -268,6 +306,90 @@ Respond in JSON only with this exact shape:
 }}
 """
 
+POV_REFINEMENT_PROMPT_OFFLINE = """You are repairing a failed Proof-of-Vulnerability (PoV) for a local offline model.
+
+VULNERABILITY:
+- Label: {cwe_type}
+- Location: {filepath}:{line_number}
+- Target Language: {target_language}
+- Explanation: {explanation}
+
+VULNERABLE SNIPPET:
+```
+{vulnerable_code}
+```
+
+TARGET EXCERPT:
+```
+{code_context}
+```
+
+FAILED POV SCRIPT:
+```python
+{failed_pov}
+```
+
+VALIDATION ERRORS:
+{validation_errors}
+
+CURRENT EXPLOIT CONTRACT:
+{exploit_contract}
+
+TASK:
+Return JSON only with a corrected runnable `pov_script` and an updated `exploit_contract`. Keep the script compact, deterministic, and focused on the declared target entrypoint.
+"""
+
+POV_VALIDATION_PROMPT_OFFLINE = """You are validating a compact offline PoV script.
+
+POV SCRIPT:
+```python
+{pov_script}
+```
+
+VULNERABILITY CONTEXT:
+- Label: {cwe_type}
+- Target: {filepath}:{line_number}
+- Goal: {exploit_goal}
+- Success Indicators: {success_indicators}
+
+TASK:
+Return JSON only with:
+{{
+  "is_valid": true or false,
+  "issues": ["issue"],
+  "suggestions": ["suggestion"],
+  "will_trigger": "YES", "MAYBE", or "NO"
+}}
+"""
+
+RETRY_ANALYSIS_PROMPT_OFFLINE = """A compact offline PoV failed.
+
+VULNERABILITY:
+- Label: {cwe_type}
+- Location: {filepath}:{line_number}
+- Explanation: {explanation}
+
+FAILED POV:
+```python
+{failed_pov}
+```
+
+EXECUTION OUTPUT:
+```
+{execution_output}
+```
+
+ATTEMPT: {attempt_number} of {max_retries}
+
+TASK:
+Return JSON only with:
+{{
+  "failure_reason": "why it failed",
+  "suggested_changes": "specific next change",
+  "different_approach": true or false
+}}
+"""
+
 SUMMARY_REPORT_PROMPT = """You are generating a summary of a vulnerability scan.
 
 SCAN METRICS:
@@ -324,6 +446,19 @@ def format_pov_generation_prompt(cwe_type: str, filepath: str, line_number: int,
     )
 
 
+def format_pov_generation_prompt_offline(cwe_type: str, filepath: str, line_number: int, vulnerable_code: str, explanation: str, code_context: str, target_language: str, pov_language: str) -> str:
+    return POV_GENERATION_PROMPT_OFFLINE.format(
+        cwe_type=cwe_type or 'UNCLASSIFIED',
+        filepath=filepath,
+        line_number=line_number,
+        vulnerable_code=vulnerable_code or '',
+        explanation=explanation or '',
+        code_context=code_context or '',
+        target_language=target_language or 'unknown',
+        pov_language=pov_language or 'python'
+    )
+
+
 def format_pov_validation_prompt(pov_script: str, cwe_type: str, filepath: str, line_number: int, exploit_goal: str = '', success_indicators: str = '', exploit_contract=None) -> str:
     contract = exploit_contract or {}
     derived_goal = exploit_goal or contract.get('goal') or 'Establish whether the identified vulnerability is real.'
@@ -336,6 +471,27 @@ def format_pov_validation_prompt(pov_script: str, cwe_type: str, filepath: str, 
             parts.append('Side effects: ' + ', '.join(str(x) for x in contract.get('side_effects', []) if str(x).strip()))
         indicators = ' | '.join([p for p in parts if p]) or 'Observable exploit success indicators not specified.'
     return POV_VALIDATION_PROMPT.format(
+        pov_script=pov_script or '',
+        cwe_type=cwe_type or 'UNCLASSIFIED',
+        filepath=filepath,
+        line_number=line_number,
+        exploit_goal=derived_goal,
+        success_indicators=indicators
+    )
+
+
+def format_pov_validation_prompt_offline(pov_script: str, cwe_type: str, filepath: str, line_number: int, exploit_goal: str = '', success_indicators: str = '', exploit_contract=None) -> str:
+    contract = exploit_contract or {}
+    derived_goal = exploit_goal or contract.get('goal') or 'Establish whether the identified vulnerability is real.'
+    indicators = success_indicators
+    if not indicators:
+        parts = []
+        if contract.get('success_indicators'):
+            parts.append(', '.join(str(x) for x in contract.get('success_indicators', []) if str(x).strip()))
+        if contract.get('side_effects'):
+            parts.append('Side effects: ' + ', '.join(str(x) for x in contract.get('side_effects', []) if str(x).strip()))
+        indicators = ' | '.join([p for p in parts if p]) or 'Observable exploit success indicators not specified.'
+    return POV_VALIDATION_PROMPT_OFFLINE.format(
         pov_script=pov_script or '',
         cwe_type=cwe_type or 'UNCLASSIFIED',
         filepath=filepath,
@@ -365,6 +521,19 @@ def format_retry_analysis_prompt(cwe_type: str, filepath: str, line_number: int,
     )
 
 
+def format_retry_analysis_prompt_offline(cwe_type: str, filepath: str, line_number: int, explanation: str, failed_pov: str, execution_output: str, attempt_number: int, max_retries: int) -> str:
+    return RETRY_ANALYSIS_PROMPT_OFFLINE.format(
+        cwe_type=cwe_type or 'UNCLASSIFIED',
+        filepath=filepath,
+        line_number=line_number,
+        explanation=explanation or '',
+        failed_pov=failed_pov or '',
+        execution_output=execution_output or '',
+        attempt_number=attempt_number,
+        max_retries=max_retries
+    )
+
+
 def format_pov_refinement_prompt(cwe_type: str, filepath: str, line_number: int, vulnerable_code: str, explanation: str, code_context: str, failed_pov: str, validation_errors, attempt_number: int, target_language: str = 'python', exploit_contract=None) -> str:
     rendered_errors = ''
     if validation_errors:
@@ -373,6 +542,28 @@ def format_pov_refinement_prompt(cwe_type: str, filepath: str, line_number: int,
         else:
             rendered_errors = str(validation_errors)
     return POV_REFINEMENT_PROMPT.format(
+        cwe_type=cwe_type or 'UNCLASSIFIED',
+        filepath=filepath,
+        line_number=line_number,
+        vulnerable_code=vulnerable_code or '',
+        explanation=explanation or '',
+        code_context=code_context or '',
+        failed_pov=failed_pov or '',
+        validation_errors=rendered_errors or '[No validation errors supplied]',
+        attempt_number=attempt_number,
+        target_language=target_language or 'python',
+        exploit_contract=json.dumps(exploit_contract or {}, indent=2)
+    )
+
+
+def format_pov_refinement_prompt_offline(cwe_type: str, filepath: str, line_number: int, vulnerable_code: str, explanation: str, code_context: str, failed_pov: str, validation_errors, attempt_number: int, target_language: str = 'python', exploit_contract=None) -> str:
+    rendered_errors = ''
+    if validation_errors:
+        if isinstance(validation_errors, (list, tuple)):
+            rendered_errors = '\n'.join(f'- {x}' for x in validation_errors)
+        else:
+            rendered_errors = str(validation_errors)
+    return POV_REFINEMENT_PROMPT_OFFLINE.format(
         cwe_type=cwe_type or 'UNCLASSIFIED',
         filepath=filepath,
         line_number=line_number,
@@ -457,10 +648,14 @@ __all__ = [
     'SUMMARY_REPORT_PROMPT',
     'format_investigation_prompt',
     'format_pov_generation_prompt',
+    'format_pov_generation_prompt_offline',
     'format_pov_validation_prompt',
+    'format_pov_validation_prompt_offline',
     'format_rag_context_prompt',
     'format_retry_analysis_prompt',
+    'format_retry_analysis_prompt_offline',
     'format_pov_refinement_prompt',
+    'format_pov_refinement_prompt_offline',
     'format_scout_prompt',
     'format_scout_triage_prompt',
     'format_summary_report_prompt',

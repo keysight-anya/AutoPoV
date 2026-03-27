@@ -81,6 +81,10 @@ export const getHistory = (limit = 100, offset = 0) => apiClient.get(`/history?l
 export const getReport = (scanId, format = 'json') => apiClient.get(`/report/${scanId}?format=${format}`, {
   responseType: format === 'pdf' ? 'blob' : 'json'
 })
+export const getFindingArtifacts = (scanId, findingIndex) => apiClient.get(`/scan/${scanId}/artifacts/${findingIndex}`)
+export const getFindingArtifactFile = (scanId, findingIndex, name) => apiClient.get(`/scan/${scanId}/artifacts/${findingIndex}/file`, {
+  params: { name }
+})
 export const getMetrics = () => apiClient.get('/metrics')
 
 export const generateApiKey = (name = 'default') => apiClient.post('/keys/generate', null, {

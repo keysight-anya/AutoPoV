@@ -128,20 +128,29 @@ class CodeIngester:
         backend = (settings.LOCAL_EMBEDDING_BACKEND or "hash").lower()
         model_name = settings.EMBEDDING_MODEL_OFFLINE
 
+        candidates = []
         if backend == "hash":
-            return _HashEmbeddings()
+            candidates.append(("hash", lambda: _HashEmbeddings()))
+        else:
+            if backend == "huggingface" and HUGGINGFACE_AVAILABLE:
+                candidates.append(("huggingface", lambda: HuggingFaceEmbeddings(model_name=model_name)))
+            if backend in {"sentence-transformers", "sentence_transformers"} and SENTENCE_TRANSFORMERS_AVAILABLE:
+                candidates.append(("sentence-transformers", lambda: _SentenceTransformerEmbeddings(model_name)))
+            if HUGGINGFACE_AVAILABLE:
+                candidates.append(("huggingface", lambda: HuggingFaceEmbeddings(model_name=model_name)))
+            if SENTENCE_TRANSFORMERS_AVAILABLE:
+                candidates.append(("sentence-transformers", lambda: _SentenceTransformerEmbeddings(model_name)))
+            candidates.append(("hash", lambda: _HashEmbeddings()))
 
-        if backend == "huggingface" and HUGGINGFACE_AVAILABLE:
-            return HuggingFaceEmbeddings(model_name=model_name)
-
-        if backend in {"sentence-transformers", "sentence_transformers"} and SENTENCE_TRANSFORMERS_AVAILABLE:
-            return _SentenceTransformerEmbeddings(model_name)
-
-        if HUGGINGFACE_AVAILABLE:
-            return HuggingFaceEmbeddings(model_name=model_name)
-
-        if SENTENCE_TRANSFORMERS_AVAILABLE:
-            return _SentenceTransformerEmbeddings(model_name)
+        seen = set()
+        for label, factory in candidates:
+            if label in seen and label != "hash":
+                continue
+            seen.add(label)
+            try:
+                return factory()
+            except Exception as exc:
+                print(f"Warning: Local embeddings backend {label} unavailable ({exc}). Trying next fallback.")
 
         return _HashEmbeddings()
 
@@ -149,13 +158,13 @@ class CodeIngester:
         """Get embeddings model based on configuration"""
         if self._embeddings is not None:
             return self._embeddings
-        
-        llm_config = settings.get_llm_config()
-        
+
         if settings.PREFER_LOCAL_EMBEDDINGS:
             print(f"Info: Using local embeddings backend ({settings.LOCAL_EMBEDDING_BACKEND}) for ingestion.")
             self._embeddings = self._build_local_embeddings()
             return self._embeddings
+
+        llm_config = settings.get_llm_config()
 
         if llm_config["mode"] == "online":
             if not OPENAI_AVAILABLE:

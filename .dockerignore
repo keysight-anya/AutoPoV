@@ -1,56 +1,53 @@
-# Git
+# Git and local metadata
 .git
 .gitignore
+.dockerignore
 .env
 frontend/.env
 
 # Python
-__pycache__
-*.pyc
-*.pyo
-*.pyd
-.Python
-*.so
-*.egg
-*.egg-info
-dist
-build
-
-# Virtual Environment
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 venv/
 env/
 ENV/
 
-# IDE
-.vscode
-.idea
-*.swp
-*.swo
+# Build output
+build/
+dist/
+frontend/node_modules/
+frontend/dist/
 
-# OS
-.DS_Store
-Thumbs.db
-
-# Data and Results (will be mounted as volumes)
+# Runtime data mounted as volumes
 data/*
 !data/.gitkeep
 results/*
 !results/.gitkeep
-results/povs/*
-!results/povs/.gitkeep
+!results/runs/
 results/runs/*
 !results/runs/.gitkeep
+!results/povs/
+results/povs/*
+!results/povs/.gitkeep
+!results/proof_artifacts/
+results/proof_artifacts/*
+!results/proof_artifacts/.gitkeep
+
+# Local tooling output
+.qoder/
+.playwright-mcp/
+.superpowers/
+.claude/
+_demo_smoke/
 
 # Temporary files
 *.log
 *.tmp
 /tmp
 
-# Docker files themselves
+# Docker definitions are copied explicitly where needed
 Dockerfile*
 docker-compose.yml
-.dockerignore
-
-# Node modules (for frontend)
-frontend/node_modules
-frontend/dist

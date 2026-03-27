@@ -80,9 +80,11 @@ class ScanManager:
         self._executor = ThreadPoolExecutor(max_workers=3)
         self._runs_dir = settings.RUNS_DIR
         self._active_runs_dir = settings.ACTIVE_RUNS_DIR
+        self._proof_artifacts_dir = settings.PROOF_ARTIFACTS_DIR
         self._scan_locks: Dict[str, threading.Lock] = {}
         os.makedirs(self._runs_dir, exist_ok=True)
         os.makedirs(self._active_runs_dir, exist_ok=True)
+        os.makedirs(self._proof_artifacts_dir, exist_ok=True)
         self._load_active_scan_snapshots()
     
     def create_scan(
@@ -567,12 +569,126 @@ class ScanManager:
             self._retire_terminal_scan(scan_id)
             return result
     
+    def _artifact_slug(self, value: Any, fallback: str = "item") -> str:
+        text = str(value or fallback).strip()
+        text = ''.join(ch if ch.isalnum() or ch in {'-', '_', '.'} else '_' for ch in text)
+        text = text.strip('._')
+        return (text or fallback)[:80]
+
+    def _infer_pov_extension(self, finding: Dict[str, Any]) -> str:
+        script = str(finding.get('pov_script') or '')
+        if script.lstrip().startswith('<?php'):
+            return '.php'
+        if script.lstrip().startswith('#!/bin/bash') or script.lstrip().startswith('#!/usr/bin/env bash'):
+            return '.sh'
+        if script.lstrip().startswith('#!/usr/bin/env node') or 'console.log(' in script or 'require(' in script or 'process.env' in script:
+            return '.js'
+        return '.py'
+
+    def _write_json_file(self, path: str, payload: Any):
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2, default=str)
+
+    def _write_text_file(self, path: str, value: Any):
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(str(value or ''))
+
+    def _export_proof_artifacts(self, result: ScanResult):
+        base_dir = os.path.join(self._proof_artifacts_dir, result.scan_id)
+        if os.path.exists(base_dir):
+            shutil.rmtree(base_dir, ignore_errors=True)
+        os.makedirs(base_dir, exist_ok=True)
+
+        index_rows = []
+        for idx, finding in enumerate(result.findings or []):
+            final_status = str(finding.get('final_status') or '')
+            should_export = bool(
+                final_status in {'confirmed', 'failed'}
+                or finding.get('pov_script')
+                or finding.get('pov_result')
+                or finding.get('validation_result')
+            )
+            if not should_export:
+                continue
+
+            label_parts = [
+                f"{idx:03d}",
+                self._artifact_slug(finding.get('cwe_type') or 'UNCLASSIFIED', 'UNCLASSIFIED'),
+                self._artifact_slug(Path(str(finding.get('filepath') or 'unknown')).name, 'unknown'),
+                f"L{int(finding.get('line_number') or 0)}",
+            ]
+            finding_dir = os.path.join(base_dir, '__'.join(label_parts))
+            os.makedirs(finding_dir, exist_ok=True)
+
+            summary = {
+                'scan_id': result.scan_id,
+                'finding_index': idx,
+                'filepath': finding.get('filepath'),
+                'line_number': finding.get('line_number'),
+                'cwe_type': finding.get('cwe_type') or 'UNCLASSIFIED',
+                'llm_verdict': finding.get('llm_verdict'),
+                'confidence': finding.get('confidence'),
+                'final_status': final_status,
+                'proof_status': (finding.get('pov_result') or {}).get('validation_method'),
+                'vulnerability_triggered': (finding.get('pov_result') or {}).get('vulnerability_triggered'),
+                'proof_summary': (finding.get('pov_result') or {}).get('proof_summary'),
+                'target_binary': (finding.get('pov_result') or {}).get('target_binary'),
+                'target_url': (finding.get('pov_result') or {}).get('target_url'),
+                'attempted_binaries': (finding.get('pov_result') or {}).get('attempted_binaries'),
+                'selected_binary': (finding.get('pov_result') or {}).get('selected_binary'),
+            }
+            self._write_json_file(os.path.join(finding_dir, 'summary.json'), summary)
+
+            if finding.get('llm_explanation'):
+                self._write_text_file(os.path.join(finding_dir, 'explanation.txt'), finding.get('llm_explanation'))
+            if finding.get('code_chunk'):
+                self._write_text_file(os.path.join(finding_dir, 'vulnerable_code.txt'), finding.get('code_chunk'))
+            if finding.get('pov_script'):
+                pov_ext = self._infer_pov_extension(finding)
+                self._write_text_file(os.path.join(finding_dir, f'proof_of_vulnerability{pov_ext}'), finding.get('pov_script'))
+            if finding.get('exploit_contract'):
+                self._write_json_file(os.path.join(finding_dir, 'exploit_contract.json'), finding.get('exploit_contract'))
+            if finding.get('validation_result'):
+                self._write_json_file(os.path.join(finding_dir, 'validation_output.json'), finding.get('validation_result'))
+            if finding.get('pov_result'):
+                pov_result = finding.get('pov_result') or {}
+                self._write_json_file(os.path.join(finding_dir, 'runtime_result.json'), pov_result)
+                self._write_text_file(os.path.join(finding_dir, 'runtime_stdout.txt'), pov_result.get('stdout'))
+                self._write_text_file(os.path.join(finding_dir, 'runtime_stderr.txt'), pov_result.get('stderr'))
+                if pov_result.get('proof_summary'):
+                    self._write_text_file(os.path.join(finding_dir, 'proof_summary.txt'), pov_result.get('proof_summary'))
+                attempted_targets = {
+                    'attempted_binaries': pov_result.get('attempted_binaries'),
+                    'selected_binary': pov_result.get('selected_binary'),
+                    'target_binary': pov_result.get('target_binary'),
+                    'target_url': pov_result.get('target_url'),
+                }
+                self._write_json_file(os.path.join(finding_dir, 'attempted_targets.json'), attempted_targets)
+
+            index_rows.append({
+                'finding_index': idx,
+                'folder': os.path.basename(finding_dir),
+                'filepath': finding.get('filepath'),
+                'line_number': finding.get('line_number'),
+                'cwe_type': finding.get('cwe_type') or 'UNCLASSIFIED',
+                'final_status': final_status,
+                'llm_verdict': finding.get('llm_verdict'),
+                'confidence': finding.get('confidence'),
+            })
+
+        self._write_json_file(os.path.join(base_dir, 'index.json'), {
+            'scan_id': result.scan_id,
+            'generated_at': datetime.utcnow().isoformat(),
+            'artifacts': index_rows,
+        })
+
     def _save_result(self, result: ScanResult):
         """Save scan result to file"""
         # Save as JSON
         json_path = os.path.join(self._runs_dir, f"{result.scan_id}.json")
         with open(json_path, 'w') as f:
             json.dump(asdict(result), f, indent=2, default=str)
+        self._export_proof_artifacts(result)
         
         # Append to CSV log
         csv_path = os.path.join(self._runs_dir, "scan_history.csv")
@@ -678,6 +794,58 @@ class ScanManager:
                 return ScanResult(**filtered)
         
         return None
+
+    def get_proof_artifact_scan_dir(self, scan_id: str) -> str:
+        return os.path.join(self._proof_artifacts_dir, scan_id)
+
+    def get_proof_artifact_dir(self, scan_id: str, finding_index: int) -> Optional[str]:
+        scan_dir = self.get_proof_artifact_scan_dir(scan_id)
+        if not os.path.isdir(scan_dir):
+            return None
+        prefix = f"{int(finding_index):03d}__"
+        for name in sorted(os.listdir(scan_dir)):
+            candidate = os.path.join(scan_dir, name)
+            if os.path.isdir(candidate) and name.startswith(prefix):
+                return candidate
+        return None
+
+    def list_proof_artifacts(self, scan_id: str, finding_index: int) -> List[Dict[str, Any]]:
+        artifact_dir = self.get_proof_artifact_dir(scan_id, finding_index)
+        if not artifact_dir:
+            return []
+        files = []
+        for name in sorted(os.listdir(artifact_dir)):
+            full_path = os.path.join(artifact_dir, name)
+            if not os.path.isfile(full_path):
+                continue
+            stat = os.stat(full_path)
+            files.append({
+                'name': name,
+                'size': stat.st_size,
+                'modified_at': datetime.utcfromtimestamp(stat.st_mtime).isoformat(),
+            })
+        return files
+
+    def read_proof_artifact(self, scan_id: str, finding_index: int, filename: str) -> Optional[Dict[str, Any]]:
+        artifact_dir = self.get_proof_artifact_dir(scan_id, finding_index)
+        if not artifact_dir:
+            return None
+        candidate = Path(artifact_dir) / filename
+        try:
+            resolved = candidate.resolve()
+            base = Path(artifact_dir).resolve()
+        except Exception:
+            return None
+        if base not in resolved.parents and resolved.parent != base:
+            return None
+        if not resolved.exists() or not resolved.is_file():
+            return None
+        return {
+            'name': resolved.name,
+            'content': resolved.read_text(encoding='utf-8', errors='replace'),
+            'size': resolved.stat().st_size,
+            'modified_at': datetime.utcfromtimestamp(resolved.stat().st_mtime).isoformat(),
+        }
     
     def get_scan_history(
         self,

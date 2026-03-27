@@ -35,6 +35,7 @@ class AnalysisCache:
     
     _instance = None
     _lock = threading.Lock()
+    PROMPT_CACHE_VERSION = "v2"
     
     def __new__(cls):
         if cls._instance is None:
@@ -178,7 +179,7 @@ class AnalysisCache:
         """
         with self._cache_lock:
             code_hash = self._compute_code_hash(code)
-            cache_key = f"{language}:{code_hash}"
+            cache_key = f"{self.PROMPT_CACHE_VERSION}:{language}:{code_hash}"
             
             cached = self._prompt_cache.get(cache_key)
             if cached:
@@ -210,7 +211,7 @@ class AnalysisCache:
         """Cache an analysis result"""
         with self._cache_lock:
             code_hash = self._compute_code_hash(code)
-            cache_key = f"{language}:{code_hash}"
+            cache_key = f"{self.PROMPT_CACHE_VERSION}:{language}:{code_hash}"
             
             cached = CachedAnalysis(
                 code_hash=code_hash,
@@ -220,7 +221,7 @@ class AnalysisCache:
                 verdict=verdict,
                 cwe_type=cwe_type,
                 confidence=confidence,
-                explanation=explanation[:500],  # Truncate for storage
+                explanation=explanation,
                 vulnerable_code=vulnerable_code[:500],
                 created_at=datetime.utcnow().isoformat(),
                 hit_count=0

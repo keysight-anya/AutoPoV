@@ -88,6 +88,8 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL_OFFLINE: str = "sentence-transformers/all-MiniLM-L6-v2"
     PREFER_LOCAL_EMBEDDINGS: bool = Field(default=True, env="PREFER_LOCAL_EMBEDDINGS")
     LOCAL_EMBEDDING_BACKEND: str = Field(default="sentence-transformers", env="LOCAL_EMBEDDING_BACKEND")
+    HF_TOKEN: str = Field(default="", env="HF_TOKEN")
+    HUGGINGFACEHUB_API_TOKEN: str = Field(default="", env="HUGGINGFACEHUB_API_TOKEN")
     
     # LangSmith Tracing
     LANGCHAIN_TRACING_V2: bool = Field(default=False, env="LANGCHAIN_TRACING_V2")
@@ -102,10 +104,17 @@ class Settings(BaseSettings):
     
     # Docker Configuration
     DOCKER_ENABLED: bool = Field(default=True, env="DOCKER_ENABLED")
-    DOCKER_IMAGE: str = "python:3.12-slim"
-    DOCKER_TIMEOUT: int = 180
-    DOCKER_MEMORY_LIMIT: str = "2g"
-    DOCKER_CPU_LIMIT: float = 2.0
+    DOCKER_IMAGE: str = Field(default="autopov/proof-python:latest", env="DOCKER_IMAGE")
+    DOCKER_NODE_IMAGE: str = Field(default="autopov/proof-node:latest", env="DOCKER_NODE_IMAGE")
+    DOCKER_BROWSER_IMAGE: str = Field(default="autopov/proof-browser:latest", env="DOCKER_BROWSER_IMAGE")
+    DOCKER_NATIVE_IMAGE: str = Field(default="autopov/proof-native:latest", env="DOCKER_NATIVE_IMAGE")
+    DOCKER_PHP_IMAGE: str = Field(default="autopov/proof-php:latest", env="DOCKER_PHP_IMAGE")
+    DOCKER_RUBY_IMAGE: str = Field(default="autopov/proof-ruby:latest", env="DOCKER_RUBY_IMAGE")
+    DOCKER_GO_IMAGE: str = Field(default="autopov/proof-go:latest", env="DOCKER_GO_IMAGE")
+    DOCKER_SHELL_IMAGE: str = Field(default="ubuntu:24.04", env="DOCKER_SHELL_IMAGE")
+    DOCKER_TIMEOUT: int = Field(default=180, env="DOCKER_TIMEOUT")
+    DOCKER_MEMORY_LIMIT: str = Field(default="2g", env="DOCKER_MEMORY_LIMIT")
+    DOCKER_CPU_LIMIT: float = Field(default=2.0, env="DOCKER_CPU_LIMIT")
     
     # Cost Control
     MAX_COST_USD: float = Field(default=100.0, env="MAX_COST_USD")
@@ -148,9 +157,14 @@ class Settings(BaseSettings):
     DATA_DIR: str = "./data"
     RESULTS_DIR: str = "./results"
     POVS_DIR: str = "./results/povs"
+    PROOF_ARTIFACTS_DIR: str = Field(default="./results/proof_artifacts", env="PROOF_ARTIFACTS_DIR")
     RUNS_DIR: str = "./results/runs"
     ACTIVE_RUNS_DIR: str = "./results/runs/active"
     TEMP_DIR: str = "/tmp/autopov"
+    MAX_UPLOAD_SIZE_MB: int = Field(default=50, env="MAX_UPLOAD_SIZE_MB")
+    MAX_ARCHIVE_UNCOMPRESSED_MB: int = Field(default=250, env="MAX_ARCHIVE_UNCOMPRESSED_MB")
+    MAX_ARCHIVE_FILES: int = Field(default=10000, env="MAX_ARCHIVE_FILES")
+    MAX_ARCHIVE_COMPRESSION_RATIO: float = Field(default=100.0, env="MAX_ARCHIVE_COMPRESSION_RATIO")
     SNAPSHOT_DIR: str = Field(default="./results/snapshots", env="SNAPSHOT_DIR")
     
     # Snapshot Configuration
@@ -315,12 +329,107 @@ class Settings(BaseSettings):
             "reasoning_enabled": False,
         }
 
+    def get_ollama_client_kwargs(self, model_name: Optional[str] = None, purpose: str = "general") -> dict:
+        """Return offline-only Ollama request limits tuned for local execution."""
+        selected_model = (model_name or self.MODEL_NAME or "").strip()
+        read_timeout_s = self.OLLAMA_READ_TIMEOUT_S
+        timeout_floors = {
+            "qwen3": {"general": 300, "scout": 300, "triage": 300, "pov": 420, "refinement": 360, "validation": 240, "retry": 240},
+            "glm-4.7-flash": {"general": 480, "scout": 480, "triage": 480, "pov": 720, "refinement": 600, "validation": 360, "retry": 360},
+            "llama4": {"general": 900, "scout": 900, "triage": 900, "pov": 1200, "refinement": 960, "validation": 480, "retry": 480},
+        }
+        model_timeouts = timeout_floors.get(selected_model, {})
+        read_timeout_s = max(read_timeout_s, model_timeouts.get(purpose, model_timeouts.get("general", read_timeout_s)))
+        return {"timeout": (self.OLLAMA_CONNECT_TIMEOUT_S, read_timeout_s)}
+
+    def get_ollama_generation_options(self, model_name: Optional[str] = None, purpose: str = "general") -> dict:
+        """Return offline generation settings without affecting online execution."""
+        selected_model = (model_name or self.MODEL_NAME or "").strip()
+        num_ctx = self.OLLAMA_NUM_CTX
+        num_predict = self.OLLAMA_NUM_PREDICT
+
+        purpose_caps = {
+            "general": (1536, 320),
+            "scout": (1280, 256),
+            "triage": (1280, 256),
+            "pov": (1664, 320),
+            "refinement": (1792, 320),
+            "validation": (1280, 192),
+            "retry": (1280, 192),
+        }
+        model_caps = {
+            "qwen3": {"general": (1280, 256), "scout": (1024, 256), "triage": (1024, 256), "pov": (1152, 224), "refinement": (1280, 240), "validation": (1024, 160), "retry": (1024, 180)},
+            "glm-4.7-flash": {"general": (1536, 320), "scout": (1280, 256), "triage": (1280, 256), "pov": (1536, 320), "refinement": (1664, 320), "validation": (1280, 192), "retry": (1280, 192)},
+            "llama4": {"general": (2048, 384), "scout": (1536, 256), "triage": (1536, 256), "pov": (2048, 384), "refinement": (2304, 448), "validation": (1536, 224), "retry": (1536, 224)},
+        }
+        selected_caps = model_caps.get(selected_model, purpose_caps)
+        capped_ctx, capped_predict = selected_caps.get(purpose, selected_caps.get("general", (num_ctx, num_predict)))
+        num_ctx = min(num_ctx, capped_ctx)
+        num_predict = min(num_predict, capped_predict)
+
+        return {"num_ctx": num_ctx, "num_predict": num_predict}
+
+    def get_offline_pov_budget(self, model_name: Optional[str] = None, purpose: str = "pov") -> dict:
+        """Cap offline PoV prompts so local models spend budget on code generation, not prompt volume."""
+        selected_model = (model_name or self.MODEL_NAME or "").strip()
+        budget = {
+            "max_context_chars": 3200,
+            "max_vulnerable_code_chars": 900,
+            "max_explanation_chars": 600,
+            "max_failed_pov_chars": 1800,
+            "max_validation_error_chars": 500,
+            "max_error_items": 5,
+        }
+
+        if selected_model == "qwen3":
+            budget.update({"max_context_chars": 2200, "max_vulnerable_code_chars": 700, "max_explanation_chars": 420, "max_failed_pov_chars": 1100, "max_validation_error_chars": 320, "max_error_items": 4})
+            if purpose == "refinement":
+                budget.update({"max_context_chars": 2500, "max_failed_pov_chars": 1300, "max_validation_error_chars": 380})
+            elif purpose in {"validation", "retry"}:
+                budget.update({"max_context_chars": 1600, "max_failed_pov_chars": 900, "max_validation_error_chars": 260})
+        elif selected_model == "glm-4.7-flash":
+            budget.update({"max_context_chars": 3000, "max_vulnerable_code_chars": 900, "max_explanation_chars": 560, "max_failed_pov_chars": 1700, "max_validation_error_chars": 450, "max_error_items": 5})
+            if purpose == "refinement":
+                budget.update({"max_context_chars": 3400, "max_failed_pov_chars": 2000, "max_validation_error_chars": 520})
+        elif selected_model == "llama4":
+            budget.update({"max_context_chars": 4200, "max_vulnerable_code_chars": 1200, "max_explanation_chars": 750, "max_failed_pov_chars": 2600, "max_validation_error_chars": 700, "max_error_items": 6})
+            if purpose == "refinement":
+                budget.update({"max_context_chars": 4800, "max_failed_pov_chars": 3000, "max_validation_error_chars": 800})
+
+        return budget
+
+    def get_offline_scout_budget(self, model_name: Optional[str] = None, purpose: str = "triage") -> dict:
+        """Cap offline scout workload so local inference remains responsive."""
+        selected_model = (model_name or self.MODEL_NAME or "").strip()
+        budget = {
+            "max_files": self.SCOUT_MAX_FILES,
+            "max_chars": self.SCOUT_MAX_CHARS_PER_FILE,
+        }
+
+        if selected_model == "qwen3":
+            if purpose == "exploratory":
+                budget.update({"max_files": min(self.SCOUT_MAX_FILES, 4), "max_chars": min(self.SCOUT_MAX_CHARS_PER_FILE, 1800)})
+            elif purpose == "directory":
+                budget.update({"max_files": min(self.SCOUT_MAX_FILES, 6), "max_chars": min(self.SCOUT_MAX_CHARS_PER_FILE, 2200)})
+            else:
+                budget.update({"max_files": min(self.SCOUT_MAX_FILES, 5), "max_chars": min(self.SCOUT_MAX_CHARS_PER_FILE, 2000)})
+        elif selected_model == "glm-4.7-flash":
+            if purpose == "exploratory":
+                budget.update({"max_files": min(self.SCOUT_MAX_FILES, 6), "max_chars": min(self.SCOUT_MAX_CHARS_PER_FILE, 2200)})
+            elif purpose == "directory":
+                budget.update({"max_files": min(self.SCOUT_MAX_FILES, 8), "max_chars": min(self.SCOUT_MAX_CHARS_PER_FILE, 2600)})
+            else:
+                budget.update({"max_files": min(self.SCOUT_MAX_FILES, 7), "max_chars": min(self.SCOUT_MAX_CHARS_PER_FILE, 2400)})
+
+        return budget
+
     def ensure_directories(self):
         """Ensure all required directories exist"""
         dirs = [
             self.DATA_DIR,
             self.RESULTS_DIR,
             self.POVS_DIR,
+            self.PROOF_ARTIFACTS_DIR,
             self.RUNS_DIR,
             self.ACTIVE_RUNS_DIR,
             self.CHROMA_PERSIST_DIR,

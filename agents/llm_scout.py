@@ -33,6 +33,23 @@ class LLMScoutError(Exception):
 class LLMScout:
     """LLM-based candidate discovery."""
 
+    def _is_offline_model(self, model_name: Optional[str]) -> bool:
+        try:
+            return settings.resolve_model_mode(model_name or settings.MODEL_NAME) == "offline"
+        except Exception:
+            return False
+
+    def _trim_snippets_for_offline(self, file_snippets: List[Dict[str, Any]], model_name: Optional[str], purpose: str) -> List[Dict[str, Any]]:
+        if not self._is_offline_model(model_name):
+            return file_snippets
+        budget = settings.get_offline_scout_budget(model_name, purpose=purpose)
+        trimmed: List[Dict[str, Any]] = []
+        for item in file_snippets[:budget["max_files"]]:
+            clone = dict(item)
+            clone["code"] = (clone.get("code") or "")[:budget["max_chars"]]
+            trimmed.append(clone)
+        return trimmed
+
     def _get_llm(self, model_name: Optional[str] = None):
         llm_config = settings.get_llm_config(model_name=model_name)
         actual_model = model_name or llm_config["model"]
@@ -57,11 +74,14 @@ class LLMScout:
             )
         if not OLLAMA_AVAILABLE:
             raise LLMScoutError("Ollama not available. Install langchain-ollama")
+        generation_options = settings.get_ollama_generation_options(actual_model, purpose="triage")
         return ChatOllama(
             model=actual_model,
             base_url=llm_config["base_url"],
             temperature=0.1,
-            client_kwargs={"timeout": (settings.OLLAMA_CONNECT_TIMEOUT_S, settings.OLLAMA_READ_TIMEOUT_S)}
+            num_ctx=generation_options["num_ctx"],
+            num_predict=generation_options["num_predict"],
+            client_kwargs=settings.get_ollama_client_kwargs(actual_model)
         )
 
     def _is_code_file(self, filepath: str) -> bool:
@@ -94,8 +114,12 @@ class LLMScout:
         return lang_map.get(ext, "unknown")
 
     def scan_directory(self, codebase_path: str, cwes: List[str], model_name: Optional[str] = None) -> List[Dict[str, Any]]:
-        max_files = settings.SCOUT_MAX_FILES
-        max_chars = settings.SCOUT_MAX_CHARS_PER_FILE
+        budget = settings.get_offline_scout_budget(model_name, purpose="directory") if self._is_offline_model(model_name) else {
+            "max_files": settings.SCOUT_MAX_FILES,
+            "max_chars": settings.SCOUT_MAX_CHARS_PER_FILE,
+        }
+        max_files = budget["max_files"]
+        max_chars = budget["max_chars"]
         max_findings = settings.SCOUT_MAX_FINDINGS
 
         files: List[str] = []
@@ -128,7 +152,12 @@ class LLMScout:
             SystemMessage(content="You are a security researcher scouting for potential vulnerabilities."),
             HumanMessage(content=prompt)
         ]
-        response = llm.invoke(messages)
+        try:
+            response = llm.invoke(messages)
+        except Exception:
+            if self._is_offline_model(model_name):
+                return []
+            raise
         content = response.content.strip()
 
         usage_details = extract_usage_details(response, agent_role="llm_scout")
@@ -185,6 +214,10 @@ class LLMScout:
         if not file_snippets:
             return []
 
+        file_snippets = self._trim_snippets_for_offline(file_snippets, model_name, purpose="triage")
+        if not file_snippets:
+            return []
+
         max_findings = settings.SCOUT_MAX_FINDINGS
         prompt = format_scout_triage_prompt(file_snippets, [])
         llm = self._get_llm(model_name)
@@ -192,7 +225,12 @@ class LLMScout:
             SystemMessage(content="You are a security researcher triaging pre-flagged vulnerability signals from static analysis tools."),
             HumanMessage(content=prompt)
         ]
-        response = llm.invoke(messages)
+        try:
+            response = llm.invoke(messages)
+        except Exception:
+            if self._is_offline_model(model_name):
+                return []
+            raise
         content = response.content.strip()
         usage_details = extract_usage_details(response, agent_role="llm_scout")
         token_usage = usage_details["token_usage"]

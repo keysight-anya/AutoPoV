@@ -5,12 +5,15 @@ Implements resilient language-aware vulnerability discovery.
 
 import os
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
 import json
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 
 from app.config import settings
 
@@ -61,8 +64,7 @@ class AgenticDiscovery:
 
     HIGH_RISK_LANGUAGES = {'python', 'javascript', 'typescript', 'java'}
 
-    # Use only Semgrep-provided security packs at runtime.
-    LOCAL_SEMGREP_RULES = '/app/semgrep-rules/owasp-min.yml'
+    LOCAL_SEMGREP_RULES = 'semgrep-rules/owasp-min.yml'
 
     def __init__(self):
         # Discover available CodeQL query paths at initialization
@@ -261,10 +263,26 @@ class AgenticDiscovery:
         return None
 
     def _get_semgrep_configs(self, languages: List[str]) -> List[str]:
-        """Get official Semgrep-provided security configurations only."""
-        # Keep Semgrep tightly scoped to Semgrep's security-focused registry pack.
-        # This avoids local YAML drift and reduces non-security findings from broader packs.
-        return ['p/security-audit']
+        """Use the stable local security ruleset for the demo path.
+
+        The Semgrep registry packs have been failing in-container, while the
+        local ruleset is language-scoped and has been producing usable security
+        findings. Keep this path deterministic for the demo.
+        """
+        local_rule_path = Path(__file__).resolve().parents[1] / self.LOCAL_SEMGREP_RULES
+        if local_rule_path.is_file():
+            return [str(local_rule_path)]
+        return []
+
+    def _get_semgrep_command(self) -> List[str]:
+        """Resolve a working Semgrep invocation for the current runtime."""
+        sibling_semgrep = str(Path(sys.executable).with_name('semgrep'))
+        if os.path.isfile(sibling_semgrep) and os.access(sibling_semgrep, os.X_OK):
+            return [sibling_semgrep]
+        semgrep_bin = shutil.which('semgrep')
+        if semgrep_bin:
+            return [semgrep_bin]
+        return [sys.executable, '-m', 'semgrep']
 
     def discover(self, codebase_path: str, cwes: List[str], scan_id: str, state: Dict[str, Any]) -> List[DiscoveryResult]:
         import time
@@ -315,7 +333,21 @@ class AgenticDiscovery:
         # Run Exploratory Agent to find what static analyzers may have missed
         # This uses LLM reasoning instead of hardcoded patterns - ALWAYS runs for CWE-agnostic discovery
         self._log(state, '[AgenticDiscovery] Running Exploratory Agent to find additional vulnerabilities')
-        exploratory_result = self._run_exploratory_agent(codebase_path, lang_profile, results, state)
+        try:
+            exploratory_result = self._run_exploratory_agent(codebase_path, lang_profile, results, state)
+        except Exception as exc:
+            if settings.resolve_model_mode(state.get("model_name", "")) == "offline":
+                self._log(state, f'[AgenticDiscovery] Exploratory agent failed in offline mode: {exc}')
+                exploratory_result = DiscoveryResult(
+                    strategy=DiscoveryStrategy.LLM_SCOUT,
+                    findings=[],
+                    success=False,
+                    error=str(exc),
+                    execution_time_s=0.0,
+                    metadata={'mode': 'exploratory', 'degraded': True}
+                )
+            else:
+                raise
         if exploratory_result:
             results.append(exploratory_result)
 
@@ -523,14 +555,20 @@ class AgenticDiscovery:
         findings: List[Dict[str, Any]] = []
         used_configs: List[str] = []
         seen: set[tuple[str, int, str]] = set()
+        semgrep_cmd = self._get_semgrep_command()
 
         for config in configs:
-            cmd = ['semgrep', '--config', config, '--json', '--quiet', codebase_path]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=settings.SEMGREP_TIMEOUT_S)
+            cmd = semgrep_cmd + ['--config', config, '--json', '--quiet', codebase_path]
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=settings.SEMGREP_TIMEOUT_S)
+            except FileNotFoundError:
+                self._log(state, '[AgenticDiscovery] Semgrep executable/module not available in the current runtime')
+                break
             stderr = (result.stderr or '').strip()
 
             if result.returncode not in [0, 1]:
-                self._log(state, f'[AgenticDiscovery] Semgrep config failed ({config}): {(stderr or result.stdout)[:200]}')
+                detail = (stderr or result.stdout or f'return code {result.returncode}')[:400]
+                self._log(state, f'[AgenticDiscovery] Semgrep config failed ({config}) [rc={result.returncode}]: {detail}')
                 continue
 
             try:
@@ -610,7 +648,8 @@ class AgenticDiscovery:
             return None
         
         # Limit files to analyze (cost control)
-        max_files = min(10, len(code_files))
+        scout_budget = settings.get_offline_scout_budget(state.get("model_name"), purpose="exploratory") if settings.resolve_model_mode(state.get("model_name", "")) == "offline" else {"max_files": 10}
+        max_files = min(scout_budget["max_files"], len(code_files))
         code_files = code_files[:max_files]
         
         self._log(state, f'[AgenticDiscovery] Exploratory agent analyzing {len(code_files)} files for missed vulnerabilities')

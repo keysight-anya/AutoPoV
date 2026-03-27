@@ -438,6 +438,73 @@ class AgentGraph:
 
         return state
 
+    def _run_autonomous_discovery(self, state: ScanState) -> List[VulnerabilityState]:
+        """Conservative heuristic fallback used when the richer discovery path fails."""
+        self._log(state, "Running heuristic fallback discovery...")
+        findings: List[VulnerabilityState] = []
+        suspicious_patterns = [
+            ("subprocess", "UNCLASSIFIED", 0.32),
+            ("eval(", "UNCLASSIFIED", 0.38),
+            ("exec(", "UNCLASSIFIED", 0.38),
+            ("pickle.loads", "UNCLASSIFIED", 0.42),
+            ("yaml.load", "UNCLASSIFIED", 0.36),
+            ("os.system", "UNCLASSIFIED", 0.34),
+        ]
+        code_extensions = {'.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.c', '.cpp', '.cc', '.h', '.hpp', '.go', '.rb', '.php', '.cs'}
+
+        for root, dirs, files in os.walk(state["codebase_path"]):
+            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('node_modules', 'venv', '.venv', '__pycache__', 'dist', 'build')]
+            for fname in files:
+                if os.path.splitext(fname)[1].lower() not in code_extensions:
+                    continue
+                file_path = os.path.join(root, fname)
+                rel_path = os.path.relpath(file_path, state["codebase_path"])
+                try:
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as handle:
+                        for line_number, line in enumerate(handle, start=1):
+                            lowered = line.lower()
+                            for pattern, cwe_type, confidence in suspicious_patterns:
+                                if pattern in lowered:
+                                    findings.append(VulnerabilityState(
+                                        cve_id=None,
+                                        filepath=rel_path,
+                                        line_number=line_number,
+                                        cwe_type=cwe_type,
+                                        code_chunk=line.strip(),
+                                        llm_verdict="",
+                                        llm_explanation="",
+                                        confidence=confidence,
+                                        pov_script=None,
+                                        pov_path=None,
+                                        pov_result=None,
+                                        retry_count=0,
+                                        inference_time_s=0.0,
+                                        cost_usd=0.0,
+                                        final_status="",
+                                        detected_language=state.get("detected_language", "unknown"),
+                                        source="heuristic",
+                                        model_used=None,
+                                        prompt_tokens=0,
+                                        completion_tokens=0,
+                                        total_tokens=0,
+                                        sifter_model=None,
+                                        sifter_tokens=None,
+                                        architect_model=None,
+                                        architect_tokens=None,
+                                        validation_result=None,
+                                        refinement_history=[],
+                                        exploit_contract=None,
+                                        execution_profile=None,
+                                    ))
+                                    break
+                except Exception:
+                    continue
+
+        deduped = self._merge_findings([], findings)
+        deduped.sort(key=lambda item: item.get("confidence", 0.0), reverse=True)
+        self._log(state, f"Heuristic fallback produced {len(deduped)} candidate findings")
+        return deduped[:settings.DISCOVERY_MAX_FINDINGS]
+
     def _run_llm_only_analysis(self, state: ScanState) -> List[VulnerabilityState]:
         """
         Run LLM-only analysis when CodeQL is not available.
@@ -634,6 +701,7 @@ class AgentGraph:
         state["total_cost_usd"] += finding["cost_usd"]
         
         state["findings"][idx] = finding
+        self._sync_findings_runtime(state, include_status=True)
         
         self._log(state, f"  Verdict: {finding['llm_verdict']} (confidence: {finding['confidence']:.2f})")
         if finding["total_tokens"] > 0:
@@ -717,15 +785,18 @@ class AgentGraph:
                 executor.submit(self._investigate_finding_batch, batch, state, model_to_use): i
                 for i, batch in enumerate(batches)
             }
+            completed_batches = 0
             
             for future in as_completed(futures):
                 batch_idx = futures[future]
                 try:
                     batch_results = future.result()
                     all_results.extend(batch_results)
-                    self._log(state, f"Completed batch {batch_idx + 1}/{len(batches)}")
+                    completed_batches += 1
+                    self._log(state, f"Completed investigation batch {completed_batches}/{len(batches)} (worker batch {batch_idx + 1})")
                 except Exception as e:
-                    self._log(state, f"Batch {batch_idx} failed: {e}")
+                    completed_batches += 1
+                    self._log(state, f"Investigation batch {completed_batches}/{len(batches)} failed (worker batch {batch_idx + 1}): {e}")
         
         # Update state with results
         for result in all_results:
@@ -747,6 +818,7 @@ class AgentGraph:
         state["current_finding_idx"] = 0
         
         self._log(state, f"Parallel investigation complete. Total tokens: {total_tokens}, Cost: ${total_cost:.4f}")
+        self._sync_findings_runtime(state, include_status=True, progress=45)
         
         return state
     
@@ -854,6 +926,7 @@ class AgentGraph:
             self._log(state, f"Skipping PoV generation because confidence {confidence:.2f} is below the proof threshold {settings.MIN_CONFIDENCE_FOR_POV:.2f}")
             finding["final_status"] = "unproven_low_confidence"
             state["findings"][idx] = finding
+            self._sync_findings_runtime(state, include_status=True)
             return state
         
         self._log(state, f"Generating PoV for {finding['cwe_type']}...")
@@ -952,6 +1025,7 @@ class AgentGraph:
             self._log(state, f"  PoV generation failed: {result.get('error')}")
         
         state["findings"][idx] = finding
+        self._sync_findings_runtime(state, include_status=True)
         return state
     
     def _node_validate_pov(self, state: ScanState) -> ScanState:
@@ -976,6 +1050,7 @@ class AgentGraph:
                 "unit_test_result": None,
             }
             state["findings"][idx] = finding
+            self._sync_findings_runtime(state, include_status=True)
             return state
         
         self._log(state, "Validating PoV script...")
@@ -1030,6 +1105,7 @@ class AgentGraph:
         self._append_scan_openrouter_usage(state, result.get("openrouter_usage"), "llm_validation", finding=finding)
         
         state["findings"][idx] = finding
+        self._sync_findings_runtime(state, include_status=True)
         return state
 
     def _node_refine_pov(self, state: ScanState) -> ScanState:
@@ -1157,6 +1233,7 @@ class AgentGraph:
             finding["retry_count"] += 1
         
         state["findings"][idx] = finding
+        self._sync_findings_runtime(state, include_status=True)
         return state
 
     def _node_run_in_docker(self, state: ScanState) -> ScanState:
@@ -1191,6 +1268,7 @@ class AgentGraph:
             }
             self._log(state, "VULNERABILITY CONFIRMED")
             state["findings"][idx] = finding
+            self._sync_findings_runtime(state, include_status=True)
             return state
 
         # Static validation is advisory only; runtime evidence is still required
@@ -1211,6 +1289,7 @@ class AgentGraph:
                 "timestamp": datetime.utcnow().isoformat()
             }
             state["findings"][idx] = finding
+            self._sync_findings_runtime(state, include_status=True)
             return state
 
         execution_profile = self._infer_runtime_profile(finding, state)
@@ -1246,7 +1325,8 @@ class AgentGraph:
                 pov_id=str(idx),
                 execution_profile=execution_profile,
                 target_language=target_language,
-                exploit_contract=finding.get("exploit_contract") or {}
+                exploit_contract=finding.get("exploit_contract") or {},
+                codebase_path=state.get("codebase_path"),
             )
             finding["pov_result"] = result
 
@@ -1254,11 +1334,14 @@ class AgentGraph:
 
         if result["vulnerability_triggered"]:
             self._log(state, "VULNERABILITY TRIGGERED")
+        elif result.get("proof_infrastructure_error"):
+            self._log(state, f"  PoV runtime infrastructure error ({result.get('validation_method', 'runtime')}): {result.get('failure_reason') or result.get('stderr', 'unknown error')}")
         else:
             self._log(state, f"  PoV did not trigger vulnerability (exit code: {result['exit_code']})")
 
 
         state["findings"][idx] = finding
+        self._sync_findings_runtime(state, include_status=True)
         return state
 
     def _node_log_confirmed(self, state: ScanState) -> ScanState:
@@ -1266,6 +1349,7 @@ class AgentGraph:
         idx = state.get("current_finding_idx", 0)
         if idx < len(state["findings"]):
             state["findings"][idx]["final_status"] = "confirmed"
+            self._sync_findings_runtime(state, include_status=True)
             # Track confirmed count for early termination
             state["confirmed_count"] = state.get("confirmed_count", 0) + 1
             self._log(state, f"Confirmed vulnerability #{state['confirmed_count']}: {state['findings'][idx].get('cwe_type', 'UNCLASSIFIED')}")
@@ -1289,6 +1373,7 @@ class AgentGraph:
         if idx < len(state["findings"]):
             if not state["findings"][idx].get("final_status"):
                 state["findings"][idx]["final_status"] = "skipped"
+                self._sync_findings_runtime(state, include_status=True)
         
         # Move to next finding
         state["current_finding_idx"] = idx + 1
@@ -1306,6 +1391,7 @@ class AgentGraph:
         idx = state.get("current_finding_idx", 0)
         if idx < len(state["findings"]):
             state["findings"][idx]["final_status"] = "failed"
+            self._sync_findings_runtime(state, include_status=True)
         
         # Move to next finding
         state["current_finding_idx"] = idx + 1
@@ -1345,6 +1431,8 @@ class AgentGraph:
                 finding["final_status"] = "unproven_lite"
             else:
                 finding["final_status"] = "skipped_lite"
+            state["findings"][idx] = finding
+            self._sync_findings_runtime(state, include_status=True)
             self._log(state, f"LITE MODE: Finding {idx} status={finding['final_status']} (no exploit proof attempted)")
             return "log_skip"
         
@@ -1364,21 +1452,27 @@ class AgentGraph:
             finding["llm_verdict"] = "REAL"
             finding["llm_explanation"] = f"Trusted finding from {source} static analysis with {confidence:.0%} confidence"
             state["findings"][idx] = finding
+            self._sync_findings_runtime(state, include_status=True)
             verdict = "REAL"
         
-        # Only generate PoV for findings that meet minimum confidence threshold
-        if verdict == "REAL" and confidence >= settings.MIN_CONFIDENCE_FOR_POV:
+        proof_threshold = max(0.65, settings.MIN_CONFIDENCE_FOR_POV)
+        # Generate PoV for all REAL findings that meet the exploit-attempt threshold.
+        if verdict == "REAL" and confidence >= proof_threshold:
             if state.get("proofs_attempted", 0) >= settings.PROOF_MAX_FINDINGS:
                 finding["final_status"] = "unproven_budget_exhausted"
+                state["findings"][idx] = finding
+                self._sync_findings_runtime(state, include_status=True)
                 self._log(state, f"Proof budget reached ({settings.PROOF_MAX_FINDINGS}); recording finding without runtime proof")
                 return "log_skip"
             state["proofs_attempted"] = state.get("proofs_attempted", 0) + 1
-            self._log(state, f"Finding {idx} is REAL with high confidence, generating PoV")
+            self._log(state, f"Finding {idx} is REAL and above proof threshold ({confidence:.2f} >= {proof_threshold:.2f}); generating PoV")
             self._update_scan_runtime(state, status=ScanStatus.GENERATING_POV, progress=min(92, 50 + idx * 3))
             return "generate_pov"
         else:
             if verdict == "REAL":
                 finding["final_status"] = "unproven_low_confidence"
+                state["findings"][idx] = finding
+                self._sync_findings_runtime(state, include_status=True)
             self._log(state, f"Finding {idx} skipped (verdict={verdict}, confidence={confidence:.2f})")
             return "log_skip"
     
@@ -1470,6 +1564,21 @@ class AgentGraph:
             get_scan_manager().update_scan(state["scan_id"], **serializable)
         except Exception as e:
             print(f"[AgentGraph] Failed to update scan runtime: {e}")
+
+    def _sync_findings_runtime(self, state: Optional[ScanState], *, include_status: bool = False, progress: Optional[int] = None):
+        if state is None or not state.get("scan_id"):
+            return
+        updates = {
+            "findings": state.get("findings", []),
+            "current_finding_idx": state.get("current_finding_idx", 0),
+            "total_tokens": state.get("total_tokens", 0),
+            "total_cost_usd": state.get("total_cost_usd", 0.0),
+        }
+        if include_status and state.get("status") is not None:
+            updates["status"] = state.get("status")
+        if progress is not None:
+            updates["progress"] = progress
+        self._update_scan_runtime(state, **updates)
 
     def _log(self, state: Optional[ScanState], message: str):
         """Add log message to state and stream to scan manager in real-time"""

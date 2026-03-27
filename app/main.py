@@ -766,6 +766,40 @@ async def get_scan_status(
     )
 
 
+@app.get("/api/scan/{scan_id}/artifacts/{finding_index}")
+async def list_finding_artifacts(
+    scan_id: str,
+    finding_index: int,
+    auth: tuple = Depends(verify_api_key_or_system)
+):
+    """List saved proof artifact files for a specific finding."""
+    scan_manager = get_scan_manager()
+    files = scan_manager.list_proof_artifacts(scan_id, finding_index)
+    artifact_dir = scan_manager.get_proof_artifact_dir(scan_id, finding_index)
+    if not files or not artifact_dir:
+        raise HTTPException(status_code=404, detail="Proof artifacts not found for this finding")
+    return {
+        "scan_id": scan_id,
+        "finding_index": finding_index,
+        "artifact_dir": artifact_dir,
+        "files": files,
+    }
+
+
+@app.get("/api/scan/{scan_id}/artifacts/{finding_index}/file")
+async def get_finding_artifact_file(
+    scan_id: str,
+    finding_index: int,
+    name: str,
+    auth: tuple = Depends(verify_api_key_or_system)
+):
+    """Read a saved proof artifact file for a specific finding."""
+    artifact = get_scan_manager().read_proof_artifact(scan_id, finding_index, name)
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Artifact file not found")
+    return artifact
+
+
 @app.get("/api/scan/{scan_id}/stream")
 async def stream_scan_logs(
     scan_id: str,

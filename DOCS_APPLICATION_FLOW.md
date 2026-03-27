@@ -1,241 +1,241 @@
-# AutoPoV — Agent Workflow and System Behaviour
+# AutoPoV Application Flow
 
-This document describes how the AutoPoV agent system behaves from the moment a scan is triggered through to final report delivery. Every stage is executed autonomously by a specialised agent.
+This document describes how the project works today, based on the current FastAPI backend, LangGraph workflow, CLI, and React frontend.
 
----
+## Entry Points
 
-## Agent System Overview
+A scan can currently start from:
 
-AutoPoV is a **multi-agent system** built on a LangGraph state machine. The graph is compiled once at startup and persists as a singleton. When a scan is submitted, the graph is invoked with an initial state and runs to completion without external prompting — each agent node perceives the current state, acts, and passes control to the next agent via conditional routing edges.
+- `POST /api/scan/git`
+- `POST /api/scan/zip`
+- `POST /api/scan/paste`
+- GitHub or GitLab webhook endpoints
+- the web UI
+- the CLI in `cli/autopov.py`
 
-The full agent loop:
+All scan-triggering API endpoints create a scan immediately and then continue work asynchronously in a background task.
 
-```
-Perceive (read state) → Decide (route condition) → Act (call tool / LLM) → Observe (update state) → Route → repeat
-```
+## Authentication and Request Handling
 
----
+There are two distinct access patterns:
 
-## Phase 1 — Scan Intake
+- Browser UI:
+  - requests come from an allowed frontend origin
+  - the backend sets an `autopov_csrf` cookie
+  - mutating requests must send the matching `X-CSRF-Token`
+  - the backend system key is used internally, so a user API key is not required for standard web usage
+- External clients:
+  - use Bearer API keys
+  - scan-triggering routes are rate-limited to 10 scans per 60 seconds per key
 
-A scan is triggered in one of four ways:
+For SSE log streaming, token auth can also be supplied via query string for EventSource compatibility.
 
-| Entry Point | Endpoint | Source |
-|---|---|---|
-| Git repository | `POST /api/scan/git` | Cloned from URL |
-| ZIP archive | `POST /api/scan/zip` | Uploaded file |
-| Raw code paste | `POST /api/scan/paste` | Inline string |
-| Webhook event | `POST /api/webhook/github` or `/gitlab` | Push / PR event |
+## Scan Creation
 
-The API layer:
-1. Validates the API key (SHA-256 hash comparison) and checks the per-key rate limit (10 agent runs/min)
-2. Creates a scan record with a UUID `scan_id` and initial status `created`
-3. Resolves the source — clones the repo, extracts the ZIP, or saves the raw code to a workspace path
-4. Dispatches the agent graph as a background task using a dedicated event loop
-5. Returns `{"scan_id": "..."}` immediately — the agents run asynchronously
+When a scan is created:
 
----
+1. `ScanManager.create_scan()` allocates a UUID scan ID.
+2. The active scan record is persisted to `results/runs/active/<scan_id>.json`.
+3. The scan is initialized with `status="created"` and `progress=0`.
+4. A background task prepares the source input and starts the LangGraph workflow.
 
-## Phase 2 — Ingestion Agent
+Git scans additionally move through `checking` and `cloning` states before analysis begins.
 
-**Node:** `ingest_code`
+## Source Preparation
 
-The Ingestion Agent prepares the codebase for semantic retrieval by all downstream agents:
+Current source handling:
 
-- Walks the file tree, ignoring non-code files and build artefacts
-- Splits each file into overlapping chunks (4000 chars, 200-char overlap)
-- Embeds each chunk using `openai/text-embedding-3-small` (online) or `sentence-transformers/all-MiniLM-L6-v2` (offline)
-- Stores chunks and embeddings in **ChromaDB** under a `scan_id`-scoped collection
-- Logs file and chunk counts in real time
+- Git:
+  - checks accessibility first
+  - clones to a scan-specific workspace
+- ZIP:
+  - stores the upload at `/tmp/autopov/<scan_id>/upload.zip`
+  - extracts it through the source handler
+- Paste:
+  - writes the supplied code to a temporary workspace
 
-This step is non-fatal — if embedding fails, agents continue with direct file reads.
+Once the source path is known, the scan manager starts the asynchronous graph run.
 
----
+## Model Resolution
 
-## Phase 3 — Discovery Agents
+The backend requires an explicit selected model.
 
-**Node:** `run_codeql`
+- If the request includes a model override, that model is used.
+- Otherwise the backend uses the saved selected model from Settings.
+- Online models require an OpenRouter key.
+- Offline models require the Ollama runtime and the selected model to be installed.
 
-Three discovery strategies run in sequence, and their findings are merged and deduplicated:
+The current curated model lists are:
 
-### 3a — CodeQL Static Discovery Agent
+- Online: `openai/gpt-5.2`, `anthropic/claude-opus-4.6`
+- Offline: `llama4`, `glm-4.7-flash`, `qwen3`
 
-If CodeQL is available:
-1. Detects the codebase language from file extensions (Python, JavaScript, Java, C/C++, Go, Ruby, PHP)
-2. Creates a CodeQL database from the source root
-3. Runs a language-specific `.ql` query for each requested CWE
-4. Parses the SARIF output — each result becomes a candidate finding with `confidence: 0.8`
-5. Cleans up the database after all queries complete
+## LangGraph Workflow
 
-If CodeQL is unavailable, the agent falls back to the LLM-only analysis path.
+The current graph in `app/agent_graph.py` is:
 
-### 3b — Heuristic Scout Agent
-
-Runs in parallel regardless of CodeQL availability:
-- Applies regex pattern libraries for each CWE across every code file
-- Fast, zero-cost — surfaces candidates the Investigator Agent must later confirm
-- Candidate confidence: `0.35`
-
-### 3c — LLM Scout Agent
-
-Runs if `SCOUT_LLM_ENABLED=true`:
-- Selects the largest files (up to `SCOUT_MAX_FILES`, default 25)
-- Sends batched file snippets to the reasoning model with a structured prompt requesting vulnerability candidates
-- Respects `SCOUT_MAX_COST_USD` — aborts if cost threshold is exceeded
-- Returns structured JSON with file path, line, CWE, reason, and confidence
-
-All three streams merge into a single deduplicated candidate list keyed on `(filepath, line_number, cwe_type)`.
-
----
-
-## Phase 4 — Investigator Agent
-
-**Node:** `investigate` (loops once per finding)
-
-The Investigator Agent performs deep analysis on each candidate in sequence:
-
-1. **Context retrieval** — fetches the code around the flagged line (±50 lines)
-2. **RAG retrieval** — queries ChromaDB for semantically related code chunks
-3. **Joern CPG analysis** (CWE-416 only) — runs Joern to trace use-after-free data flows
-4. **Reasoning** — sends the assembled context to the reasoning model with a structured investigation prompt
-5. **Verdict parsing** — extracts `REAL` / `FALSE_POSITIVE`, confidence score (0–1), explanation, and vulnerable code snippet
-6. **Cost tracking** — reads actual token usage from the API response and calculates cost per model pricing table
-7. **Learning Store write** — records model, CWE, language, verdict, confidence, and cost to `data/learning.db`
-
-The **Policy Agent** (`app/policy.py`) selects the reasoning model before each investigation call:
-- `auto` → OpenRouter routes automatically
-- `fixed` → uses `MODEL_NAME`
-- `learning` → queries the Learning Store for the model with the best confirmed/cost score for this CWE + language
-
-Only findings where `verdict == "REAL"` and `confidence >= 0.7` proceed to PoV generation.
-
----
-
-## Phase 5 — PoV Generator Agent
-
-**Node:** `generate_pov`
-
-For each confirmed finding, the PoV Generator Agent writes a working exploit:
-
-1. Retrieves full file content from ChromaDB or disk
-2. Detects the target language from the codebase
-3. Sends the vulnerable code, explanation, and language context to the reasoning model with a structured exploit-generation prompt
-4. The agent is instructed that the script **must print `VULNERABILITY TRIGGERED`** when it successfully triggers the vulnerability
-5. Stores the generated script in the finding state
-
-If generation fails, the finding is marked `pov_generation_failed`.
-
----
-
-## Phase 6 — Validation Agent
-
-**Node:** `validate_pov`
-
-The Validation Agent applies a **three-tier escalating proof strategy**:
-
-| Tier | Method | Condition |
-|---|---|---|
-| 1 | **Static analysis** | Checks the PoV script for correct exploit patterns and attack structure |
-| 2 | **Unit test execution** | Runs the PoV in an isolated Python/language harness and checks for `VULNERABILITY TRIGGERED` in output |
-| 3 | **Docker execution** | Fallback — runs the PoV in a sandboxed container with no network, 512 MB RAM cap, 1 CPU, 60s timeout |
-
-If static analysis achieves ≥ 80% confidence → confirmed without execution.
-If the unit test triggers the vulnerability → confirmed.
-Otherwise → Docker execution agent runs.
-
-If validation fails after `MAX_RETRIES` (default 2) attempts, the PoV Generator Agent is invoked again with feedback.
-
----
-
-## Phase 7 — Routing and Loop Logic
-
-After each finding is resolved (confirmed / skipped / failed), the graph's conditional router:
-
-1. Increments `current_finding_idx`
-2. Checks if more findings remain
-3. If yes → routes back to the Investigator Agent for the next finding
-4. If no → marks the scan `completed`, records `end_time`, and exits the graph
-
-This loop is the core of the agentic architecture — the graph is not a linear script but a stateful cycle that processes each finding through the full agent stack.
-
----
-
-## Phase 8 — Results and Reporting
-
-When the agent graph completes:
-
-- The Scan Manager serialises the final state to `results/runs/<scan_id>.json`
-- Appends a summary row to `results/runs/scan_history.csv`
-- Optionally saves a codebase snapshot to `results/snapshots/<scan_id>/` (if `SAVE_CODEBASE_SNAPSHOT=true`)
-- Confirmed PoV scripts are saved to `results/povs/`
-- The Report Generator can produce `results/<scan_id>_report.json` and `results/<scan_id>_report.pdf` on demand
-
----
-
-## Real-Time Agent Observability
-
-While the agent graph runs, every `_log()` call:
-1. Appends to `state["logs"]` in the LangGraph state
-2. Immediately writes to the Scan Manager's in-memory log buffer (thread-safe)
-3. Is streamed to subscribers via SSE at `GET /api/scan/<scan_id>/stream?api_key=...`
-
-Both the web dashboard and the CLI poll/stream these logs to surface what each agent is doing in real time.
-
----
-
-## Agent Model Routing and Self-Improvement
-
-The **Policy Agent** (`app/policy.py`) makes model routing decisions at two points:
-- Before each `investigate` node invocation
-- Before each `generate_pov` node invocation
-
-It queries the **Learning Store** (`data/learning.db`) for:
-```sql
--- Score = confirmed findings / (total cost + small constant)
-SELECT model, confirmed / (cost + 0.01) AS score
-FROM investigations
-WHERE cwe=? AND language=?
-GROUP BY model ORDER BY score DESC
+```text
+ingest_code
+  -> run_codeql
+  -> log_findings_count
+  -> investigate
+      -> generate_pov or log_skip
+  -> validate_pov
+      -> run_in_docker or refine_pov or log_failure
+  -> log_confirmed / log_skip / log_failure
+      -> investigate next finding or end
 ```
 
-In `learning` mode, the top-scoring model is selected automatically. The system improves with each scan — more data means better routing.
+The graph is stateful and processes findings one by one after discovery.
 
----
+## Stage 1: Mandatory Ingestion
 
-## API Surface
+`ingest_code` always attempts vector-store ingestion first.
 
-| Method | Endpoint | Auth | Description |
-|---|---|---|---|
-| `POST` | `/api/scan/git` | API Key | Trigger agent run on Git repo |
-| `POST` | `/api/scan/zip` | API Key | Trigger agent run on ZIP upload |
-| `POST` | `/api/scan/paste` | API Key | Trigger agent run on code paste |
-| `GET` | `/api/scan/{id}` | API Key | Poll agent run status + findings |
-| `GET` | `/api/scan/{id}/stream` | API Key (query param) | Stream live agent logs (SSE) |
-| `POST` | `/api/scan/{id}/cancel` | API Key | Cancel a running agent run |
-| `POST` | `/api/scan/{id}/replay` | API Key (rate-limited) | Replay findings against new models |
-| `GET` | `/api/history` | API Key | Paginated agent run history |
-| `GET` | `/api/report/{id}` | API Key | Download report (JSON or PDF) |
-| `GET` | `/api/learning/summary` | API Key | Agent performance stats |
-| `GET` | `/api/metrics` | API Key | System-wide scan metrics |
-| `GET` | `/api/config` | API Key | System config + tool availability |
-| `GET` | `/api/health` | None | Health check |
-| `POST` | `/api/keys/generate` | Admin Key | Mint a new API key |
-| `GET` | `/api/keys` | Admin Key | List all API keys |
-| `DELETE` | `/api/keys/{id}` | Admin Key | Revoke an API key |
-| `POST` | `/api/admin/cleanup` | Admin Key | Remove old result files |
-| `POST` | `/api/webhook/github` | HMAC | GitHub push → agent run |
-| `POST` | `/api/webhook/gitlab` | Token | GitLab push → agent run |
+Current behavior:
 
-Interactive API docs: `http://localhost:8000/api/docs`
+- `RAG_REQUIRED=true` makes ingestion mandatory
+- code is chunked and embedded
+- per-scan retrieval data is prepared for downstream investigation
+- if no source chunks are indexed, the scan fails instead of quietly continuing
 
----
+This is stricter than older docs that described ingestion as optional.
 
-## Authentication Model
+## Stage 2: Agentic Discovery
 
-| Key Type | Stored As | Used For | Validated By |
-|---|---|---|---|
-| Admin Key | Plaintext in `.env` | Key management endpoints | `hmac.compare_digest` (timing-safe) |
-| API Key | SHA-256 hash in `data/api_keys.json` | All agent operation endpoints | Hash comparison, debounced `last_used` writes |
+The graph then enters `run_codeql`, which now acts as the broader discovery stage rather than only a CodeQL-only pass.
 
-API keys are rate-limited to 10 agent runs per 60 seconds per key. `last_used` timestamps are batched in memory and flushed to disk every 30 seconds — not on every request.
+Discovery currently combines:
 
+- language profiling
+- CodeQL when available
+- Semgrep fallback or supplemental analysis
+- heuristic scouting
+- optional LLM scouting
+
+Findings are deduplicated before investigation. Discovery is open-ended by default, and scans are not created with a fixed CWE list.
+
+## Stage 3: Investigation
+
+`investigate` performs the deeper per-finding analysis.
+
+Typical inputs include:
+
+- file-local code context
+- retrieved RAG context
+- optional tool output such as Joern analysis when relevant
+- the currently selected model
+
+The investigator decides whether a candidate is credible enough to continue and records explanation, confidence, cost, and model usage metadata.
+
+## Stage 4: PoV Generation
+
+`generate_pov` creates an exploit or proof artifact for findings that pass the investigation threshold.
+
+The generated payload is stored in scan state and later included in result output if retained by validation and reporting.
+
+## Stage 5: Validation and Refinement
+
+`validate_pov` is the first validation stage.
+
+The current implementation can:
+
+- run static validation logic
+- use harness-based execution through the PoV tester
+- trigger a refinement loop when feedback indicates the PoV may be repairable
+
+If validation still needs runtime proof, the graph routes to `run_in_docker`.
+
+## Stage 6: Runtime Proof
+
+`run_in_docker` is the final proof stage when runtime confirmation is required.
+
+Docker proof is especially important when a finding cannot be confirmed from static reasoning or harness execution alone.
+
+## Stage 7: Logging and Iteration
+
+After each finding reaches a terminal per-finding state:
+
+- `log_confirmed`
+- `log_skip`
+- or `log_failure`
+
+the graph checks whether more findings remain. If so, it loops back to `investigate`. Otherwise it ends.
+
+## Persistence and Recovery
+
+The scan manager persists active state continuously.
+
+Current persistence behavior:
+
+- active scans are written under `results/runs/active/`
+- completed results are written under `results/runs/`
+- interrupted in-flight scans are restored as `interrupted` after backend restart
+- optional code snapshots are stored under `results/snapshots/<scan_id>/`
+
+This allows replay and postmortem inspection even when the original working directory is gone.
+
+## Result Generation
+
+When a scan completes, the backend stores:
+
+- overall scan status
+- logs
+- findings
+- language metadata
+- cost and token usage
+- proof metadata
+
+Reports can then be generated on demand as:
+
+- JSON
+- PDF
+
+through `GET /api/report/{scan_id}`.
+
+## Frontend Flow
+
+The React frontend follows this flow:
+
+1. Home page starts a scan from Git, ZIP, or pasted code.
+2. The app navigates to `/scan/<scan_id>`.
+3. The progress page polls `GET /api/scan/{scan_id}` every 2 seconds.
+4. It also opens an SSE connection to `/api/scan/{scan_id}/stream`.
+5. Terminal scan states redirect to `/results/<scan_id>`.
+6. Results view loads the saved result or falls back to report retrieval.
+
+The Settings page manages:
+
+- selected model and mode
+- optional OpenRouter key saved through the backend
+- API keys
+- webhook configuration
+
+## CLI Flow
+
+The CLI mirrors the same backend flow:
+
+- `scan` accepts Git URLs, ZIP files, and local directories
+- local directories are zipped before upload
+- `paste` reads from stdin
+- `results`, `history`, `report`, `cancel`, and `replay` operate against backend endpoints
+
+The CLI uses the selected backend model unless `--model` is provided.
+
+## Replay Flow
+
+Replay works from a previously saved scan result:
+
+1. the original findings are loaded
+2. optionally only confirmed findings are retained
+3. the backend reuses the original codebase path or a saved snapshot
+4. a new scan is created with preloaded findings
+
+Important current behavior: although the replay request schema accepts a list of models, the implementation currently launches replay scans using the backend's currently configured model.
+
+## Practical Notes
+
+- The app is discovery-first and CWE-agnostic by default.
+- The backend currently reports fixed routing in `/api/config`.
+- The web UI is first-party and CSRF-protected rather than API-key-driven.
+- CLI and external integrations still need API keys.

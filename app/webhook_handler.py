@@ -122,7 +122,7 @@ class WebhookHandler:
             
             result["repo_url"] = repo.get("clone_url")
             result["repo_name"] = repo.get("full_name")
-            result["pr_number"] = pr.get("number")
+            result["pr_number"] = pr.get("number") or payload.get("number")
             result["pr_title"] = pr.get("title")
             result["branch"] = pr.get("head", {}).get("ref")
             result["commit"] = pr.get("head", {}).get("sha")

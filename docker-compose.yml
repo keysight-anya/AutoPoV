@@ -19,6 +19,8 @@ services:
       - DOCKER_ENABLED=true
       - CODEQL_CLI_PATH=/usr/local/bin/codeql
       - OLLAMA_BASE_URL=http://ollama:11434
+      - HF_TOKEN=${HF_TOKEN}
+      - HUGGINGFACEHUB_API_TOKEN=${HF_TOKEN}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
       interval: 15s

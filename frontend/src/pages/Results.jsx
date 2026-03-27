@@ -199,6 +199,16 @@ export default function Results() {
   const totalLoc = result?.total_loc || result?.language_info?.total_loc || 0
   const provenFindings = useMemo(() => findings.filter(f => f.final_status === 'confirmed'), [findings])
   const povFindings = useMemo(() => findings.filter(f => f.pov_script || f.pov_result), [findings])
+  const realFindings = useMemo(() => findings.filter(f => f.llm_verdict === 'REAL'), [findings])
+  const failedFindings = useMemo(() => findings.filter(f => f.final_status === 'failed'), [findings])
+  const unprovenFindings = useMemo(
+    () => findings.filter(f => String(f.final_status || '').startsWith('unproven')),
+    [findings]
+  )
+  const falsePositiveFindings = useMemo(
+    () => findings.filter(f => f.llm_verdict === 'FALSE_POSITIVE' || f.final_status === 'skipped'),
+    [findings]
+  )
   const openrouterUsage = useMemo(() => collectOpenRouterUsage(findings, result?.scan_openrouter_usage || []), [findings, result])
 
   const counts = useMemo(() => {
@@ -209,11 +219,15 @@ export default function Results() {
 
   const filtered = useMemo(() => {
     let base = findings
+    if (viewFilter === 'real') base = realFindings
     if (viewFilter === 'confirmed') base = provenFindings
+    if (viewFilter === 'failed') base = failedFindings
+    if (viewFilter === 'unproven') base = unprovenFindings
+    if (viewFilter === 'false_positive') base = falsePositiveFindings
     if (viewFilter === 'pov') base = povFindings
     if (filter !== 'ALL') base = base.filter(f => getSeverity(f) === filter)
     return base
-  }, [findings, provenFindings, povFindings, filter, viewFilter])
+  }, [findings, realFindings, provenFindings, failedFindings, unprovenFindings, falsePositiveFindings, povFindings, filter, viewFilter])
 
   const downloadReport = async (format) => {
     try {
@@ -262,7 +276,7 @@ export default function Results() {
         padding: '10px 20px',
         background: 'var(--surface1)',
         borderBottom: '1px solid var(--border1)',
-        display: 'flex', alignItems: 'center', gap: 20,
+        display: 'flex', alignItems: 'center', gap: 20, flexWrap: 'wrap',
         flexShrink: 0,
         fontFamily: '"JetBrains Mono", monospace',
         fontSize: 10, letterSpacing: '.08em',
@@ -270,13 +284,25 @@ export default function Results() {
         <button type="button" onClick={() => setViewFilter('all')} style={statButtonStyle(viewFilter === 'all', 'var(--accent)')}>
           FINDINGS <span style={{ color: 'var(--accent)', marginLeft: 6 }}>{findings.length}</span>
         </button>
+        <button type="button" onClick={() => setViewFilter('real')} style={statButtonStyle(viewFilter === 'real', '#f59e0b')}>
+          REAL <span style={{ color: '#f59e0b', marginLeft: 6 }}>{realFindings.length}</span>
+        </button>
         <button type="button" onClick={() => setViewFilter('confirmed')} style={statButtonStyle(viewFilter === 'confirmed', '#22c55e')}>
           PROVEN <span style={{ color: '#22c55e', marginLeft: 6 }}>{provenFindings.length}</span>
+        </button>
+        <button type="button" onClick={() => setViewFilter('failed')} style={statButtonStyle(viewFilter === 'failed', '#f87171')}>
+          FAILED <span style={{ color: '#f87171', marginLeft: 6 }}>{failedFindings.length}</span>
+        </button>
+        <button type="button" onClick={() => setViewFilter('unproven')} style={statButtonStyle(viewFilter === 'unproven', '#fde047')}>
+          UNPROVEN <span style={{ color: '#fde047', marginLeft: 6 }}>{unprovenFindings.length}</span>
+        </button>
+        <button type="button" onClick={() => setViewFilter('false_positive')} style={statButtonStyle(viewFilter === 'false_positive', 'var(--text2)')}>
+          FALSE POS <span style={{ color: 'var(--text2)', marginLeft: 6 }}>{falsePositiveFindings.length}</span>
         </button>
         <button type="button" onClick={() => setViewFilter('pov')} style={statButtonStyle(viewFilter === 'pov', 'var(--accent)')}>
           PoVs <span style={{ color: 'var(--accent)', marginLeft: 6 }}>{povFindings.length}</span>
         </button>
-        <span style={{ color: 'var(--text3)', fontFamily: '"JetBrains Mono", monospace', fontSize: 9 }}>
+        <span style={{ color: 'var(--text3)', fontFamily: '"JetBrains Mono", monospace', fontSize: 9, marginLeft: 8 }}>
           FILES <span style={{ color: 'var(--text2)', marginLeft: 6 }}>{totalFiles}</span>
         </span>
         <span style={{ color: 'var(--text3)', fontFamily: '"JetBrains Mono", monospace', fontSize: 9 }}>
@@ -333,7 +359,15 @@ export default function Results() {
               [ NO FINDINGS FOR THIS FILTER ]
             </div>
           ) : (
-            filtered.map((f, idx) => <FindingCard key={`${f.filepath}:${f.line_number}:${f.cwe_type}:${idx}`} finding={f} forceExpanded={viewFilter === 'pov'} />)
+            filtered.map((f, idx) => (
+              <FindingCard
+                key={`${f.filepath}:${f.line_number}:${f.cwe_type}:${idx}`}
+                finding={f}
+                forceExpanded={viewFilter === 'pov'}
+                scanId={scanId}
+                findingIndex={findings.indexOf(f)}
+              />
+            ))
           )}
         </div>
       </div>

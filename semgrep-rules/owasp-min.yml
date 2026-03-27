@@ -1,7 +1,7 @@
 rules:
   - id: js-command-exec-signal
     languages: [javascript, typescript]
-    message: Security signal: process execution sink. Review whether attacker-controlled data can reach this call.
+    message: "Security signal: process execution sink. Review whether attacker-controlled data can reach this call."
     severity: ERROR
     pattern-either:
       - pattern: require("child_process").exec(...)
@@ -11,7 +11,7 @@ rules:
 
   - id: js-dynamic-exec-signal
     languages: [javascript, typescript]
-    message: Security signal: dynamic code execution sink. Review whether untrusted content can reach this call.
+    message: "Security signal: dynamic code execution sink. Review whether untrusted content can reach this call."
     severity: ERROR
     pattern-either:
       - pattern: eval(...)
@@ -19,7 +19,7 @@ rules:
 
   - id: js-dom-html-sink
     languages: [javascript, typescript]
-    message: Security signal: HTML injection sink. Review whether untrusted content can reach this DOM write.
+    message: "Security signal: HTML injection sink. Review whether untrusted content can reach this DOM write."
     severity: WARNING
     pattern-either:
       - pattern: $EL.innerHTML = $X
@@ -28,7 +28,7 @@ rules:
 
   - id: python-command-exec-signal
     languages: [python]
-    message: Security signal: process execution sink. Review whether attacker-controlled data can reach this call.
+    message: "Security signal: process execution sink. Review whether attacker-controlled data can reach this call."
     severity: ERROR
     pattern-either:
       - pattern: os.system(...)
@@ -38,7 +38,7 @@ rules:
 
   - id: python-dynamic-exec-signal
     languages: [python]
-    message: Security signal: dynamic code execution sink. Review whether untrusted content can reach this call.
+    message: "Security signal: dynamic code execution sink. Review whether untrusted content can reach this call."
     severity: ERROR
     pattern-either:
       - pattern: eval(...)
@@ -46,7 +46,7 @@ rules:
 
   - id: python-unsafe-deser-signal
     languages: [python]
-    message: Security signal: unsafe deserialization API. Review whether attacker-controlled data reaches this sink.
+    message: "Security signal: unsafe deserialization API. Review whether attacker-controlled data reaches this sink."
     severity: ERROR
     pattern-either:
       - pattern: pickle.loads(...)
@@ -55,7 +55,7 @@ rules:
 
   - id: c-unsafe-buffer-copy
     languages: [c, cpp]
-    message: Security signal: unsafe buffer copy or formatting primitive. Review bounds and caller control over sizes.
+    message: "Security signal: unsafe buffer copy or formatting primitive. Review bounds and caller control over sizes."
     severity: ERROR
     pattern-either:
       - pattern: strcpy(...)
@@ -65,7 +65,7 @@ rules:
 
   - id: c-format-string-signal
     languages: [c, cpp]
-    message: Security signal: possible attacker-controlled format string sink.
+    message: "Security signal: possible attacker-controlled format string sink."
     severity: WARNING
     pattern-either:
       - pattern: printf($X)

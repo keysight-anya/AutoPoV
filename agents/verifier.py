@@ -29,8 +29,13 @@ from app.config import settings
 from app.openrouter_client import OpenRouterReasoningChat, extract_usage_details
 from prompts import (
     format_pov_generation_prompt,
+    format_pov_generation_prompt_offline,
     format_pov_validation_prompt,
-    format_retry_analysis_prompt
+    format_pov_validation_prompt_offline,
+    format_retry_analysis_prompt,
+    format_retry_analysis_prompt_offline,
+    format_pov_refinement_prompt,
+    format_pov_refinement_prompt_offline,
 )
 from agents.static_validator import get_static_validator, ValidationResult
 from agents.unit_test_runner import get_unit_test_runner, TestResult
@@ -44,11 +49,7 @@ class VerificationError(Exception):
 class VulnerabilityVerifier:
     NATIVE_INVALID_ENTRYPOINTS = {
         "if", "for", "while", "switch", "return", "sizeof", "malloc", "calloc", "realloc", "free",
-        "memcpy", "memmove", "memset", "strcpy", "strncpy", "strcat", "strcmp", "unknown",
-    }
-    NATIVE_INVALID_ENTRYPOINTS = {
-        "if", "for", "while", "switch", "return", "sizeof", "malloc", "calloc", "realloc", "free",
-        "memcpy", "memmove", "memset", "strcpy", "strncpy", "strcat", "strcmp", "main-like",
+        "memcpy", "memmove", "memset", "strcpy", "strncpy", "strcat", "strcmp", "unknown", "main-like",
     }
     """Generates and validates PoV scripts"""
     
@@ -68,6 +69,34 @@ class VulnerabilityVerifier:
         if ext == '.py':
             return 'python'
         return ''
+
+    def _infer_pov_script_runtime(self, pov_script: str) -> str:
+        script = str(pov_script or '')
+        stripped = script.lstrip()
+        if stripped.startswith('<?php'):
+            return 'php'
+        if stripped.startswith('#!/bin/bash') or stripped.startswith('#!/usr/bin/env bash'):
+            return 'shell'
+        if stripped.startswith('#!/usr/bin/env node') or 'console.log(' in script or 'require(' in script or 'process.env' in script:
+            return 'javascript'
+        return 'python'
+
+    def _validate_pov_script_syntax(self, pov_script: str) -> Optional[str]:
+        runtime = self._infer_pov_script_runtime(pov_script)
+        try:
+            if runtime == 'python':
+                ast.parse(pov_script)
+                return None
+            if runtime == 'javascript':
+                syntax_check = get_unit_test_runner().validate_syntax(pov_script, runtime_profile='javascript')
+                if syntax_check.get('valid'):
+                    return None
+                return syntax_check.get('error') or 'JavaScript syntax error'
+            return None
+        except SyntaxError as e:
+            return str(e)
+        except Exception as e:
+            return str(e)
 
     def _extract_target_entrypoint(self, vulnerable_code: str, filepath: str) -> str:
         patterns = [
@@ -204,7 +233,50 @@ class VulnerabilityVerifier:
         return {"pov_script": pov_script, "exploit_contract": self._normalize_exploit_contract({}, cwe_type, explanation, vulnerable_code, filepath=filepath)}
 
     
-    def _get_llm(self, model_name: Optional[str] = None):
+    def _is_offline_model_selected(self, model_name: Optional[str] = None) -> bool:
+        selected_model = (model_name or settings.MODEL_NAME or '').strip()
+        return settings.is_offline_model(selected_model)
+
+    def _compact_text(self, value: str, max_chars: int) -> str:
+        text = (value or '').strip()
+        if max_chars <= 0 or len(text) <= max_chars:
+            return text
+        if max_chars <= 160:
+            return text[:max_chars].rstrip()
+        head = max_chars // 2
+        tail = max_chars - head - len('\n...\n')
+        return f"{text[:head].rstrip()}\n...\n{text[-max(0, tail):].lstrip()}"
+
+    def _trim_validation_errors(self, validation_errors: List[str], max_items: int, max_chars: int) -> List[str]:
+        trimmed = []
+        for item in (validation_errors or [])[:max_items]:
+            trimmed.append(self._compact_text(str(item), max_chars))
+        return trimmed
+
+    def _prepare_offline_pov_inputs(
+        self,
+        model_name: Optional[str],
+        purpose: str,
+        vulnerable_code: str,
+        explanation: str,
+        code_context: str,
+        failed_pov: str = '',
+        validation_errors: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        budget = settings.get_offline_pov_budget(model_name=model_name, purpose=purpose)
+        return {
+            'vulnerable_code': self._compact_text(vulnerable_code, budget['max_vulnerable_code_chars']),
+            'explanation': self._compact_text(explanation, budget['max_explanation_chars']),
+            'code_context': self._compact_text(code_context, budget['max_context_chars']),
+            'failed_pov': self._compact_text(failed_pov, budget['max_failed_pov_chars']),
+            'validation_errors': self._trim_validation_errors(
+                validation_errors or [],
+                budget['max_error_items'],
+                budget['max_validation_error_chars'],
+            ),
+        }
+
+    def _get_llm(self, model_name: Optional[str] = None, purpose: str = "general"):
         """Get LLM instance based on configuration"""
         llm_config = settings.get_llm_config(model_name=model_name)
         actual_model = model_name or llm_config["model"]
@@ -238,13 +310,14 @@ class VulnerabilityVerifier:
             if not OLLAMA_AVAILABLE:
                 raise VerificationError("Ollama not available. Install langchain-ollama")
             
+            offline_options = settings.get_ollama_generation_options(actual_model, purpose=purpose)
             llm = ChatOllama(
                 model=actual_model,
                 base_url=llm_config["base_url"],
                 temperature=0.2,
-                num_ctx=settings.OLLAMA_NUM_CTX,
-                num_predict=settings.OLLAMA_NUM_PREDICT,
-                client_kwargs={"timeout": (settings.OLLAMA_CONNECT_TIMEOUT_S, settings.OLLAMA_READ_TIMEOUT_S)}
+                num_ctx=offline_options["num_ctx"],
+                num_predict=offline_options["num_predict"],
+                client_kwargs=settings.get_ollama_client_kwargs(actual_model, purpose=purpose)
             )
             llm._autopov_model_name = actual_model
             
@@ -288,20 +361,39 @@ class VulnerabilityVerifier:
             pov_language = "python"
         
         try:
-            # Format prompt with language info
-            prompt = format_pov_generation_prompt(
-                cwe_type=cwe_type,
-                filepath=filepath,
-                line_number=line_number,
-                vulnerable_code=vulnerable_code,
-                explanation=explanation,
-                code_context=code_context,
-                target_language=target_language,
-                pov_language=pov_language
-            )
+            if self._is_offline_model_selected(model_name):
+                offline_inputs = self._prepare_offline_pov_inputs(
+                    model_name,
+                    "pov",
+                    vulnerable_code,
+                    explanation,
+                    code_context,
+                )
+                prompt = format_pov_generation_prompt_offline(
+                    cwe_type=cwe_type,
+                    filepath=filepath,
+                    line_number=line_number,
+                    vulnerable_code=offline_inputs["vulnerable_code"],
+                    explanation=offline_inputs["explanation"],
+                    code_context=offline_inputs["code_context"],
+                    target_language=target_language,
+                    pov_language=pov_language
+                )
+                llm = self._get_llm(model_name, purpose="pov")
+            else:
+                prompt = format_pov_generation_prompt(
+                    cwe_type=cwe_type,
+                    filepath=filepath,
+                    line_number=line_number,
+                    vulnerable_code=vulnerable_code,
+                    explanation=explanation,
+                    code_context=code_context,
+                    target_language=target_language,
+                    pov_language=pov_language
+                )
+                llm = self._get_llm(model_name)
             
             # Call LLM with specified model
-            llm = self._get_llm(model_name)
             messages = [
                 SystemMessage(content=f"You are a security researcher creating {pov_language} Proof-of-Vulnerability scripts."),
                 HumanMessage(content=prompt)
@@ -391,6 +483,12 @@ class VulnerabilityVerifier:
             "static_result": None,
             "unit_test_result": None
         }
+
+        syntax_error = self._validate_pov_script_syntax(pov_script)
+        if syntax_error:
+            result["is_valid"] = False
+            result["issues"].append(f"Syntax error: {syntax_error}")
+            return result
         
         # ===== STEP 1: Static Validation (Always run - fast) =====
         static_validator = get_static_validator()
@@ -419,14 +517,15 @@ class VulnerabilityVerifier:
             result["validation_method"] = "static_analysis"
             result["suggestions"].append(f"Static validation passed with {static_result.confidence:.0%} confidence")
             return result
-        
         # ===== STEP 2: Unit Test Validation (If the snippet is executable in the unit harness) =====
-        unit_test_supported = self._infer_runtime_profile_from_filepath(filepath) in {"python", "javascript", "node"} or bool(re.search(r"(^|\n)\s*(def\s+|function\s+|async\s+function\s+)", vulnerable_code or ""))
+        runtime_profile = self._infer_runtime_profile_from_filepath(filepath)
+        unit_test_supported = runtime_profile in {"python", "javascript", "node"} or bool(re.search(r"(^|\n)\s*(def\s+|function\s+|async\s+function\s+)", vulnerable_code or ""))
         if vulnerable_code and len(vulnerable_code) > 10 and unit_test_supported:
             unit_runner = get_unit_test_runner()
+            normalized_runtime = "javascript" if runtime_profile in {"javascript", "node"} else "python"
             
             # First check syntax
-            syntax_check = unit_runner.validate_syntax(pov_script)
+            syntax_check = unit_runner.validate_syntax(pov_script, runtime_profile=normalized_runtime)
             if not syntax_check["valid"]:
                 result["is_valid"] = False
                 result["issues"].append(f"Syntax error: {syntax_check['error']}")
@@ -438,7 +537,9 @@ class VulnerabilityVerifier:
                 vulnerable_code=vulnerable_code,
                 cwe_type=cwe_type,
                 scan_id=f"validate_{cwe_type}_{line_number}",
-                exploit_contract=exploit_contract or {}
+                exploit_contract=exploit_contract or {},
+                runtime_profile=normalized_runtime,
+                filepath=filepath,
             )
             
             # Extract oracle evidence from unit test details
@@ -622,15 +723,28 @@ class VulnerabilityVerifier:
         model_name: Optional[str] = None
     ) -> Dict[str, Any]:
         """Use LLM to validate PoV script"""
-        prompt = format_pov_validation_prompt(
-            pov_script=pov_script,
-            cwe_type=cwe_type,
-            filepath=filepath,
-            line_number=line_number,
-            exploit_contract=exploit_contract or {}
-        )
-        
-        llm = self._get_llm(model_name)
+        if self._is_offline_model_selected(model_name):
+            trimmed_script = self._compact_text(
+                pov_script,
+                settings.get_offline_pov_budget(model_name=model_name, purpose="validation")["max_failed_pov_chars"],
+            )
+            prompt = format_pov_validation_prompt_offline(
+                pov_script=trimmed_script,
+                cwe_type=cwe_type,
+                filepath=filepath,
+                line_number=line_number,
+                exploit_contract=exploit_contract or {}
+            )
+            llm = self._get_llm(model_name, purpose="validation")
+        else:
+            prompt = format_pov_validation_prompt(
+                pov_script=pov_script,
+                cwe_type=cwe_type,
+                filepath=filepath,
+                line_number=line_number,
+                exploit_contract=exploit_contract or {}
+            )
+            llm = self._get_llm(model_name)
         messages = [
             SystemMessage(content="You are validating security test scripts."),
             HumanMessage(content=prompt)
@@ -690,18 +804,31 @@ class VulnerabilityVerifier:
         Returns:
             Analysis result with suggestions
         """
-        prompt = format_retry_analysis_prompt(
-            cwe_type=cwe_type,
-            filepath=filepath,
-            line_number=line_number,
-            explanation=explanation,
-            failed_pov=failed_pov,
-            execution_output=execution_output,
-            attempt_number=attempt_number,
-            max_retries=max_retries
-        )
-        
-        llm = self._get_llm(model_name)
+        if self._is_offline_model_selected(model_name):
+            budget = settings.get_offline_pov_budget(model_name=model_name, purpose="retry")
+            prompt = format_retry_analysis_prompt_offline(
+                cwe_type=cwe_type,
+                filepath=filepath,
+                line_number=line_number,
+                explanation=self._compact_text(explanation, budget["max_explanation_chars"]),
+                failed_pov=self._compact_text(failed_pov, budget["max_failed_pov_chars"]),
+                execution_output=self._compact_text(execution_output, budget["max_context_chars"]),
+                attempt_number=attempt_number,
+                max_retries=max_retries
+            )
+            llm = self._get_llm(model_name, purpose="retry")
+        else:
+            prompt = format_retry_analysis_prompt(
+                cwe_type=cwe_type,
+                filepath=filepath,
+                line_number=line_number,
+                explanation=explanation,
+                failed_pov=failed_pov,
+                execution_output=execution_output,
+                attempt_number=attempt_number,
+                max_retries=max_retries
+            )
+            llm = self._get_llm(model_name)
         messages = [
             SystemMessage(content="You are analyzing failed security tests."),
             HumanMessage(content=prompt)
@@ -758,28 +885,51 @@ class VulnerabilityVerifier:
         Returns:
             Dictionary with refined PoV script and metadata
         """
-        from prompts import format_pov_refinement_prompt
-        
         start_time = datetime.utcnow()
         
         try:
-            # Format refinement prompt
-            prompt = format_pov_refinement_prompt(
-                cwe_type=cwe_type,
-                filepath=filepath,
-                line_number=line_number,
-                vulnerable_code=vulnerable_code,
-                explanation=explanation,
-                code_context=code_context,
-                failed_pov=failed_pov,
-                validation_errors=validation_errors,
-                attempt_number=attempt_number,
-                target_language=target_language,
-                exploit_contract=self._normalize_exploit_contract(exploit_contract or {}, cwe_type, explanation, vulnerable_code, filepath=filepath)
-            )
+            normalized_contract = self._normalize_exploit_contract(exploit_contract or {}, cwe_type, explanation, vulnerable_code, filepath=filepath)
+            if self._is_offline_model_selected(model_name):
+                offline_inputs = self._prepare_offline_pov_inputs(
+                    model_name,
+                    "refinement",
+                    vulnerable_code,
+                    explanation,
+                    code_context,
+                    failed_pov=failed_pov,
+                    validation_errors=validation_errors,
+                )
+                prompt = format_pov_refinement_prompt_offline(
+                    cwe_type=cwe_type,
+                    filepath=filepath,
+                    line_number=line_number,
+                    vulnerable_code=offline_inputs["vulnerable_code"],
+                    explanation=offline_inputs["explanation"],
+                    code_context=offline_inputs["code_context"],
+                    failed_pov=offline_inputs["failed_pov"],
+                    validation_errors=offline_inputs["validation_errors"],
+                    attempt_number=attempt_number,
+                    target_language=target_language,
+                    exploit_contract=normalized_contract
+                )
+                llm = self._get_llm(model_name, purpose="refinement")
+            else:
+                prompt = format_pov_refinement_prompt(
+                    cwe_type=cwe_type,
+                    filepath=filepath,
+                    line_number=line_number,
+                    vulnerable_code=vulnerable_code,
+                    explanation=explanation,
+                    code_context=code_context,
+                    failed_pov=failed_pov,
+                    validation_errors=validation_errors,
+                    attempt_number=attempt_number,
+                    target_language=target_language,
+                    exploit_contract=normalized_contract
+                )
+                llm = self._get_llm(model_name)
             
             # Call LLM with specified model
-            llm = self._get_llm(model_name)
             messages = [
                 SystemMessage(content="You are a security researcher fixing a failed Proof-of-Vulnerability script."),
                 HumanMessage(content=prompt)

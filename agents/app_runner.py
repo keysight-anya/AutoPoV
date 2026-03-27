@@ -2,6 +2,7 @@
 AutoPoV Application Runner Module
 Manages target application lifecycle for PoV testing
 """
+import json
 import os
 import shutil
 import socket
@@ -70,6 +71,53 @@ class ApplicationRunner:
                 if any(name.endswith(ext) for ext in extensions):
                     return os.path.join(root, name)
         return None
+    def _detect_node_start_command(self, app_path: str) -> Optional[list[str]]:
+        package_json = os.path.join(app_path, "package.json")
+        if not os.path.exists(package_json):
+            return None
+        try:
+            with open(package_json, 'r', encoding='utf-8') as f:
+                pkg = json.load(f)
+        except Exception:
+            return ["npm", "start"]
+
+        scripts = pkg.get("scripts", {}) if isinstance(pkg, dict) else {}
+        for script_name in ["start", "dev", "serve", "preview"]:
+            if script_name in scripts:
+                return ["npm", "run", script_name]
+        return ["npm", "start"]
+
+    def _detect_python_start_commands(self, app_path: str, entry: str, port: int) -> list[list[str]]:
+        commands = []
+        entry_name = os.path.basename(entry)
+        module_name = os.path.splitext(entry_name)[0]
+        entry_text = ''
+        try:
+            with open(entry, 'r', encoding='utf-8', errors='ignore') as f:
+                entry_text = f.read()
+        except Exception:
+            entry_text = ''
+
+        if entry_name == 'manage.py':
+            commands.append(["python3", entry, "runserver", f"0.0.0.0:{port}"])
+        if 'FastAPI(' in entry_text or 'Starlette(' in entry_text:
+            commands.append(["python3", "-m", "uvicorn", f"{module_name}:app", "--host", "0.0.0.0", "--port", str(port)])
+        if 'Flask(' in entry_text or 'app = Flask' in entry_text:
+            commands.append(["python3", entry])
+            commands.append(["python3", "-m", "flask", "--app", entry, "run", "--host", "0.0.0.0", "--port", str(port)])
+        if 'app =' in entry_text or 'if __name__ == "__main__"' in entry_text or "if __name__ == '__main__'" in entry_text:
+            commands.append(["python3", entry])
+        commands.append(["python3", entry])
+
+        seen = set()
+        unique_commands = []
+        for command in commands:
+            key = tuple(command)
+            if key not in seen:
+                seen.add(key)
+                unique_commands.append(command)
+        return unique_commands
+
     def start_nodejs_app(self, scan_id: str, app_path: str, port: int = 3000, start_timeout: int = 60) -> Dict[str, Any]:
         try:
             package_json = os.path.join(app_path, "package.json")
@@ -77,20 +125,22 @@ class ApplicationRunner:
                 return {"success": False, "error": f"No package.json found in {app_path}", "url": None, "process": None}
             node_modules = os.path.join(app_path, "node_modules")
             if not os.path.exists(node_modules):
-                install_result = subprocess.run(["npm", "install"], cwd=app_path, capture_output=True, text=True, timeout=120)
+                install_command = ["npm", "ci"] if os.path.exists(os.path.join(app_path, "package-lock.json")) else ["npm", "install"]
+                install_result = subprocess.run(install_command, cwd=app_path, capture_output=True, text=True, timeout=180)
                 if install_result.returncode != 0:
-                    return {"success": False, "error": f"npm install failed: {install_result.stderr}", "url": None, "process": None}
+                    return {"success": False, "error": f"{' '.join(install_command)} failed: {install_result.stderr or install_result.stdout}", "url": None, "process": None}
             env = os.environ.copy()
             env["PORT"] = str(port)
             env["HOST"] = "0.0.0.0"
-            process = subprocess.Popen(["npm", "start"], cwd=app_path, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+            command = self._detect_node_start_command(app_path) or ["npm", "start"]
+            process = subprocess.Popen(command, cwd=app_path, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
             url = f"http://localhost:{port}"
             if not self._wait_for_http_ready(url, start_timeout):
                 process.terminate()
-                return {"success": False, "error": f"Application failed to start within {start_timeout}s", "url": None, "process": None}
+                return {"success": False, "error": f"Application failed to start with {' '.join(command)} within {start_timeout}s", "url": None, "process": None}
             return self._register_running_app(scan_id, process, url, port, app_path, "nodejs")
         except subprocess.TimeoutExpired:
-            return {"success": False, "error": "Timeout during npm install", "url": None, "process": None}
+            return {"success": False, "error": "Timeout during npm dependency install", "url": None, "process": None}
         except Exception as e:
             return {"success": False, "error": str(e), "url": None, "process": None}
     def start_python_app(self, scan_id: str, app_path: str, port: int = 8001, start_timeout: int = 60) -> Dict[str, Any]:
@@ -104,12 +154,16 @@ class ApplicationRunner:
             env = os.environ.copy()
             env["PORT"] = str(port)
             env["HOST"] = "0.0.0.0"
-            process = subprocess.Popen(["python3", entry], cwd=app_path, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+            commands = self._detect_python_start_commands(app_path, entry, port)
+            last_error = ""
             url = f"http://localhost:{port}"
-            if not self._wait_for_http_ready(url, start_timeout):
+            for command in commands:
+                process = subprocess.Popen(command, cwd=app_path, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+                if self._wait_for_http_ready(url, start_timeout):
+                    return self._register_running_app(scan_id, process, url, port, app_path, "python")
                 process.terminate()
-                return {"success": False, "error": f"Application failed to start within {start_timeout}s", "url": None, "process": None}
-            return self._register_running_app(scan_id, process, url, port, app_path, "python")
+                last_error = f"Application failed to start with {' '.join(command)} within {start_timeout}s"
+            return {"success": False, "error": last_error or f"Application failed to start within {start_timeout}s", "url": None, "process": None}
         except Exception as e:
             return {"success": False, "error": str(e), "url": None, "process": None}
     def _collect_native_sources(self, app_path: str, language: str) -> list[str]:
@@ -153,6 +207,9 @@ class ApplicationRunner:
                 candidates.append((score, full))
         candidates.sort(reverse=True)
         return [full for _, full in candidates]
+    def _select_existing_native_binary(self, app_path: str) -> Optional[str]:
+        artifacts = self._find_native_artifacts(app_path)
+        return artifacts[0] if artifacts else None
     def _run_native_build_command(self, command: list[str], cwd: str, timeout: int = 300, env: Optional[Dict[str, str]] = None) -> tuple[bool, str]:
         result = subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
         output = '\n'.join(part for part in [result.stdout, result.stderr] if part)
@@ -202,6 +259,8 @@ class ApplicationRunner:
             if not ok:
                 continue
             artifacts = self._find_native_artifacts(app_path, build_started_at)
+            if not artifacts:
+                artifacts = self._find_native_artifacts(app_path)
             if artifacts:
                 return {
                     'success': True,
@@ -227,6 +286,31 @@ class ApplicationRunner:
             if not sources:
                 return {"success": False, "error": f"No {language} source files found in {app_path}", "binary_path": None}
             if len(sources) > 1:
+                compiler = 'gcc' if language == 'c' else 'g++'
+                if shutil.which(compiler):
+                    binary_path = os.path.join('/tmp', f'autopov_{scan_id}_{language}_target')
+                    result = subprocess.run(
+                        [compiler, *sources, '-O0', '-g', '-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-o', binary_path],
+                        cwd=app_path,
+                        capture_output=True,
+                        text=True,
+                        timeout=180,
+                    )
+                    if result.returncode == 0:
+                        return {
+                            'success': True,
+                            'error': None,
+                            'binary_path': binary_path,
+                            'build_method': 'all-sources-compile',
+                        }
+                existing_binary = self._select_existing_native_binary(app_path)
+                if existing_binary:
+                    return {
+                        'success': True,
+                        'error': None,
+                        'binary_path': existing_binary,
+                        'build_method': 'existing-artifact',
+                    }
                 return {
                     "success": False,
                     "error": "Multiple native source files detected but no supported build context produced an executable; refusing naive single-file compilation.\n" + (project_build.get('build_log') or ''),

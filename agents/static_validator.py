@@ -4,6 +4,7 @@ Validates PoV scripts using static code analysis without execution.
 """
 
 import re
+from pathlib import Path
 from typing import Dict, Any, List
 from dataclasses import dataclass
 
@@ -101,7 +102,7 @@ class StaticValidator:
         if found_indicators:
             matched_patterns.append(f"indicators: {', '.join(found_indicators)}")
 
-        generic_signals = self._generic_validation_signals(pov_script, vulnerable_code, exploit_contract)
+        generic_signals = self._generic_validation_signals(pov_script, vulnerable_code, exploit_contract, filepath=filepath)
         matched_patterns.extend(generic_signals['matches'])
         issues.extend(generic_signals['issues'])
 
@@ -128,11 +129,13 @@ class StaticValidator:
                 matches.append(str(item))
         return matches
 
-    def _generic_validation_signals(self, pov_script: str, vulnerable_code: str, exploit_contract: Dict[str, Any]) -> Dict[str, List[str]]:
+    def _generic_validation_signals(self, pov_script: str, vulnerable_code: str, exploit_contract: Dict[str, Any], filepath: str = '') -> Dict[str, List[str]]:
         matches: List[str] = []
         issues: List[str] = []
         pov_lower = pov_script.lower()
         vuln_lower = (vulnerable_code or '').lower()
+        ext = Path(filepath or '').suffix.lower()
+        is_native = ext in {'.c', '.h', '.cc', '.cpp', '.cxx', '.hpp'} or any(term in vuln_lower for term in ['malloc', 'free', 'memcpy', 'strcpy', 'sizeof'])
 
         suspicious_terms = ['payload', 'exploit', 'trigger', 'input', 'request', 'query', 'command', 'path', 'token', 'header', 'free', 'buffer']
         shared_terms = [term for term in suspicious_terms if term in pov_lower and term in vuln_lower]
@@ -146,10 +149,21 @@ class StaticValidator:
             else:
                 issues.append('PoV does not reference the target entrypoint from the exploit contract')
 
-        if any(word in pov_lower for word in ['assert', 'sys.exit', 'raise', 'print(']):
+        observable_tokens = ['assert', 'sys.exit', 'raise', 'print(']
+        if is_native:
+            observable_tokens.extend(['subprocess.run', 'target_binary', 'target_bin', 'mqjs_bin', 'addresssanitizer', 'undefinedbehaviorsanitizer'])
+        if any(word in pov_lower for word in observable_tokens):
             matches.append('contains_observable_outcome_logic')
         else:
             issues.append('PoV lacks a clear observable outcome check')
+
+        if is_native:
+            native_markers = ['target_binary', 'target_bin', 'mqjs_bin', 'subprocess.run', 'stdin', 'argv', 'input_file', 'addresssanitizer', 'undefinedbehaviorsanitizer']
+            found_native = [marker for marker in native_markers if marker in pov_lower]
+            if found_native:
+                matches.append(f"native_execution_signals: {', '.join(found_native[:4])}")
+            else:
+                issues.append('Native PoV does not appear to execute or target a compiled binary')
 
         return {'matches': matches, 'issues': issues}
 
@@ -158,13 +172,13 @@ class StaticValidator:
             return 0.5
         vulnerable_lower = (vulnerable_code or '').lower()
         pov_lower = pov_script.lower()
-        keywords = ['function', 'def', 'class', 'route', 'endpoint', 'query', 'execute', 'render', 'template', 'user', 'input', 'request', 'free', 'malloc', 'buffer', 'path']
+        keywords = ['function', 'def', 'class', 'route', 'endpoint', 'query', 'execute', 'render', 'template', 'user', 'input', 'request', 'free', 'malloc', 'buffer', 'path', 'argc', 'argv', 'stdin', 'fopen', 'read', 'write']
         matches = sum(1 for keyword in keywords if keyword in vulnerable_lower and keyword in pov_lower)
         for item in exploit_contract.get('inputs', []) + exploit_contract.get('trigger_steps', []) + [exploit_contract.get('target_entrypoint', '')]:
             token = str(item).strip().lower()
             if token and token in pov_lower:
                 matches += 1
-        return min(matches / 4, 1.0)
+        return min(matches / 5, 1.0)
 
     def _calculate_confidence(self, matched_count: int, issue_count: int, has_vuln_check: bool, code_relevance: float, has_contract_signal: bool, generic_mode: bool) -> float:
         base_score = 0.25

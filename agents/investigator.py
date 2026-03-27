@@ -92,12 +92,15 @@ class VulnerabilityInvestigator:
             
             callbacks = [self._tracer] if self._tracer else None
             
+            generation_options = settings.get_ollama_generation_options(actual_model, purpose="general")
             llm = ChatOllama(
                 model=actual_model,
                 base_url=llm_config["base_url"],
                 temperature=0.1,
                 callbacks=callbacks,
-                client_kwargs={"timeout": (settings.OLLAMA_CONNECT_TIMEOUT_S, settings.OLLAMA_READ_TIMEOUT_S)}
+                num_ctx=generation_options["num_ctx"],
+                num_predict=generation_options["num_predict"],
+                client_kwargs=settings.get_ollama_client_kwargs(actual_model)
             )
             
             llm._autopov_model_name = actual_model
