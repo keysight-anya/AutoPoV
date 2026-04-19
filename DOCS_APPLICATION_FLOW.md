@@ -4,16 +4,17 @@ This document describes how the project works today, based on the current FastAP
 
 ## Entry Points
 
-A scan can currently start from:
+A scan can start from:
 
-- `POST /api/scan/git`
-- `POST /api/scan/zip`
-- `POST /api/scan/paste`
+- `POST /api/scan/git` — GitHub or GitLab repository URL
+- `POST /api/scan/zip` — uploaded ZIP or TAR archive (`.zip`, `.tar`, `.tar.gz`, `.tar.bz2`, `.tar.xz`)
+- `POST /api/scan/paste` — raw pasted code (single code chunk, any supported language)
+- `POST /api/scan/benchmark` — pre-installed benchmark target
 - GitHub or GitLab webhook endpoints
-- the web UI
+- the web UI (Home page: Git URL tab, ZIP upload tab, or Paste tab)
 - the CLI in `cli/autopov.py`
 
-All scan-triggering API endpoints create a scan immediately and then continue work asynchronously in a background task.
+All scan-triggering API endpoints create a scan record immediately and continue work asynchronously in a background task.
 
 ## Authentication and Request Handling
 
@@ -43,18 +44,23 @@ Git scans additionally move through `checking` and `cloning` states before analy
 
 ## Source Preparation
 
-Current source handling:
+All source input types are handled by `app/source_handler.py`:
 
-- Git:
-  - checks accessibility first
-  - clones to a scan-specific workspace
-- ZIP:
-  - stores the upload at `/tmp/autopov/<scan_id>/upload.zip`
-  - extracts it through the source handler
-- Paste:
-  - writes the supplied code to a temporary workspace
+- **Git**: accessibility check → clone to scan-specific workspace via `app/git_handler.py`
+- **ZIP**: uploaded to `/tmp/autopov/<scan_id>/upload.zip` → extracted with path-traversal and compression-ratio validation; single root dir is flattened
+- **TAR / TAR.GZ / TAR.BZ2 / TAR.XZ**: same extraction pipeline as ZIP, symlinks rejected
+- **File upload**: individual files copied, directory structure optionally preserved
+- **Folder upload**: entire folder tree copied
+- **Paste / Code chunk**: raw code string written to a temporary file with the correct extension inferred from the declared language
 
-Once the source path is known, the scan manager starts the asynchronous graph run.
+Security limits applied during archive extraction:
+- Max upload size: `MAX_UPLOAD_SIZE_MB` (default 500MB)
+- Max decompressed size: `MAX_ARCHIVE_UNCOMPRESSED_MB`
+- Max file count: `MAX_ARCHIVE_FILES`
+- Max compression ratio: `MAX_ARCHIVE_COMPRESSION_RATIO` (bomb protection)
+- Path traversal and symlink rejection on every member
+
+Once the source path is resolved, the scan manager starts the asynchronous LangGraph run.
 
 ## Model Resolution
 
@@ -76,17 +82,19 @@ The current graph in `app/agent_graph.py` is:
 
 ```text
 ingest_code
-  -> run_codeql
+  -> run_codeql (discovery: CodeQL + Semgrep + heuristics + LLM scout)
   -> log_findings_count
-  -> investigate
+  -> probe_target (preflight: ASan build, binary name, surface, baseline)
+  -> investigate (per-finding LLM analysis + RAG + optional Joern)
       -> generate_pov or log_skip
-  -> validate_pov
-      -> run_in_docker or refine_pov or log_failure
+  -> validate_pov (static checks + harness)
+      -> coordinate_pov (retry meta-reasoning)
+      -> run_in_docker or refine_pov (x3) or log_failure
   -> log_confirmed / log_skip / log_failure
       -> investigate next finding or end
 ```
 
-The graph is stateful and processes findings one by one after discovery.
+The graph is stateful and processes findings sequentially after discovery.
 
 ## Stage 1: Mandatory Ingestion
 
@@ -115,7 +123,21 @@ Discovery currently combines:
 
 Findings are deduplicated before investigation. Discovery is open-ended by default, and scans are not created with a fixed CWE list.
 
-## Stage 3: Investigation
+## Stage 3: Preflight Probe
+
+`probe_target` runs before investigation and PoV generation.
+
+What it captures:
+
+- `probe_binary_name`: exact name of the built binary (e.g. `xmlwf`, `jhead`, `cjson`)
+- `probe_baseline_exit_code` and `probe_baseline_stderr`: clean-run reference for ASAN-disabled oracle fallback
+- `observed_surface`: `file_argument | stdin | argv_only | network | unknown` (inferred from help text)
+- `known_subcommands` and `help_text`: injected into PoV generation prompts
+- `asan_disabled`: set when ASan is not available (triggers exit-code-anomaly oracle path)
+
+Probe data flows into every downstream step: investigation prompts, PoV scaffold generation, refinement error injection, and oracle signal evaluation.
+
+## Stage 4: Investigation
 
 `investigate` performs the deeper per-finding analysis.
 
@@ -128,31 +150,75 @@ Typical inputs include:
 
 The investigator decides whether a candidate is credible enough to continue and records explanation, confidence, cost, and model usage metadata.
 
-## Stage 4: PoV Generation
+## Stage 5: PoV Generation
 
-`generate_pov` creates an exploit or proof artifact for findings that pass the investigation threshold.
+`generate_pov` creates an exploit script for findings that pass the investigation threshold.
 
-The generated payload is stored in scan state and later included in result output if retained by validation and reporting.
+Generation paths:
 
-## Stage 5: Validation and Refinement
+- **Deterministic harness fallback** (`_build_binary_surface_block`): format-aware file fuzzer using pre-built payload arrays (`.jpg`, `.png`, `.gif`, `.xml`, `.json`, `.bmp`, `.tif`, `.webp`, etc.), triggered when LLM context is too small or surface is well-known.
+- **C library harness** (`c_library_harness`): inline C driver for library-only targets (no standalone binary).
+- **LLM-generated script**: qwen3/glm-4.7-flash/llama4 via Ollama, or OpenRouter for online models. Prompt includes `probe_binary_name`, `observed_surface`, `help_text`, `known_subcommands`, and `repo_input_hints`.
 
-`validate_pov` is the first validation stage.
+All byte payloads in f-string templates use double-escaped literals (`\\xff`, `\\x00`) to prevent null-byte injection into generated Python source.
 
-The current implementation can:
+The generated PoV is stored in scan state.
 
-- run static validation logic
-- use harness-based execution through the PoV tester
-- trigger a refinement loop when feedback indicates the PoV may be repairable
+## Stage 6: Static Validation
 
-If validation still needs runtime proof, the graph routes to `run_in_docker`.
+`validate_pov` runs `static_validator.py` before any execution.
 
-## Stage 6: Runtime Proof
+Rejects:
 
-`run_in_docker` is the final proof stage when runtime confirmation is required.
+- Self-compile patterns: `subprocess.run.*cmake`, `subprocess.run.*gcc`, `subprocess.run.*make`, etc.
+- Wrong binary name: `TARGET_SYMBOL != probe_binary_name`
+- Empty `TARGET_BINARY` without fallback
+- Language mismatch
 
-Docker proof is especially important when a finding cannot be confirmed from static reasoning or harness execution alone.
+Allows execution to proceed; oracle decides the outcome.
 
-## Stage 7: Logging and Iteration
+## Stage 7: Retry Coordination
+
+`coordinate_pov` uses the selected model (via `get_verifier()._get_llm()`) to reason over the retry history and select one of:
+
+- `refine_payload`: try different byte payload
+- `refine_format`: change file format or input method
+- `change_surface`: switch from file to stdin or vice versa
+- `abandon`: skip this finding
+
+## Stage 8: Refinement
+
+`refine_pov` runs up to 3 times.
+
+## Stage 9: Runtime Proof
+
+`run_in_docker` executes the PoV in an isolated language-matched proof container.
+
+Container images available under `docker/proof-images/`:
+
+- `native` — C/C++ targets with ASan runtime
+- `python` — Python scripts
+- `node` — JavaScript/Node.js
+- `go` — Go binaries
+- `java` — Java/JVM
+- `php` — PHP scripts
+- `ruby` — Ruby scripts
+- `browser` — headless browser targets
+
+The binary locator inside `docker_runner.py` scores candidate binaries using CMake/Meson/Make build metadata, assigning -999 to test binaries and build tools to avoid false picks.
+
+## Stage 10: Oracle Evaluation
+
+Oracle signal classification in `agents/oracle_policy.py`:
+
+- `crash_signal`: SIGSEGV (139), SIGABRT (134), exit code -11, -6
+- `sanitizer_output`: AddressSanitizer `heap-buffer-overflow`, `use-after-free`, `stack-buffer-overflow`; UBSan output
+- `stdout_marker`: `VULNERABILITY TRIGGERED` in stdout
+- **ASAN-disabled fallback**: baseline exit clean (0/1/2) + exploit exited with signal code + ≥2 new meaningful stderr lines vs baseline
+- `non_evidence`: no crash signal; finding recorded as unproven
+- `ambiguous_signal`: partial evidence; low-confidence confirmation
+
+## Stage 11: Logging and Iteration
 
 After each finding reaches a terminal per-finding state:
 
@@ -236,6 +302,10 @@ Important current behavior: although the replay request schema accepts a list of
 ## Practical Notes
 
 - The app is discovery-first and CWE-agnostic by default.
-- The backend currently reports fixed routing in `/api/config`.
-- The web UI is first-party and CSRF-protected rather than API-key-driven.
-- CLI and external integrations still need API keys.
+- The backend reports fixed routing in `/api/config`; all LLM calls use the single selected model.
+- All LLM routing goes through `get_verifier()._get_llm(model, purpose)` — offline routes to Ollama, online to OpenRouter. No hardcoded model instantiation.
+- The web UI is first-party and CSRF-protected rather than API-key-driven for browser users.
+- CLI and external integrations need Bearer API keys; add them with `python3 add_api_key.py` and then restart the backend.
+- Archive uploads support `.zip`, `.tar`, `.tar.gz`, `.tar.bz2`, `.tar.xz` with security limits on size, file count, and compression ratio.
+- Paste/code-chunk scans write raw code to a temporary file with extension inferred from the declared language (supports 20+ languages).
+- The preflight probe is the single authoritative source for binary name, input surface, baseline signals, and help text — all fed downstream to generation and oracle evaluation.

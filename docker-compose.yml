@@ -18,7 +18,8 @@ services:
       - API_PORT=8000
       - DOCKER_ENABLED=true
       - CODEQL_CLI_PATH=/usr/local/bin/codeql
-      - OLLAMA_BASE_URL=http://ollama:11434
+      #- OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
       - HF_TOKEN=${HF_TOKEN}
       - HUGGINGFACEHUB_API_TOKEN=${HF_TOKEN}
     healthcheck:
@@ -30,6 +31,7 @@ services:
     restart: unless-stopped
 
   ollama:
+    profiles: ["docker-ollama"]
     image: ollama/ollama:latest
     container_name: autopov-ollama
     ports:

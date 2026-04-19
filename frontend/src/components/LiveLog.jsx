@@ -2,10 +2,11 @@
 import { useEffect, useRef } from 'react'
 
 const LOG_COLOR = (msg) => {
-  if (/error|failed|exception/i.test(msg))               return '#fca5a5'  // red
-  if (/success|confirmed|completed/i.test(msg))          return '#86efac'  // green
-  if (/vulnerability triggered/i.test(msg))              return '#f87171'  // bright red
-  if (/warning|skipped/i.test(msg))                      return '#fde047'  // yellow
+  if (/vulnerability triggered/i.test(msg))              return '#f87171'
+  if (/error|failed|exception|infrastructure/i.test(msg)) return '#fca5a5'
+  if (/success|confirmed|completed|passed/i.test(msg))   return '#86efac'
+  if (/preflight|oracle|surface|variant|baseline/i.test(msg)) return '#93c5fd'
+  if (/warning|skipped|pending/i.test(msg))              return '#fde047'
   return 'var(--text2)'
 }
 

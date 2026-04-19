@@ -219,6 +219,71 @@ class LiveDockerTester:
                 screenshot_base64 = base64.b64encode(handle.read()).decode("utf-8")
             return screenshot_path, screenshot_base64
 
+
+    def test_browser_interaction(self, scan_id: str, cwe_type: str, request_config: Dict[str, Any], exploit_contract: Optional[Dict[str, Any]] = None) -> LiveTestResult:
+        import requests
+        start_time = datetime.utcnow()
+        exploit_contract = exploit_contract or {}
+        url = str(request_config.get('url') or '')
+        method = str(request_config.get('method') or 'GET').upper()
+        params = dict(request_config.get('params') or {})
+        payload = request_config.get('payload')
+        param = str(request_config.get('param') or 'input')
+        if payload and method == 'GET' and param not in params:
+            params[param] = payload
+        if params:
+            query = requests.compat.urlencode(params, doseq=True)
+            separator = '&' if '?' in url else '?'
+            url = f'{url}{separator}{query}' if query else url
+        if not url:
+            return LiveTestResult(False, False, '', self.running_containers.get(scan_id, {}).get('container_id'), 0, 0, '', None, None, [], 'low', 'Missing browser target URL')
+        if not PLAYWRIGHT_AVAILABLE:
+            fallback_payload = str(payload or '')
+            return self.test_vulnerability(scan_id, cwe_type, str(request_config.get('url') or ''), fallback_payload, target_param=param, http_method=method, screenshot=False, exploit_contract=exploit_contract)
+        evidence: List[str] = []
+        screenshot_path = None
+        screenshot_base64 = None
+        dialogs: List[str] = []
+        status_code = 0
+        response_preview = ''
+        triggered = False
+        confidence = 'low'
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch()
+                page = browser.new_page()
+                page.on('dialog', lambda dialog: (dialogs.append(dialog.message), dialog.dismiss()))
+                response = page.goto(url, timeout=10000, wait_until='networkidle')
+                status_code = response.status if response else 0
+                response_preview = page.content()[:500]
+                lower = response_preview.lower()
+                for indicator in exploit_contract.get('success_indicators', []) or []:
+                    token = str(indicator).strip().lower()
+                    if token and token in lower:
+                        evidence.append(f'Success indicator observed in DOM: {indicator}')
+                        triggered = True
+                if dialogs:
+                    evidence.append(f'Browser dialog observed: {dialogs[0]}')
+                    triggered = True
+                if cwe_type == 'CWE-79' and any(marker in lower for marker in ['<script', 'onerror=', 'onload=', 'javascript:']):
+                    evidence.append('Executable script marker reflected in DOM response')
+                    triggered = True
+                try:
+                    screenshot_path, screenshot_base64 = self._capture_screenshot(url)
+                    if screenshot_path:
+                        evidence.append(f'Screenshot captured: {screenshot_path}')
+                except Exception as screenshot_error:
+                    evidence.append(f'Screenshot failed: {screenshot_error}')
+                browser.close()
+            if triggered:
+                confidence = 'high' if len(evidence) > 1 else 'medium'
+            end_time = datetime.utcnow()
+            result = LiveTestResult(True, triggered, str(request_config.get('url') or ''), self.running_containers.get(scan_id, {}).get('container_id'), (end_time - start_time).total_seconds() * 1000, status_code, response_preview, screenshot_path, screenshot_base64, evidence, confidence)
+            self.test_history.append(result)
+            return result
+        except Exception as e:
+            return LiveTestResult(False, False, str(request_config.get('url') or ''), self.running_containers.get(scan_id, {}).get('container_id'), 0, status_code, response_preview, screenshot_path, screenshot_base64, evidence, 'low', str(e))
+
     def stop_target_app(self, scan_id: str) -> bool:
         if scan_id not in self.running_containers:
             return False

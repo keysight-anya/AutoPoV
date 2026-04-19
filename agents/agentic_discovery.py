@@ -5,6 +5,7 @@ Implements resilient language-aware vulnerability discovery.
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -62,7 +63,7 @@ class AgenticDiscovery:
         'php', 'swift', 'kotlin', 'scala', 'rust', 'r', 'ocaml', 'lua', 'julia', 'bash', 'docker'
     }
 
-    HIGH_RISK_LANGUAGES = {'python', 'javascript', 'typescript', 'java'}
+    HIGH_RISK_LANGUAGES = {'python', 'javascript', 'typescript', 'java', 'c', 'cpp'}
 
     LOCAL_SEMGREP_RULES = 'semgrep-rules/owasp-min.yml'
 
@@ -259,15 +260,51 @@ class AgenticDiscovery:
                     log(f"Using Security directory as fallback: {security_dir}")
                     return security_dir
         
-        log(f"WARNING: No CodeQL suite found for {codeql_language}")
+        # Tier 2: Try pack specifiers directly — codeql resolves these from installed packs
+        # even when the physical qlpack directory was not found by path-walking above.
+        _PACK_SPECIFIERS = [
+            f'codeql/{codeql_language}-queries:codeql-suites/{codeql_language}-security-extended.qls',
+            f'codeql/{codeql_language}-queries:codeql-suites/{codeql_language}-security-and-quality.qls',
+            f'codeql/{codeql_language}-queries:codeql-suites/{codeql_language}-code-scanning.qls',
+        ]
+        for spec in _PACK_SPECIFIERS:
+            try:
+                probe = subprocess.run(
+                    ['codeql', 'resolve', 'queries', spec],
+                    capture_output=True, text=True, timeout=10
+                )
+                if probe.returncode == 0:
+                    log(f"Pack specifier resolved for {codeql_language}: {spec}")
+                    return spec
+            except (subprocess.SubprocessError, FileNotFoundError, OSError):
+                pass
+
+        # Tier 3: Local codeql_queries/<language>/ directory — always available, covers core CWEs.
+        # Each language has its own subdirectory so queries are never run against a mismatched
+        # database (e.g. C++ .ql files must not be passed to a Java CodeQL database).
+        # To add coverage for a new language, create codeql_queries/<lang>/ with at least one .ql.
+        local_queries_root = Path(__file__).resolve().parents[1] / 'codeql_queries'
+        # Try exact language subdirectory first
+        lang_subdir = local_queries_root / codeql_language
+        if lang_subdir.is_dir() and any(lang_subdir.glob('*.ql')):
+            log(f"Using local fallback queries for {codeql_language}: {lang_subdir}")
+            return str(lang_subdir)
+        # 'c' and 'cpp' both map to the cpp pack — try the cpp subdir as alias
+        if codeql_language in ('c', 'cpp'):
+            cpp_subdir = local_queries_root / 'cpp'
+            if cpp_subdir.is_dir() and any(cpp_subdir.glob('*.ql')):
+                log(f"Using local fallback queries (cpp) for {codeql_language}: {cpp_subdir}")
+                return str(cpp_subdir)
+        # No language-specific fallback available — skip rather than run wrong-language queries
+        log(f"WARNING: No CodeQL suite or local fallback found for {codeql_language} — skipping CodeQL")
         return None
 
     def _get_semgrep_configs(self, languages: List[str]) -> List[str]:
-        """Use the stable local security ruleset for the demo path.
+        """Return the local security-focused ruleset.
 
-        The Semgrep registry packs have been failing in-container, while the
-        local ruleset is language-scoped and has been producing usable security
-        findings. Keep this path deterministic for the demo.
+        The local ruleset covers C/C++, Python, Java, and JavaScript/TypeScript
+        with rules that surface real security sinks and dangerous patterns only.
+        No code-quality, complexity, or style rules are included.
         """
         local_rule_path = Path(__file__).resolve().parents[1] / self.LOCAL_SEMGREP_RULES
         if local_rule_path.is_file():
@@ -301,56 +338,83 @@ class AgenticDiscovery:
         self._log(state, f'[AgenticDiscovery] Semgrep supported: {lang_profile.semgrep_supported}')
         if lang_profile.codeql_languages:
             self._log(state, f'[AgenticDiscovery] CodeQL language coverage: {", ".join(lang_profile.codeql_languages)}')
-        if lang_profile.codeql_target_language:
-            mapped = self._map_to_codeql_language(lang_profile.codeql_target_language)
-            if lang_profile.codeql_target_language != mapped:
-                self._log(state, f'[AgenticDiscovery] CodeQL extractor mapping: detected {lang_profile.codeql_target_language} -> extractor {mapped}')
         if lang_profile.semgrep_languages:
             self._log(state, f'[AgenticDiscovery] Semgrep language coverage: {", ".join(lang_profile.semgrep_languages)}')
         if lang_profile.unsupported_languages:
             self._log(state, f'[AgenticDiscovery] Agent-only fallback languages: {", ".join(lang_profile.unsupported_languages)}')
 
-        if lang_profile.codeql_supported and lang_profile.codeql_target_language:
-            self._log(state, '[AgenticDiscovery] Step 2: Attempting CodeQL Pre-Flight')
-            codeql_result = self._try_codeql(codebase_path, lang_profile.codeql_target_language, scan_id, state)
-            results.append(codeql_result)
+        # Step 2: Run CodeQL for every detected language that has a pack installed.
+        # Each language gets its own database + analysis pass so findings are not
+        # silently dropped because the primary language consumed the only run slot.
+        codeql_succeeded_langs: set = set()   # languages where CodeQL ran + found/returned results
+        codeql_failed_langs: set = set()      # languages where CodeQL had no suite or crashed
 
-            if any(lang in self.HIGH_RISK_LANGUAGES for lang in lang_profile.codeql_languages):
-                self._log(state, '[AgenticDiscovery] Step 3: Hybrid Enforcement - Running Semgrep for additional coverage')
-                semgrep_result = self._run_semgrep(codebase_path, lang_profile, state)
-                results.append(semgrep_result)
-            elif not codeql_result.success and lang_profile.semgrep_supported:
-                self._log(state, f'[AgenticDiscovery] CodeQL failed ({codeql_result.error}), escalating to Semgrep')
-                semgrep_result = self._run_semgrep(codebase_path, lang_profile, state)
-                results.append(semgrep_result)
-        elif lang_profile.semgrep_supported:
-            self._log(state, f'[AgenticDiscovery] No CodeQL coverage for detected languages, pivoting to Semgrep ({", ".join(lang_profile.semgrep_languages)})')
+        # Deduplicate: c and cpp both map to the 'cpp' extractor — only run once.
+        seen_codeql_extractors: set = set()
+
+        if lang_profile.codeql_supported and lang_profile.codeql_languages:
+            self._log(state, '[AgenticDiscovery] Step 2: CodeQL Analysis (per language)')
+            for lang in lang_profile.codeql_languages:
+                codeql_lang = self._map_to_codeql_language(lang)
+                if lang != codeql_lang:
+                    self._log(state, f'[AgenticDiscovery] CodeQL extractor mapping: detected {lang} -> extractor {codeql_lang}')
+                if codeql_lang in seen_codeql_extractors:
+                    self._log(state, f'[AgenticDiscovery] Skipping {lang} (extractor {codeql_lang} already ran)')
+                    if codeql_lang in codeql_succeeded_langs:
+                        codeql_succeeded_langs.add(lang)  # credit the alias too
+                    else:
+                        codeql_failed_langs.add(lang)
+                    continue
+                seen_codeql_extractors.add(codeql_lang)
+
+                codeql_result = self._try_codeql(codebase_path, lang, scan_id, state)
+                results.append(codeql_result)
+                if codeql_result.success:
+                    codeql_succeeded_langs.add(lang)
+                    codeql_succeeded_langs.add(codeql_lang)
+                else:
+                    codeql_failed_langs.add(lang)
+                    codeql_failed_langs.add(codeql_lang)
+                    self._log(state, f'[AgenticDiscovery] CodeQL failed for {lang}: {codeql_result.error}')
+
+        # Step 3: Semgrep — run as fallback and/or supplemental.
+        #   Fallback:     any language where CodeQL was not available or failed.
+        #   Supplemental: always run for HIGH_RISK languages even when CodeQL succeeded,
+        #                 because Semgrep catches pattern-level sinks that CodeQL queries
+        #                 may not include in the installed pack.
+        run_semgrep = False
+        semgrep_reason = ''
+
+        langs_needing_fallback = (
+            set(lang_profile.semgrep_languages)
+            - codeql_succeeded_langs
+        )
+        high_risk_covered_by_codeql = (
+            set(self.HIGH_RISK_LANGUAGES)
+            & codeql_succeeded_langs
+            & set(lang_profile.semgrep_languages)
+        )
+
+        if langs_needing_fallback:
+            run_semgrep = True
+            semgrep_reason = f'fallback for {sorted(langs_needing_fallback)}'
+        if high_risk_covered_by_codeql:
+            run_semgrep = True
+            extra = f'supplemental for high-risk {sorted(high_risk_covered_by_codeql)}'
+            semgrep_reason = (semgrep_reason + '; ' + extra) if semgrep_reason else extra
+
+        if not lang_profile.codeql_supported and lang_profile.semgrep_supported:
+            run_semgrep = True
+            semgrep_reason = f'no CodeQL coverage, pivoting to Semgrep ({sorted(lang_profile.semgrep_languages)})'
+
+        if run_semgrep:
+            self._log(state, f'[AgenticDiscovery] Step 3: Semgrep ({semgrep_reason})')
             semgrep_result = self._run_semgrep(codebase_path, lang_profile, state)
             results.append(semgrep_result)
-        else:
+        elif not results:
             self._log(state, '[AgenticDiscovery] Detected languages are not supported by CodeQL or Semgrep')
 
-        # Run Exploratory Agent to find what static analyzers may have missed
-        # This uses LLM reasoning instead of hardcoded patterns - ALWAYS runs for CWE-agnostic discovery
-        self._log(state, '[AgenticDiscovery] Running Exploratory Agent to find additional vulnerabilities')
-        try:
-            exploratory_result = self._run_exploratory_agent(codebase_path, lang_profile, results, state)
-        except Exception as exc:
-            if settings.resolve_model_mode(state.get("model_name", "")) == "offline":
-                self._log(state, f'[AgenticDiscovery] Exploratory agent failed in offline mode: {exc}')
-                exploratory_result = DiscoveryResult(
-                    strategy=DiscoveryStrategy.LLM_SCOUT,
-                    findings=[],
-                    success=False,
-                    error=str(exc),
-                    execution_time_s=0.0,
-                    metadata={'mode': 'exploratory', 'degraded': True}
-                )
-            else:
-                raise
-        if exploratory_result:
-            results.append(exploratory_result)
-
+        # Run LLM Scout (triage mode) on CodeQL/Semgrep findings when enabled
         # Cost-Benefit Triage via LLM Scout - DISABLED by default (redundant with Investigator)
         # Set SCOUT_LLM_ENABLED=true to re-enable if needed for large codebases
         if settings.SCOUT_LLM_ENABLED:
@@ -405,6 +469,277 @@ class AgenticDiscovery:
             codeql_target_language=codeql_target_language,
         )
 
+    def _format_codeql_error(self, completed: Optional[subprocess.CompletedProcess[str]]) -> str:
+        if completed is None:
+            return 'Unknown error'
+        return (completed.stderr or completed.stdout or 'Unknown error')[:600]
+
+    def _build_codeql_create_cmd(self, db_path: str, codebase_path: str, codeql_lang: str, build_command: Optional[str] = None, build_wrapper_path: Optional[str] = None) -> List[str]:
+        create_cmd = [
+            settings.CODEQL_CLI_PATH,
+            'database', 'create', db_path,
+            f'--language={codeql_lang}',
+            '--source-root', codebase_path,
+            '--overwrite'
+        ]
+        if build_wrapper_path:
+            create_cmd.append(f'--command=/bin/sh {shlex.quote(build_wrapper_path)}')
+        elif build_command:
+            create_cmd.append(f'--command=/bin/sh -lc {shlex.quote(build_command)}')
+        return create_cmd
+
+    def _write_codeql_manual_build_wrapper(self, codebase_path: str, build_command: str, scan_id: str, attempt_index: int) -> str:
+        wrapper_dir = os.path.join(settings.TEMP_DIR, f'codeql_manual_build_{scan_id}')
+        os.makedirs(wrapper_dir, exist_ok=True)
+        wrapper_path = os.path.join(wrapper_dir, f'build_{attempt_index}.sh')
+        script = "#!/bin/sh\nset -eu\ncd " + shlex.quote(codebase_path) + "\n" + build_command + "\n"
+        Path(wrapper_path).write_text(script, encoding='utf-8')
+        os.chmod(wrapper_path, 0o700)
+        return wrapper_path
+
+    def _load_benchmark_build_commands(self, codebase_path: str) -> List[str]:
+        metadata_path = Path(codebase_path) / '.autopov-benchmark.json'
+        if not metadata_path.is_file():
+            return []
+        try:
+            payload = json.loads(metadata_path.read_text(encoding='utf-8'))
+        except Exception:
+            return []
+        commands = payload.get('codeql_build_commands') or []
+        if not isinstance(commands, list):
+            return []
+        return [str(command).strip() for command in commands if str(command).strip()]
+
+    def _supports_manual_build_fallback(self, codeql_lang: str) -> bool:
+        return codeql_lang in {'cpp', 'java'}
+
+    def _write_codeql_extract_helper(self, codebase_path: str, codeql_lang: str, scan_id: str) -> str:
+        helper_dir = os.path.join(settings.TEMP_DIR, f'codeql_extract_helper_{scan_id}')
+        os.makedirs(helper_dir, exist_ok=True)
+        helper_path = os.path.join(helper_dir, f'{codeql_lang}_extract.py')
+        if codeql_lang == 'java':
+            script = """#!/usr/bin/env python3
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+out_dir = root / '.autopov-codeql-classes'
+out_dir.mkdir(exist_ok=True)
+javac = shutil.which('javac')
+if not javac:
+    raise SystemExit('javac not found')
+exclude_parts = {'build', 'target', '.git', 'node_modules', 'vendor', '.gradle', '.idea', 'out'}
+preferred_prefixes = [
+    root / 'src' / 'main' / 'java',
+    root / 'src' / 'java',
+    root / 'src',
+]
+def wanted(p: Path) -> bool:
+    if any(part in exclude_parts for part in p.parts):
+        return False
+    return p.suffix == '.java'
+all_sources = [p for p in root.rglob('*.java') if wanted(p)]
+preferred = []
+for prefix in preferred_prefixes:
+    if prefix.exists():
+        preferred.extend([p for p in prefix.rglob('*.java') if wanted(p)])
+ordered = []
+seen = set()
+for p in preferred + all_sources:
+    rp = str(p)
+    if rp not in seen:
+        seen.add(rp)
+        ordered.append(p)
+if not ordered:
+    raise SystemExit('No Java source files found for fallback extraction')
+jars = [str(p) for p in root.rglob('*.jar') if '.git' not in p.parts and 'node_modules' not in p.parts]
+classpath = os.pathsep.join(jars) if jars else ''
+base_cmd = [javac, '-proc:none', '-g', '-d', str(out_dir)]
+if classpath:
+    base_cmd.extend(['-classpath', classpath])
+main_like = [p for p in ordered if '/src/test/' not in str(p).replace('\\','/') and '/test/' not in str(p).replace('\\','/')]
+batches = [main_like or ordered, ordered]
+for batch in batches:
+    try:
+        result = subprocess.run(base_cmd + [str(p) for p in batch], cwd=str(root), capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        result = None
+    if result and result.returncode == 0:
+        raise SystemExit(0)
+successes = 0
+for src in ordered:
+    cmd = list(base_cmd) + [str(src)]
+    try:
+        result = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        continue
+    if result.returncode == 0:
+        successes += 1
+raise SystemExit(0 if successes else 1)
+"""
+        else:
+            script = """#!/usr/bin/env python3
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+build_dir = root / '.autopov-codeql-objs'
+build_dir.mkdir(exist_ok=True)
+cc = shutil.which('clang') or shutil.which('gcc') or shutil.which('cc')
+cxx = shutil.which('clang++') or shutil.which('g++') or shutil.which('c++')
+if not cc and not cxx:
+    raise SystemExit('No C/C++ compiler found')
+exclude_parts = {'build', 'target', '.git', 'node_modules', 'vendor', '.gradle', '.idea', '.autopov-codeql-build'}
+def wanted(p: Path) -> bool:
+    if any(part in exclude_parts for part in p.parts):
+        return False
+    return p.suffix.lower() in {'.c', '.cc', '.cpp', '.cxx'}
+sources = [p for p in root.rglob('*') if p.is_file() and wanted(p)]
+if not sources:
+    raise SystemExit('No C/C++ source files found for fallback extraction')
+include_dirs = []
+seen_dirs = set()
+for src in sources:
+    for candidate in [src.parent, root, root / 'include', root / 'src', root / 'lib']:
+        if candidate.exists():
+            key = str(candidate.resolve())
+            if key not in seen_dirs:
+                seen_dirs.add(key)
+                include_dirs.append(candidate.resolve())
+compiled = 0
+for idx, src in enumerate(sources):
+    suffix = src.suffix.lower()
+    compiler = cxx if suffix in {'.cc', '.cpp', '.cxx'} else cc
+    if not compiler:
+        continue
+    obj = build_dir / f'obj_{idx}.o'
+    cmd = [compiler, '-c', str(src), '-o', str(obj), '-O0', '-g', '-w']
+    if suffix in {'.cc', '.cpp', '.cxx'}:
+        cmd.append('-std=c++11')
+    for inc in include_dirs:
+        cmd.extend(['-I', str(inc)])
+    try:
+        result = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        continue
+    if result.returncode == 0:
+        compiled += 1
+raise SystemExit(0 if compiled else 1)
+"""
+        Path(helper_path).write_text(script, encoding='utf-8')
+        os.chmod(helper_path, 0o700)
+        return helper_path
+
+    def _candidate_codeql_build_commands(self, codebase_path: str, codeql_lang: str, scan_id: str = 'scan') -> List[str]:
+        if not self._supports_manual_build_fallback(codeql_lang):
+            return []
+
+        root = Path(codebase_path)
+        jobs = max(2, min(4, os.cpu_count() or 2))
+        build_dir = '.autopov-codeql-build'
+        commands: List[str] = []
+
+        benchmark_commands = self._load_benchmark_build_commands(codebase_path)
+        for command in benchmark_commands:
+            if command not in commands:
+                commands.append(command)
+
+        def add(command: str):
+            command = command.strip()
+            if command and command not in commands:
+                commands.append(command)
+
+        helper_path = self._write_codeql_extract_helper(codebase_path, codeql_lang, scan_id)
+        add(f'python3 {shlex.quote(helper_path)} {shlex.quote(codebase_path)}')
+
+        if codeql_lang == 'cpp':
+            if (root / 'CMakeLists.txt').exists():
+                add(
+                    f'cmake -S . -B {shlex.quote(build_dir)} -DCMAKE_BUILD_TYPE=Debug '
+                    f'&& cmake --build {shlex.quote(build_dir)} -j{jobs}'
+                )
+            if (root / 'meson.build').exists():
+                add(
+                    f'meson setup {shlex.quote(build_dir)} --buildtype=debug || meson setup {shlex.quote(build_dir)} --wipe --buildtype=debug; '
+                    f'meson compile -C {shlex.quote(build_dir)}'
+                )
+            # autogen.sh generates ./configure — must run before trying ./configure
+            if (root / 'autogen.sh').exists():
+                add(f'chmod +x ./autogen.sh && ./autogen.sh && ./configure --disable-dependency-tracking && make -j{jobs}')
+                add(f'chmod +x ./autogen.sh && ./autogen.sh && make -j{jobs}')
+            # autoreconf for repos with configure.ac but no autogen.sh
+            if (root / 'configure.ac').exists() or (root / 'configure.in').exists():
+                add(f'autoreconf -fi && ./configure --disable-dependency-tracking && make -j{jobs}')
+                add(f'autoreconf -fi && make -j{jobs}')
+            if (root / 'configure').exists():
+                add(f'chmod +x ./configure && ./configure --disable-dependency-tracking && make -j{jobs}')
+                add(f'chmod +x ./configure && ./configure && make -j{jobs}')
+            for makefile_name in ('Makefile', 'GNUmakefile', 'makefile'):
+                if (root / makefile_name).exists():
+                    add(f'make -j{jobs}')
+                    break
+        elif codeql_lang == 'java':
+            if (root / 'mvnw').exists():
+                add('chmod +x ./mvnw && ./mvnw -q -DskipTests compile')
+            if (root / 'pom.xml').exists() and shutil.which('mvn'):
+                add('mvn -q -DskipTests compile')
+            if (root / 'gradlew').exists():
+                add('chmod +x ./gradlew && ./gradlew --no-daemon compileJava classes -q')
+                add('chmod +x ./gradlew && ./gradlew --no-daemon classes -q')
+            if ((root / 'build.gradle').exists() or (root / 'build.gradle.kts').exists()) and shutil.which('gradle'):
+                add('gradle --no-daemon compileJava classes -q')
+                add('gradle --no-daemon classes -q')
+
+        return commands
+
+    def _create_codeql_database(self, codebase_path: str, codeql_lang: str, db_path: str, state: Dict[str, Any]) -> Dict[str, Any]:
+        self._log(state, f'[AgenticDiscovery] Creating CodeQL database for {codeql_lang}...')
+        autobuild_cmd = self._build_codeql_create_cmd(db_path, codebase_path, codeql_lang)
+        autobuild = subprocess.run(autobuild_cmd, capture_output=True, text=True, timeout=settings.CODEQL_TIMEOUT_S)
+        if autobuild.returncode == 0:
+            return {'success': True, 'strategy': 'autobuild', 'error': None, 'command': None}
+
+        autobuild_error = self._format_codeql_error(autobuild)
+        self._log(state, f'[AgenticDiscovery] CodeQL autobuild failed for {codeql_lang}: {autobuild_error[:240]}')
+
+        manual_commands = self._candidate_codeql_build_commands(codebase_path, codeql_lang, state.get('scan_id', 'scan'))
+        if not manual_commands:
+            return {'success': False, 'strategy': 'autobuild', 'error': autobuild_error, 'command': None}
+
+        self._log(state, f'[AgenticDiscovery] Retrying CodeQL database creation with {len(manual_commands)} manual build fallback(s)...')
+        last_error = autobuild_error
+        for idx, build_command in enumerate(manual_commands, start=1):
+            if os.path.exists(db_path):
+                shutil.rmtree(db_path, ignore_errors=True)
+            self._log(state, f'[AgenticDiscovery] Manual CodeQL build fallback {idx}/{len(manual_commands)}: {build_command}')
+            wrapper_path = self._write_codeql_manual_build_wrapper(codebase_path, build_command, state.get('scan_id', 'scan'), idx)
+            try:
+                manual_cmd = self._build_codeql_create_cmd(
+                    db_path,
+                    codebase_path,
+                    codeql_lang,
+                    build_wrapper_path=wrapper_path,
+                )
+                manual = subprocess.run(manual_cmd, capture_output=True, text=True, timeout=settings.CODEQL_TIMEOUT_S)
+            finally:
+                try:
+                    os.unlink(wrapper_path)
+                except OSError:
+                    pass
+            if manual.returncode == 0:
+                self._log(state, f'[AgenticDiscovery] Manual CodeQL build fallback succeeded with command: {build_command}')
+                return {'success': True, 'strategy': 'manual', 'error': None, 'command': build_command}
+            last_error = self._format_codeql_error(manual)
+            self._log(state, f'[AgenticDiscovery] Manual CodeQL build fallback failed: {last_error[:240]}')
+
+        return {'success': False, 'strategy': 'manual', 'error': last_error, 'command': manual_commands[-1]}
+
     def _try_codeql(self, codebase_path: str, language: str, scan_id: str, state: Dict[str, Any]) -> DiscoveryResult:
         import time
         start_time = time.time()
@@ -413,19 +748,28 @@ class AgenticDiscovery:
         db_path = os.path.join(settings.TEMP_DIR, f'codeql_db_{scan_id}')
         result_path = os.path.join(settings.TEMP_DIR, f'codeql_results_{scan_id}_{codeql_lang}.sarif')
 
+        if not suite:
+            self._log(state, f'[AgenticDiscovery] CodeQL suite selected: None (skipping CodeQL for {codeql_lang})')
+            return DiscoveryResult(
+                DiscoveryStrategy.CODEQL,
+                [],
+                False,
+                f'No CodeQL suite available for {codeql_lang} — install the qlpacks or set CODEQL_SUITE_PATH',
+                time.time() - start_time,
+                {'language': codeql_lang}
+            )
+
         try:
-            self._log(state, f'[AgenticDiscovery] Creating CodeQL database for {codeql_lang}...')
-            create_cmd = [
-                settings.CODEQL_CLI_PATH,
-                'database', 'create', db_path,
-                f'--language={codeql_lang}',
-                '--source-root', codebase_path,
-                '--overwrite'
-            ]
-            create = subprocess.run(create_cmd, capture_output=True, text=True, timeout=settings.CODEQL_TIMEOUT_S)
-            if create.returncode != 0:
-                error_msg = (create.stderr or create.stdout or 'Unknown error')[:300]
-                return DiscoveryResult(DiscoveryStrategy.CODEQL, [], False, f'Database creation failed: {error_msg}', time.time() - start_time, {'language': codeql_lang})
+            create_result = self._create_codeql_database(codebase_path, codeql_lang, db_path, state)
+            if not create_result['success']:
+                return DiscoveryResult(
+                    DiscoveryStrategy.CODEQL,
+                    [],
+                    False,
+                    f"Database creation failed ({create_result['strategy']}): {create_result['error']}",
+                    time.time() - start_time,
+                    {'language': codeql_lang, 'build_strategy': create_result['strategy'], 'build_command': create_result.get('command')}
+                )
 
             # Try primary suite first
             self._log(state, f'[AgenticDiscovery] CodeQL suite selected: {suite}')
@@ -450,7 +794,13 @@ class AgenticDiscovery:
                 success=True,
                 error=None,
                 execution_time_s=time.time() - start_time,
-                metadata={'language': codeql_lang, 'suite': suite, 'findings_count': len(findings)}
+                metadata={
+                    'language': codeql_lang,
+                    'suite': suite,
+                    'findings_count': len(findings),
+                    'build_strategy': create_result['strategy'],
+                    'build_command': create_result.get('command'),
+                }
             )
         except subprocess.TimeoutExpired:
             return DiscoveryResult(DiscoveryStrategy.CODEQL, [], False, 'CodeQL timeout', time.time() - start_time, {'language': codeql_lang, 'suite': suite})
@@ -596,99 +946,10 @@ class AgenticDiscovery:
                     'alert_message': match.get('extra', {}).get('message', ''),
                 })
 
+        findings = self._filter_test_findings(findings)
         if not used_configs:
             self._log(state, '[AgenticDiscovery] All Semgrep configs failed or returned unusable output')
         return findings, (used_configs or configs)
-
-    def _run_exploratory_agent(self, codebase_path: str, lang_profile: LanguageProfile, previous_results: List[DiscoveryResult], state: Dict[str, Any]) -> Optional[DiscoveryResult]:
-        """
-        Run an exploratory agent to find vulnerabilities that static analyzers may have missed.
-        
-        This agent uses LLM reasoning to identify:
-        - Logic bugs
-        - Business logic vulnerabilities
-        - Race conditions
-        - Authentication/authorization flaws
-        - Data validation issues
-        
-        No hardcoded CWE patterns - evaluates each finding on exploitability.
-        """
-        import time
-        start_time = time.time()
-        
-        # Gather context from previous findings to avoid duplication
-        existing_findings = []
-        for result in previous_results:
-            if result.success:
-                existing_findings.extend(result.findings)
-        
-        # Get primary language files for analysis
-        primary_lang = lang_profile.primary
-        code_files = []
-        for root, dirs, files in os.walk(codebase_path):
-            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('node_modules', 'venv', '__pycache__', 'dist', 'build')]
-            for fname in files:
-                ext = os.path.splitext(fname)[1].lower()
-                if ext in {'.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.c', '.cpp', '.cc', '.h', '.hpp', '.go', '.rb', '.php', '.cs'}:
-                    filepath = os.path.join(root, fname)
-                    rel_path = os.path.relpath(filepath, codebase_path)
-                    try:
-                        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                            code = f.read(settings.SCOUT_MAX_CHARS_PER_FILE)
-                        code_files.append({
-                            'filepath': rel_path,
-                            'language': self._detect_language_from_path(rel_path),
-                            'code': code,
-                        })
-                    except (OSError, IOError):
-                        continue
-        
-        if not code_files:
-            self._log(state, '[AgenticDiscovery] No code files found for exploratory analysis')
-            return None
-        
-        # Limit files to analyze (cost control)
-        scout_budget = settings.get_offline_scout_budget(state.get("model_name"), purpose="exploratory") if settings.resolve_model_mode(state.get("model_name", "")) == "offline" else {"max_files": 10}
-        max_files = min(scout_budget["max_files"], len(code_files))
-        code_files = code_files[:max_files]
-        
-        self._log(state, f'[AgenticDiscovery] Exploratory agent analyzing {len(code_files)} files for missed vulnerabilities')
-        
-        # Use LLM scout with exploratory prompt
-        from agents.llm_scout import get_llm_scout
-        scout = get_llm_scout()
-        
-        # Create exploratory analysis snippets
-        exploratory_snippets = []
-        for cf in code_files:
-            exploratory_snippets.append({
-                'filepath': cf['filepath'],
-                'language': cf['language'],
-                'code': cf['code'],
-                'candidate_lines': [],  # No pre-conceived notions
-                'candidate_cwes': [],   # No hardcoded CWEs
-            })
-        
-        # Run exploratory analysis (no CWE constraints)
-        findings = scout.scan_snippets(exploratory_snippets, [], model_name=state.get("model_name"))  # Empty cwes = open-ended discovery
-        
-        # Filter out duplicates from existing findings
-        existing_keys = {(f.get('filepath'), f.get('line_number')) for f in existing_findings}
-        new_findings = [f for f in findings if (f.get('filepath'), f.get('line_number')) not in existing_keys]
-        
-        if new_findings:
-            self._log(state, f'[AgenticDiscovery] Exploratory agent found {len(new_findings)} additional findings')
-        else:
-            self._log(state, '[AgenticDiscovery] Exploratory agent found no additional findings')
-        
-        return DiscoveryResult(
-            strategy=DiscoveryStrategy.LLM_SCOUT,  # Reuse LLM_SCOUT enum
-            findings=new_findings,
-            success=True,
-            error=None,
-            execution_time_s=time.time() - start_time,
-            metadata={'files_analyzed': len(code_files), 'findings_count': len(new_findings), 'mode': 'exploratory'}
-        )
 
     def _run_llm_scout(self, codebase_path: str, cwes: List[str], previous_results: List[DiscoveryResult], state: Dict[str, Any]) -> Optional[DiscoveryResult]:
         import time
@@ -711,6 +972,7 @@ class AgenticDiscovery:
             # Sort by confidence desc before capping
             candidates = sorted(candidates, key=lambda f: f.get('confidence', 0), reverse=True)[:max_candidates]
 
+        candidates = [c for c in candidates if not self._is_test_artifact_path(c.get('filepath', ''))]
         if not candidates:
             self._log(state, '[AgenticDiscovery] No high-confidence candidates for LLM scout; skipping')
             return None
@@ -749,22 +1011,52 @@ class AgenticDiscovery:
         if not file_snippets:
             return None
 
-        findings = scout.scan_snippets(file_snippets, cwes, model_name=state.get("model_name"))
+        findings = self._filter_test_findings(scout.scan_snippets(file_snippets, cwes, model_name=state.get("model_name")))
         return DiscoveryResult(DiscoveryStrategy.LLM_SCOUT, findings, True, None, time.time() - start_time, {'candidates_analyzed': len(candidates), 'findings_count': len(findings)})
+
+    def _is_test_artifact_path(self, filepath: str) -> bool:
+        lowered = str(filepath or '').replace('\\', '/').lower()
+        markers = [
+            '/src/test/',
+            '/tests/',
+            '/test/',
+            '/__tests__/',
+            '/spec/',
+            '/specs/',
+            'test_',
+            '_test.',
+            '.spec.',
+            '.test.',
+        ]
+        return any(marker in lowered for marker in markers)
+
+    def _filter_test_findings(self, findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        filtered: List[Dict[str, Any]] = []
+        for finding in findings:
+            filepath = finding.get('filepath', '')
+            if self._is_test_artifact_path(filepath):
+                continue
+            filtered.append(finding)
+        return filtered
 
     def _map_to_codeql_language(self, language: str) -> str:
         mapping = {
-            'python': 'python',
+            'python':     'python',
             'javascript': 'javascript',
-            'typescript': 'javascript',
-            'java': 'java',
-            'c': 'cpp',
-            'cpp': 'cpp',
-            'go': 'go',
-            'ruby': 'ruby',
-            'csharp': 'csharp',
+            'typescript': 'javascript',  # CodeQL uses the javascript pack for TypeScript
+            'java':       'java',
+            'kotlin':     'java',        # CodeQL kotlin support uses the java database
+            'c':          'cpp',
+            'cpp':        'cpp',
+            'c++':        'cpp',
+            'go':         'go',
+            'golang':     'go',
+            'ruby':       'ruby',
+            'csharp':     'csharp',
+            'c#':         'csharp',
+            'swift':      'swift',       # CodeQL 2.12+ supports Swift
         }
-        return mapping.get(language, language)
+        return mapping.get(language.lower(), language.lower())
 
     def _extract_codeql_classification(self, rule_meta: Dict[str, Any], rule_id: str) -> str:
         """Extract CWE classification from CodeQL rule metadata."""

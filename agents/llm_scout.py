@@ -67,6 +67,7 @@ class LLMScout:
                 temperature=0.1,
                 timeout=settings.LLM_REQUEST_TIMEOUT_S,
                 reasoning_enabled=llm_config.get("reasoning_enabled", True),
+                max_tokens=settings.get_online_max_tokens(),  # None = no cap
                 default_headers={
                     "HTTP-Referer": "https://autopov.local",
                     "X-OpenRouter-Title": "AutoPoV"

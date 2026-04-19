@@ -1,5 +1,8 @@
 # Secrets and local environment
 .env
+*.env
+!.env.example
+!frontend/.env.example
 frontend/.env
 venv/
 env/
@@ -58,6 +61,26 @@ package-lock.json
 .superpowers/
 .claude/
 _demo_smoke/
+
+# Diagnostic and one-off dev scripts (root-level _*.py / _*.sh / _*.ps1)
+_*.py
+_*.sh
+_*.ps1
+
+# Temporary scan/batch state and result files
+batch_*.json
+*_state.json
+*.json
+!data/benchmarks/manifest.example.json
+
+# Embedded benchmark repos (use submodules instead)
+data/benchmarks/sources/juliet-dynamic/
+data/benchmarks/sources/owasp-benchmark-python/
+
+# Scratch / leftover files
+.codex_patch_*
+=
+{line}*
 
 # OS and editor files
 .DS_Store

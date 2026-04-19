@@ -31,6 +31,8 @@ from app.scan_manager import get_scan_manager, ScanResult
 from app.agent_graph import get_agent_graph
 from app.report_generator import get_report_generator
 from app.learning_store import get_learning_store
+from app.benchmark_registry import get_benchmark_registry
+from app.benchmark_manager import get_benchmark_manager
 
 
 # Pydantic models for API
@@ -45,6 +47,14 @@ class ScanPasteRequest(BaseModel):
     code: str
     language: Optional[str] = None
     filename: Optional[str] = None
+    model: Optional[str] = Field(default=None)
+
+
+class ScanBenchmarkRequest(BaseModel):
+    benchmark_id: Optional[str] = None
+    benchmark_root: Optional[str] = None
+    manifest_path: Optional[str] = None
+    case_ids: Optional[List[str]] = None
     model: Optional[str] = Field(default=None)
 
 
@@ -68,6 +78,9 @@ class ScanStatusResponse(BaseModel):
     result: Optional[dict] = None
     findings: List[dict] = []
     error: Optional[str] = None
+    start_time: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
 
 
 class APIKeyResponse(BaseModel):
@@ -85,6 +98,10 @@ class HealthResponse(BaseModel):
     docker_available: bool
     codeql_available: bool
     joern_available: bool
+
+
+class BenchmarkListResponse(BaseModel):
+    benchmarks: List[dict]
 
 
 class WebhookResponse(BaseModel):
@@ -267,6 +284,48 @@ async def health_check():
     )
 
 
+@app.get("/api/balance")
+async def get_openrouter_balance(auth: tuple = Depends(verify_api_key_or_system)):
+    """Fetch current OpenRouter credit balance using the configured API key."""
+    import requests as _requests
+    or_key = settings.get_openrouter_api_key()
+    if not or_key:
+        return {"balance_usd": None, "error": "OpenRouter API key not configured"}
+    try:
+        resp = _requests.get(
+            f"{settings.OPENROUTER_BASE_URL}/auth/key",
+            headers={"Authorization": f"Bearer {or_key}"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        d = (resp.json().get("data") or {})
+        limit     = d.get("limit")       # None = unlimited prepaid
+        limit_usd = d.get("limit_usd")   # prepaid total
+        usage     = float(d.get("usage") or 0.0)
+        if limit is not None:
+            balance = max(0.0, float(limit) - usage)
+        elif limit_usd is not None:
+            balance = max(0.0, float(limit_usd) - usage)
+        else:
+            balance = None  # unlimited / org key — cannot determine
+        return {"balance_usd": balance, "usage_usd": usage, "limit_usd": limit_usd or limit}
+    except Exception as exc:
+        return {"balance_usd": None, "error": str(exc)}
+
+
+@app.get("/api/benchmarks", response_model=BenchmarkListResponse)
+async def list_benchmarks(auth: tuple = Depends(verify_api_key_or_system)):
+    """List built-in managed benchmark suites."""
+    return BenchmarkListResponse(benchmarks=get_benchmark_manager().list_benchmarks())
+
+
+@app.post("/api/benchmarks/{benchmark_id}/install")
+async def install_benchmark(benchmark_id: str, auth: tuple = Depends(verify_api_key_or_system_with_rate_limit)):
+    """Install a managed benchmark suite into the local benchmark cache."""
+    install_path = get_benchmark_manager().ensure_installed(benchmark_id)
+    return {"benchmark_id": benchmark_id, "status": "installed", "install_path": install_path}
+
+
 @app.get("/api/config")
 async def get_config(auth: Optional[tuple] = Depends(verify_api_key_optional)):
     """Get system configuration for discovery-first scans"""
@@ -298,7 +357,10 @@ async def scan_git(
     scan_id = get_scan_manager().create_scan(
         codebase_path="",  # Will be set after clone
         model_name=model,
-        cwes=[]
+        cwes=[],
+        target_type="repo",
+        target_label=request.url,
+        repo_url=request.url,
     )
     
     def run_scan():
@@ -316,6 +378,8 @@ async def scan_git(
             
             if scan_info:
                 scan_manager.append_log(scan_id, message)
+                resolved_label = (repo_info or {}).get('full_name') or request.url
+                scan_manager.update_scan(scan_id, target_label=resolved_label, repo_url=request.url)
             
             if not is_accessible:
                 if scan_info:
@@ -428,6 +492,110 @@ async def scan_zip(
         scan_id=scan_id,
         status="created",
         message="ZIP file scan initiated"
+    )
+
+
+@app.post("/api/scan/benchmark", response_model=ScanResponse)
+async def scan_benchmark(
+    request: ScanBenchmarkRequest,
+    background_tasks: BackgroundTasks,
+    auth: tuple = Depends(verify_api_key_or_system_with_rate_limit)
+):
+    """Scan a benchmark manifest target."""
+    model = request.model or get_configured_model()
+    ensure_model_runtime_ready(model)
+
+    managed_root = None
+    if request.benchmark_id:
+        try:
+            managed_root = get_benchmark_manager().ensure_installed(request.benchmark_id)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    effective_benchmark_root = request.benchmark_root or managed_root
+    if not effective_benchmark_root and not request.manifest_path:
+        raise HTTPException(status_code=400, detail="Provide benchmark_id, benchmark_root, or manifest_path")
+
+    try:
+        preview = get_benchmark_registry().preview_manifest(
+            manifest_path=request.manifest_path,
+            case_ids=request.case_ids,
+            benchmark_root=effective_benchmark_root,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    scan_id = get_scan_manager().create_scan(
+        codebase_path="",
+        model_name=model,
+        cwes=[],
+        target_type="benchmark",
+        target_label=preview.get("benchmark_id") or preview.get("benchmark_name"),
+        benchmark_metadata=preview
+    )
+
+    def run_scan():
+        import traceback
+        scan_manager = get_scan_manager()
+        scan_info = scan_manager.get_scan(scan_id)
+
+        try:
+            if scan_info:
+                scan_manager.update_scan(scan_id, status="checking", progress=2)
+                if request.benchmark_id:
+                    scan_manager.append_log(scan_id, f"Using managed benchmark: {request.benchmark_id}")
+                elif request.manifest_path:
+                    scan_manager.append_log(scan_id, f"Loading benchmark manifest: {request.manifest_path}")
+                else:
+                    scan_manager.append_log(scan_id, f"Auto-importing benchmark root: {effective_benchmark_root}")
+
+            materialized = get_benchmark_registry().materialize(
+                scan_id=scan_id,
+                manifest_path=request.manifest_path,
+                case_ids=request.case_ids,
+                benchmark_root=effective_benchmark_root,
+            )
+            benchmark_metadata = materialized.benchmark_metadata
+            codebase_path = materialized.codebase_path
+
+            if scan_info:
+                scan_manager.update_scan(
+                    scan_id,
+                    status="ingesting",
+                    progress=8,
+                    codebase_path=codebase_path,
+                    target_label=benchmark_metadata.get("benchmark_id") or benchmark_metadata.get("benchmark_name"),
+                    benchmark_metadata=benchmark_metadata,
+                )
+                scan_manager.append_log(scan_id, f"Benchmark family: {benchmark_metadata.get('benchmark_family')}")
+                scan_manager.append_log(scan_id, f"Benchmark target: {benchmark_metadata.get('benchmark_id')}")
+                scan_manager.append_log(scan_id, f"Selected cases: {len(benchmark_metadata.get('selected_case_ids') or [])}")
+                scan_manager.append_log(scan_id, f"Benchmark materialized to: {codebase_path}")
+                scan_manager.append_log(scan_id, "Starting vulnerability scan...")
+
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(scan_manager.run_scan_async(scan_id))
+            finally:
+                try:
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                finally:
+                    loop.close()
+
+        except Exception as e:
+            error_msg = f"{str(e)}\n{traceback.format_exc()}"
+            if scan_info:
+                scan_manager.update_scan(scan_id, status="failed", progress=100, error=str(e))
+                scan_manager.append_log(scan_id, f"ERROR: {str(e)}")
+            print(f"Benchmark scan {scan_id} failed: {error_msg}")
+
+    background_tasks.add_task(run_scan)
+
+    return ScanResponse(
+        scan_id=scan_id,
+        status="created",
+        message="Benchmark scan initiated"
     )
 
 
@@ -620,6 +788,17 @@ async def get_active_scans(auth: tuple = Depends(verify_api_key_or_system)):
     return {"active_scans": active_scans, "count": len(active_scans)}
 
 
+@app.delete("/api/scans/all")
+async def delete_all_scans(auth: tuple = Depends(verify_api_key_or_system)):
+    """Delete all scan results, history, snapshots, PoVs and proof artifacts."""
+    deleted, skipped = get_scan_manager().delete_all_scans()
+    return {
+        "deleted": deleted,
+        "skipped": skipped,
+        "message": f"Deleted {deleted} scan(s). {skipped} skipped (still running)."
+    }
+
+
 @app.post("/api/scans/cleanup")
 async def cleanup_stuck_scans(auth: tuple = Depends(verify_api_key_or_system)):
     """Clean up stuck/interrupted scans by deleting them"""
@@ -715,15 +894,29 @@ async def get_scan_status(
     scan_manager = get_scan_manager()
     scan_info = scan_manager.get_scan(scan_id)
 
+    def response_times(active_info=None, result_dict=None):
+        active_info = active_info or {}
+        result_dict = result_dict or {}
+        start_time = active_info.get("start_time") or result_dict.get("start_time")
+        created_at = active_info.get("created_at") or result_dict.get("created_at") or start_time
+        updated_at = active_info.get("updated_at") or result_dict.get("updated_at") or result_dict.get("end_time")
+        return {
+            "start_time": start_time,
+            "created_at": created_at,
+            "updated_at": updated_at,
+        }
+
     if scan_info and scan_info.get("status") in {"completed", "failed", "cancelled", "stopped"}:
         result = scan_manager.get_scan_result(scan_id)
         if result:
+            result_dict = result.__dict__
             return ScanStatusResponse(
                 scan_id=scan_id,
                 status=result.status,
                 progress=100,
                 logs=result.logs if hasattr(result, 'logs') else [],
-                result=result.__dict__
+                result=result_dict,
+                **response_times(scan_info, result_dict)
             )
         fallback_result = scan_info.get("result")
         if isinstance(fallback_result, dict):
@@ -734,35 +927,41 @@ async def get_scan_status(
                 logs=fallback_result.get("logs") or scan_info.get("logs", []),
                 result=fallback_result,
                 findings=fallback_result.get("findings") or scan_info.get("findings", []),
-                error=scan_info.get("error")
+                error=scan_info.get("error"),
+                **response_times(scan_info, fallback_result)
             )
 
     if not scan_info:
         # Try to load from saved results
         result = scan_manager.get_scan_result(scan_id)
         if result:
+            result_dict = result.__dict__
             return ScanStatusResponse(
                 scan_id=scan_id,
                 status=result.status,
                 progress=100,
                 logs=result.logs if hasattr(result, 'logs') else [],
-                result=result.__dict__
+                result=result_dict,
+                **response_times({}, result_dict)
             )
         raise HTTPException(status_code=404, detail="Scan not found")
-    
+
     # Get findings from scan info if available
     findings = []
     if scan_info.get("findings"):
         findings = [f.__dict__ if hasattr(f, '__dict__') else f for f in scan_info.get("findings", [])]
-    
+
+    active_result = scan_info.get("result").__dict__ if scan_info.get("result") else None
+
     return ScanStatusResponse(
         scan_id=scan_id,
         status=scan_info.get("status", "unknown"),
         progress=scan_info.get("progress", 0),
         logs=scan_info.get("logs", []),
-        result=scan_info.get("result").__dict__ if scan_info.get("result") else None,
+        result=active_result,
         findings=findings,
-        error=scan_info.get("error")
+        error=scan_info.get("error"),
+        **response_times(scan_info, active_result)
     )
 
 
@@ -798,6 +997,43 @@ async def get_finding_artifact_file(
     if not artifact:
         raise HTTPException(status_code=404, detail="Artifact file not found")
     return artifact
+
+
+@app.get("/api/scan/{scan_id}/findings/{finding_index}/probe")
+async def get_finding_probe(
+    scan_id: str,
+    finding_index: int,
+    auth: tuple = Depends(verify_api_key_or_system)
+):
+    """Return the preflight probe result for a specific finding (or scan-level probe if no per-finding file).
+
+    The probe shows the actual binary path, CLI flags, crash observations, missing shared libs,
+    and interesting strings collected before PoV generation.  Use this to diagnose failures
+    without writing any diagnostic scripts.
+    """
+    probe = get_scan_manager().get_probe_result(scan_id, finding_index)
+    if probe is None:
+        raise HTTPException(status_code=404, detail="Probe result not found for this finding")
+    return {
+        "scan_id": scan_id,
+        "finding_index": finding_index,
+        "probe": probe,
+    }
+
+
+@app.get("/api/scan/{scan_id}/probe")
+async def get_scan_probe(
+    scan_id: str,
+    auth: tuple = Depends(verify_api_key_or_system)
+):
+    """Return the scan-level preflight probe result."""
+    probe = get_scan_manager().get_probe_result(scan_id)
+    if probe is None:
+        raise HTTPException(status_code=404, detail="Probe result not found for this scan")
+    return {
+        "scan_id": scan_id,
+        "probe": probe,
+    }
 
 
 @app.get("/api/scan/{scan_id}/stream")

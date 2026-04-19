@@ -1,0 +1,4 @@
+Waiting for backend health...
+Backend healthy: {"status":"healthy","version":"1.0.0","docker_available":true,"codeql_available":true,"joern_available":false}
+Active scans: {"active_scans":[],"count":0}
+Scan trigger [200]: {"scan_id":"a3c83b27-3839-492a-bdc0-e6464cdbb61a","status":"created","message":"Git repository scan initiated"}

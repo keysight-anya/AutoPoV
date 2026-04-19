@@ -18,6 +18,21 @@ const RUNNING_STATUSES = [
   'running',
 ]
 
+function formatEta(totalSeconds) {
+  if (!Number.isFinite(totalSeconds) || totalSeconds <= 0) return null
+  const mins = Math.ceil(totalSeconds / 60)
+  if (mins < 60) return `${mins}m`
+  const hours = Math.floor(mins / 60)
+  const rem = mins % 60
+  return rem ? `${hours}h ${rem}m` : `${hours}h`
+}
+
+function formatPercent(value) {
+  if (!Number.isFinite(value) || value <= 0) return '0%'
+  if (value >= 10) return `${Math.round(value)}%`
+  return `${value.toFixed(1)}%`
+}
+
 export default function ScanProgress() {
   const { scanId } = useParams()
   const navigate = useNavigate()
@@ -29,8 +44,10 @@ export default function ScanProgress() {
   const [showStopConfirm, setShowStopConfirm] = useState(false)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const [deleting, setDeleting] = useState(false)
+  const [nowMs, setNowMs] = useState(Date.now())
 
   useEffect(() => {
+    const clock = setInterval(() => setNowMs(Date.now()), 1000)
     const pollStatus = async () => {
       try {
         const res = await getScanStatus(scanId)
@@ -82,6 +99,7 @@ export default function ScanProgress() {
 
     return () => {
       clearInterval(interval)
+      clearInterval(clock)
       if (eventSource) eventSource.close()
     }
   }, [scanId, navigate])
@@ -132,12 +150,44 @@ export default function ScanProgress() {
 
   const totalFiles = scanInfo?.result?.language_info?.total_files || scanInfo?.language_info?.total_files || 0
   const totalLoc = scanInfo?.result?.total_loc || scanInfo?.result?.language_info?.total_loc || scanInfo?.language_info?.total_loc || 0
+  const languageInfo = scanInfo?.result?.language_info || scanInfo?.language_info || {}
+  const languageSummary = useMemo(() => {
+    const stats = languageInfo?.language_stats || {}
+    const entries = Object.entries(stats)
+      .map(([language, count]) => [language, Number(count) || 0])
+      .filter(([, count]) => count > 0)
+      .sort((a, b) => b[1] - a[1])
+
+    if (!entries.length) return []
+
+    const denominator = totalFiles || entries.reduce((sum, [, count]) => sum + count, 0)
+    return entries.slice(0, 4).map(([language, count]) => ({
+      language,
+      count,
+      percentage: denominator > 0 ? (count / denominator) * 100 : 0,
+    }))
+  }, [languageInfo, totalFiles])
+
+  const eta = useMemo(() => {
+    if (!scanInfo || !RUNNING_STATUSES.includes(status)) return null
+    const progress = Number(scanInfo?.progress)
+    if (!Number.isFinite(progress) || progress <= 0 || progress >= 100) return null
+    const startedAt = scanInfo?.start_time || scanInfo?.created_at || scanInfo?.result?.start_time || scanInfo?.result?.created_at
+    if (!startedAt) return null
+    const startedMs = new Date(startedAt).getTime()
+    if (!Number.isFinite(startedMs) || startedMs <= 0) return null
+    const elapsedSeconds = Math.max(1, Math.floor((nowMs - startedMs) / 1000))
+    if (elapsedSeconds < 10) return null
+    const totalEstimateSeconds = Math.round(elapsedSeconds / (progress / 100))
+    const remainingSeconds = Math.max(0, totalEstimateSeconds - elapsedSeconds)
+    return { elapsedSeconds, totalEstimateSeconds, remainingSeconds }
+  }, [scanInfo, status, nowMs])
 
   const cfg = useMemo(() => {
     if (RUNNING_STATUSES.includes(status) || status === 'cancelling') {
       return {
         label: status === 'cancelling' ? 'Cancelling scan...' : `Scanning in progress${typeof scanInfo?.progress === 'number' ? ` (${scanInfo.progress}%)` : ''}`,
-        sub: 'Analyzing codebase for vulnerabilities',
+        sub: eta ? `Analyzing codebase for vulnerabilities | ETA ${formatEta(eta.remainingSeconds)} remaining | ~${formatEta(eta.totalEstimateSeconds)} total` : 'Analyzing codebase for vulnerabilities',
         color: 'text-primary-400',
         border: 'border-primary-500/30',
         bg: 'bg-primary-500/5',
@@ -186,7 +236,7 @@ export default function ScanProgress() {
       border: 'border-red-500/30',
       bg: 'bg-red-500/5',
     }
-  }, [status, scanInfo?.progress])
+  }, [status, scanInfo?.progress, eta])
 
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
@@ -325,9 +375,66 @@ export default function ScanProgress() {
         ) : (
           <XCircle className={`w-7 h-7 shrink-0 ${cfg.color}`} />
         )}
-        <div>
+        <div style={{ minWidth: 0, flex: 1 }}>
           <p className={`font-semibold ${cfg.color}`}>{cfg.label}</p>
           <p className="text-sm text-gray-500 mt-0.5">{cfg.sub}</p>
+          {(totalLoc > 0 || totalFiles > 0 || languageSummary.length > 0) && (
+            <div
+              style={{
+                marginTop: 10,
+                display: 'flex',
+                flexWrap: 'wrap',
+                gap: 8,
+                alignItems: 'center',
+                fontFamily: '"JetBrains Mono", monospace',
+                fontSize: 10,
+                letterSpacing: '.06em',
+              }}
+            >
+              {totalLoc > 0 && (
+                <span
+                  style={{
+                    color: 'var(--text3)',
+                    border: '1px solid var(--border2)',
+                    background: 'rgba(255,255,255,0.02)',
+                    borderRadius: 999,
+                    padding: '4px 8px',
+                  }}
+                >
+                  LOC <span style={{ color: 'var(--text2)', marginLeft: 6 }}>{totalLoc.toLocaleString()}</span>
+                </span>
+              )}
+              {totalFiles > 0 && (
+                <span
+                  style={{
+                    color: 'var(--text3)',
+                    border: '1px solid var(--border2)',
+                    background: 'rgba(255,255,255,0.02)',
+                    borderRadius: 999,
+                    padding: '4px 8px',
+                  }}
+                >
+                  FILES <span style={{ color: 'var(--text2)', marginLeft: 6 }}>{totalFiles}</span>
+                </span>
+              )}
+              {languageSummary.map(({ language, percentage, count }) => (
+                <span
+                  key={language}
+                  style={{
+                    color: 'var(--text3)',
+                    border: '1px solid var(--border2)',
+                    background: 'rgba(255,255,255,0.02)',
+                    borderRadius: 999,
+                    padding: '4px 8px',
+                  }}
+                  title={`${count} files`}
+                >
+                  {String(language).toUpperCase()}
+                  <span style={{ color: 'var(--text2)', marginLeft: 6 }}>{formatPercent(percentage)}</span>
+                </span>
+              ))}
+            </div>
+          )}
         </div>
       </div>
 

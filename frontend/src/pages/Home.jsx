@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from 'react'
+
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import ParallaxBg from '../components/ParallaxBg'
-import { scanGit, scanPaste, scanZip } from '../api/client'
+import { listBenchmarks, scanBenchmark, scanGit, scanPaste, scanZip } from '../api/client'
 
 export default function Home() {
   const navigate = useNavigate()
@@ -10,22 +11,66 @@ export default function Home() {
   const [error, setError] = useState(null)
   const [selectedFile, setSelectedFile] = useState(null)
   const [btnPulsing, setBtnPulsing] = useState(false)
+  const [benchmarksLoading, setBenchmarksLoading] = useState(false)
+  const [benchmarksLoaded, setBenchmarksLoaded] = useState(false)
+  const [benchmarks, setBenchmarks] = useState([])
   const [formData, setFormData] = useState({
     gitUrl: '',
     branch: '',
     code: '',
     language: 'python',
     filename: '',
+    benchmarkId: '',
+    benchmarkCaseIds: '',
   })
 
   const fileRef = useRef(null)
   const gitUrlRef = useRef(null)
   const codeRef = useRef(null)
+  const benchmarkRef = useRef(null)
+
+  const selectedBenchmark = useMemo(
+    () => benchmarks.find((benchmark) => benchmark.benchmark_id === formData.benchmarkId) || null,
+    [benchmarks, formData.benchmarkId]
+  )
 
   useEffect(() => {
     if (activeTab === 'git') gitUrlRef.current?.focus()
     if (activeTab === 'paste') codeRef.current?.focus()
+    if (activeTab === 'benchmark') benchmarkRef.current?.focus()
   }, [activeTab])
+
+  useEffect(() => {
+    if (activeTab !== 'benchmark' || benchmarksLoaded) return
+
+    let ignore = false
+    setBenchmarksLoading(true)
+
+    const loadBenchmarks = async () => {
+      try {
+        const response = await listBenchmarks()
+        if (ignore) return
+        const items = response.data?.benchmarks || []
+        setBenchmarks(items)
+        setBenchmarksLoaded(true)
+        setFormData((prev) => ({
+          ...prev,
+          benchmarkId: prev.benchmarkId || items[0]?.benchmark_id || '',
+          benchmarkCaseIds: '',
+        }))
+      } catch (err) {
+        if (ignore) return
+        setError(err.response?.data?.detail || err.message || 'Failed to load benchmarks')
+      } finally {
+        if (!ignore) setBenchmarksLoading(false)
+      }
+    }
+
+    loadBenchmarks()
+    return () => {
+      ignore = true
+    }
+  }, [activeTab, benchmarksLoaded])
 
   const update = (patch) => setFormData((prev) => ({ ...prev, ...patch }))
 
@@ -44,6 +89,14 @@ export default function Home() {
         const fd = new FormData()
         fd.append('file', selectedFile)
         response = await scanZip(fd)
+      } else if (activeTab === 'benchmark') {
+        response = await scanBenchmark({
+          benchmark_id: formData.benchmarkId,
+          case_ids: formData.benchmarkCaseIds
+            .split(',')
+            .map((value) => value.trim())
+            .filter(Boolean),
+        })
       } else {
         response = await scanPaste({
           code: formData.code,
@@ -88,6 +141,26 @@ export default function Home() {
   }
   const textareaStyle = { ...inputBase, resize: 'vertical', minHeight: 180 }
   const selectStyle = { ...inputBase, cursor: 'pointer', appearance: 'none' }
+  const chipStyle = {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 6,
+    padding: '6px 10px',
+    border: '1px solid var(--border2)',
+    background: 'var(--surface2)',
+    color: 'var(--text2)',
+    fontFamily: monoFont,
+    fontSize: 10,
+    letterSpacing: '.08em',
+    textTransform: 'uppercase',
+  }
+
+  const actionLabel =
+    activeTab === 'benchmark'
+      ? 'RUN BENCHMARK'
+      : activeTab === 'paste'
+        ? 'ANALYZE CODE'
+        : 'ANALYZE REPOSITORY'
 
   return (
     <div
@@ -183,6 +256,7 @@ export default function Home() {
             <div className="tabs-group">
               {[
                 { id: 'git', label: 'REPOSITORY URL' },
+                { id: 'benchmark', label: 'BENCHMARK SUITE' },
                 { id: 'zip', label: 'ZIP ARCHIVE' },
                 { id: 'paste', label: 'PASTE CODE' },
               ].map((tab) => (
@@ -214,6 +288,67 @@ export default function Home() {
                     required
                     style={{ ...inputBase, border: 'none', background: 'transparent', flex: 1, paddingLeft: 0 }}
                   />
+                </div>
+              </div>
+            )}
+
+            {activeTab === 'benchmark' && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <div>
+                  <span style={labelStyle}>Managed Benchmark</span>
+                  <select
+                    ref={benchmarkRef}
+                    value={formData.benchmarkId}
+                    onChange={(e) => update({ benchmarkId: e.target.value })}
+                    style={selectStyle}
+                    required
+                    disabled={benchmarksLoading || benchmarks.length === 0}
+                  >
+                    {!benchmarks.length && <option value="">{benchmarksLoading ? 'Loading benchmarks...' : 'No benchmarks available'}</option>}
+                    {benchmarks.map((benchmark) => (
+                      <option key={benchmark.benchmark_id} value={benchmark.benchmark_id}>
+                        {benchmark.display_name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {selectedBenchmark && (
+                  <div
+                    style={{
+                      border: '1px solid var(--border2)',
+                      background: 'var(--surface2)',
+                      padding: 14,
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: 10,
+                    }}
+                  >
+                    <div style={{ fontFamily: monoFont, fontSize: 11, letterSpacing: '.08em', color: 'var(--text1)' }}>
+                      {selectedBenchmark.display_name}
+                    </div>
+                    <div style={{ fontFamily: monoFont, fontSize: 11, color: 'var(--text3)', lineHeight: 1.6 }}>
+                      {selectedBenchmark.description}
+                    </div>
+                    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                      <span style={chipStyle}>{selectedBenchmark.benchmark_family}</span>
+                      <span style={chipStyle}>{selectedBenchmark.language}</span>
+                      <span style={chipStyle}>{selectedBenchmark.installed ? 'cached locally' : 'will install on demand'}</span>
+                    </div>
+                  </div>
+                )}
+
+                <div>
+                  <span style={labelStyle}>Case IDs (optional)</span>
+                  <textarea
+                    value={formData.benchmarkCaseIds}
+                    onChange={(e) => update({ benchmarkCaseIds: e.target.value })}
+                    placeholder="CWE121_Stack_Based_Buffer_Overflow__CWE806_char_declare_memcpy_01, sql-case-1"
+                    style={{ ...textareaStyle, minHeight: 96 }}
+                  />
+                  <div style={{ marginTop: 8, fontFamily: monoFont, fontSize: 10, letterSpacing: '.06em', color: 'var(--text3)' }}>
+                    Leave blank to scan the full managed suite. Separate multiple case IDs with commas for a narrower pilot run.
+                  </div>
                 </div>
               </div>
             )}
@@ -284,7 +419,7 @@ export default function Home() {
 
           <button
             type="submit"
-            disabled={isLoading}
+            disabled={isLoading || (activeTab === 'benchmark' && !formData.benchmarkId)}
             className={`scan-btn${btnPulsing ? ' pulsing' : ''}`}
             style={{ opacity: isLoading ? 0.5 : 1, cursor: isLoading ? 'not-allowed' : 'pointer' }}
           >
@@ -294,7 +429,7 @@ export default function Home() {
                 STARTING SCAN...
               </>
             ) : (
-              'ANALYZE REPOSITORY'
+              actionLabel
             )}
           </button>
         </form>
@@ -302,6 +437,7 @@ export default function Home() {
         {(() => {
           const hasInput =
             (activeTab === 'git' && formData.gitUrl.length > 0) ||
+            (activeTab === 'benchmark' && formData.benchmarkId.length > 0) ||
             (activeTab === 'zip' && selectedFile != null) ||
             (activeTab === 'paste' && formData.code.length > 0)
           if (isLoading) {
