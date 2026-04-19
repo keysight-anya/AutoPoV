@@ -4,17 +4,18 @@
 import hashlib
 import json
 import os
+import secrets
 from datetime import datetime
 
-# Generate a new key
-key_id = "user_key_2024"
-api_key = "apv_user_key_for_testing_12345"
+# Generate a cryptographically random key
+key_id = f"batch_{secrets.token_urlsafe(8)}"
+api_key = f"apov_{secrets.token_urlsafe(32)}"
 
 # Calculate hash (same method as backend)
 key_hash = hashlib.sha256(api_key.encode()).hexdigest()
 
-# Load existing keys
-keys_file = "/home/user/AutoPoV/data/api_keys.json"
+# Load existing keys — resolve path relative to this script
+keys_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "api_keys.json")
 with open(keys_file, 'r') as f:
     data = json.load(f)
 
@@ -22,7 +23,7 @@ with open(keys_file, 'r') as f:
 data[key_id] = {
     "key_id": key_id,
     "key_hash": key_hash,
-    "name": "user",
+    "name": "batch",
     "created_at": datetime.utcnow().isoformat(),
     "last_used": None,
     "is_active": True

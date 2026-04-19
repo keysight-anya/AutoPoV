@@ -37,7 +37,7 @@ function collectOpenRouterUsage(findings, scanOpenRouterUsage = []) {
         return []
       }
     }
-    if (typeof usage === 'object') return [usage]
+    if (typeof usage === 'object') return Object.keys(usage).length > 0 ? [usage] : []
     return []
   }
 
@@ -78,6 +78,30 @@ function collectOpenRouterUsage(findings, scanOpenRouterUsage = []) {
     ;(finding?.refinement_history || []).forEach((item) => {
       pushCall(item?.openrouter_usage, 'pov_refinement', finding, item?.attempt ?? null)
     })
+
+    const hasTrackedUsage =
+      normalizeUsageEntries(finding?.scout_openrouter_usage).length > 0 ||
+      normalizeUsageEntries(finding?.openrouter_usage).length > 0 ||
+      normalizeUsageEntries(finding?.pov_openrouter_usage).length > 0 ||
+      normalizeUsageEntries(finding?.validation_result?.openrouter_usage).length > 0 ||
+      normalizeUsageEntries(finding?.pov_result?.openrouter_usage).length > 0 ||
+      (finding?.refinement_history || []).some((item) => normalizeUsageEntries(item?.openrouter_usage).length > 0)
+
+    if (!hasTrackedUsage && (finding?.model_used || finding?.total_tokens || finding?.prompt_tokens || finding?.completion_tokens)) {
+      calls.push({
+        generation_id: null,
+        agent_role: 'investigator',
+        provider_name: 'ollama',
+        model: finding?.model_used || 'unknown',
+        cost_usd: Number(finding?.cost_usd || 0),
+        tokens_prompt: Number(finding?.prompt_tokens || 0),
+        tokens_completion: Number(finding?.completion_tokens || 0),
+        total_tokens: Number(finding?.total_tokens || 0),
+        native_tokens_reasoning: 0,
+        finding_ref: `${finding?.filepath || 'unknown'}:${finding?.line_number || 0}`,
+        attempt: null,
+      })
+    }
   })
 
   const grouped = new Map()
@@ -200,9 +224,21 @@ export default function Results() {
   const provenFindings = useMemo(() => findings.filter(f => f.final_status === 'confirmed'), [findings])
   const povFindings = useMemo(() => findings.filter(f => f.pov_script || f.pov_result), [findings])
   const realFindings = useMemo(() => findings.filter(f => f.llm_verdict === 'REAL'), [findings])
-  const failedFindings = useMemo(() => findings.filter(f => f.final_status === 'failed'), [findings])
+  const failedFindings = useMemo(() => findings.filter(f =>
+    f.final_status === 'failed' ||
+    f.final_status === 'pov_generation_failed' ||
+    f.final_status === 'pov_failed' ||
+    f.final_status === 'contract_gate_failed' ||
+    f.final_status === 'unproven_contract_gate'
+  ), [findings])
   const unprovenFindings = useMemo(
-    () => findings.filter(f => String(f.final_status || '').startsWith('unproven')),
+    () => findings.filter(f =>
+      String(f.final_status || '').startsWith('unproven') ||
+      f.final_status === 'pov_generation_failed' ||
+      f.final_status === 'pov_failed' ||
+      f.final_status === 'contract_gate_failed' ||
+      (f.llm_verdict === 'REAL' && f.final_status && f.final_status !== 'confirmed')
+    ),
     [findings]
   )
   const falsePositiveFindings = useMemo(
@@ -210,6 +246,10 @@ export default function Results() {
     [findings]
   )
   const openrouterUsage = useMemo(() => collectOpenRouterUsage(findings, result?.scan_openrouter_usage || []), [findings, result])
+  const offlineUsageOnly = useMemo(
+    () => openrouterUsage.summary.length > 0 && openrouterUsage.summary.every((row) => row.provider_name === 'ollama'),
+    [openrouterUsage]
+  )
 
   const counts = useMemo(() => {
     const c = { ALL: findings.length, CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0, INFO: 0 }
@@ -294,13 +334,13 @@ export default function Results() {
           FAILED <span style={{ color: '#f87171', marginLeft: 6 }}>{failedFindings.length}</span>
         </button>
         <button type="button" onClick={() => setViewFilter('unproven')} style={statButtonStyle(viewFilter === 'unproven', '#fde047')}>
-          UNPROVEN <span style={{ color: '#fde047', marginLeft: 6 }}>{unprovenFindings.length}</span>
+          PROOF PENDING <span style={{ color: '#fde047', marginLeft: 6 }}>{unprovenFindings.length}</span>
         </button>
         <button type="button" onClick={() => setViewFilter('false_positive')} style={statButtonStyle(viewFilter === 'false_positive', 'var(--text2)')}>
-          FALSE POS <span style={{ color: 'var(--text2)', marginLeft: 6 }}>{falsePositiveFindings.length}</span>
+          REJECTED <span style={{ color: 'var(--text2)', marginLeft: 6 }}>{falsePositiveFindings.length}</span>
         </button>
         <button type="button" onClick={() => setViewFilter('pov')} style={statButtonStyle(viewFilter === 'pov', 'var(--accent)')}>
-          PoVs <span style={{ color: 'var(--accent)', marginLeft: 6 }}>{povFindings.length}</span>
+          PROOF ATTEMPTS <span style={{ color: 'var(--accent)', marginLeft: 6 }}>{povFindings.length}</span>
         </button>
         <span style={{ color: 'var(--text3)', fontFamily: '"JetBrains Mono", monospace', fontSize: 9, marginLeft: 8 }}>
           FILES <span style={{ color: 'var(--text2)', marginLeft: 6 }}>{totalFiles}</span>
@@ -324,11 +364,12 @@ export default function Results() {
       {openrouterUsage.summary.length > 0 && (
         <div style={{ padding: '12px 20px', borderBottom: '1px solid var(--border1)', background: 'var(--surface1)' }}>
           <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap', fontFamily: '"JetBrains Mono", monospace', fontSize: 10, letterSpacing: '.08em', marginBottom: 10 }}>
-            <span style={{ color: 'var(--text3)' }}>OPENROUTER CALLS <span style={{ color: 'var(--text2)', marginLeft: 6 }}>{openrouterUsage.calls.length}</span></span>
-            <span style={{ color: 'var(--text3)' }}>EXACT COST <span style={{ color: 'var(--text2)', marginLeft: 6 }}>${openrouterUsage.totalCostUsd.toFixed(6)}</span></span>
+            <span style={{ color: 'var(--text3)' }}>{offlineUsageOnly ? 'MODEL CALLS' : 'OPENROUTER CALLS'} <span style={{ color: 'var(--text2)', marginLeft: 6 }}>{openrouterUsage.calls.length}</span></span>
+            <span style={{ color: 'var(--text3)' }}>{offlineUsageOnly ? 'TOTAL TOKENS' : 'EXACT COST'} <span style={{ color: 'var(--text2)', marginLeft: 6 }}>{offlineUsageOnly ? (openrouterUsage.totalPromptTokens + openrouterUsage.totalCompletionTokens + openrouterUsage.totalReasoningTokens).toLocaleString() : `$${openrouterUsage.totalCostUsd.toFixed(6)}`}</span></span>
             <span style={{ color: 'var(--text3)' }}>PROMPT <span style={{ color: 'var(--text2)', marginLeft: 6 }}>{openrouterUsage.totalPromptTokens.toLocaleString()}</span></span>
             <span style={{ color: 'var(--text3)' }}>COMPLETION <span style={{ color: 'var(--text2)', marginLeft: 6 }}>{openrouterUsage.totalCompletionTokens.toLocaleString()}</span></span>
             <span style={{ color: 'var(--text3)' }}>REASONING <span style={{ color: 'var(--text2)', marginLeft: 6 }}>{openrouterUsage.totalReasoningTokens.toLocaleString()}</span></span>
+            <span style={{ color: 'var(--text3)' }}>TOTAL TOKENS <span style={{ color: 'var(--text2)', marginLeft: 6 }}>{(openrouterUsage.totalPromptTokens + openrouterUsage.totalCompletionTokens + openrouterUsage.totalReasoningTokens).toLocaleString()}</span></span>
           </div>
           <div style={{ border: '1px solid var(--border1)', overflow: 'hidden' }}>
             <div style={{ display: 'grid', gridTemplateColumns: '120px 1.6fr 70px 100px 110px', padding: '8px 12px', background: 'var(--surface2)', fontFamily: '"JetBrains Mono", monospace', fontSize: 10, letterSpacing: '.08em', color: 'var(--text3)' }}>
@@ -336,7 +377,7 @@ export default function Results() {
               <span>MODEL</span>
               <span>CALLS</span>
               <span>REASONING</span>
-              <span>COST</span>
+              <span>{offlineUsageOnly ? 'TOKENS' : 'COST'}</span>
             </div>
             {openrouterUsage.summary.map((row, idx) => (
               <div key={`${row.agent_role}:${row.model}:${idx}`} style={{ display: 'grid', gridTemplateColumns: '120px 1.6fr 70px 100px 110px', padding: '8px 12px', borderTop: idx === 0 ? 'none' : '1px solid var(--border1)', fontFamily: '"JetBrains Mono", monospace', fontSize: 10, color: 'var(--text2)' }}>
@@ -344,7 +385,7 @@ export default function Results() {
                 <span style={{ color: 'var(--accent)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.model}</span>
                 <span>{row.calls}</span>
                 <span>{row.reasoning_tokens.toLocaleString()}</span>
-                <span>${row.cost_usd.toFixed(6)}</span>
+                <span>{offlineUsageOnly ? (row.prompt_tokens + row.completion_tokens + row.reasoning_tokens).toLocaleString() : `$${row.cost_usd.toFixed(6)}`}</span>
               </div>
             ))}
           </div>
@@ -374,3 +415,6 @@ export default function Results() {
     </div>
   )
 }
+
+
+

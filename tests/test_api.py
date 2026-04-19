@@ -38,6 +38,23 @@ class TestScanEndpoints:
         response = client.get("/api/scan/test-id")
         assert response.status_code == 403
 
+    def test_list_benchmarks_without_auth(self):
+        """Test benchmark listing requires authentication"""
+        response = client.get("/api/benchmarks")
+        assert response.status_code == 403
+
+    def test_install_benchmark_without_auth(self):
+        """Test benchmark install requires authentication"""
+        response = client.post("/api/benchmarks/juliet-dynamic/install")
+        assert response.status_code == 403
+
+    def test_benchmark_scan_without_auth(self):
+        """Test benchmark scan requires authentication"""
+        response = client.post("/api/scan/benchmark", json={
+            "manifest_path": "/tmp/example-manifest.json"
+        })
+        assert response.status_code == 403
+
 
 class TestWebhookEndpoints:
     """Test webhook endpoints"""

@@ -129,6 +129,7 @@ class OpenRouterReasoningChat:
         timeout: int,
         default_headers: Dict[str, str] | None = None,
         reasoning_enabled: bool = True,
+        max_tokens: Optional[int] = None,
     ) -> None:
         self.model = model
         self.api_key = api_key
@@ -137,6 +138,7 @@ class OpenRouterReasoningChat:
         self.timeout = timeout
         self.default_headers = default_headers or {}
         self.reasoning_enabled = reasoning_enabled
+        self.max_tokens = max_tokens  # None = no cap; model uses what it needs
         self._autopov_model_name = model
 
     def _serialize_content(self, content: Any) -> str:
@@ -265,13 +267,36 @@ class OpenRouterReasoningChat:
         }
         if self.reasoning_enabled:
             payload['reasoning'] = {'enabled': True}
+        # Only set max_tokens if a cap is explicitly configured.
+        # When None (default), the payload omits max_tokens entirely so the model
+        # can generate a complete response without being truncated mid-output.
+        if self.max_tokens is not None:
+            payload['max_tokens'] = self.max_tokens
 
-        response = requests.post(
-            f'{self.base_url}/chat/completions',
-            headers=self._headers(),
-            json=payload,
-            timeout=self.timeout,
-        )
+        def _do_request(p: Dict[str, Any]) -> requests.Response:
+            return requests.post(
+                f'{self.base_url}/chat/completions',
+                headers=self._headers(),
+                json=p,
+                timeout=self.timeout,
+            )
+
+        response = _do_request(payload)
+
+        # 402 = insufficient credits.
+        # If no cap was set, retry once with a conservative 4096 token cap so
+        # we can at least get a partial response rather than a hard failure.
+        # If a cap was already set, halve it and retry once.
+        if response.status_code == 402:
+            current_max = payload.get('max_tokens')
+            if current_max is None:
+                retry_max = 4096  # conservative fallback when no cap was set
+            else:
+                retry_max = max(512, current_max // 2)
+            payload['max_tokens'] = retry_max
+            print(f"    [warn] 402 insufficient credits — retrying with max_tokens={retry_max}")
+            response = _do_request(payload)
+
         try:
             response.raise_for_status()
         except requests.HTTPError as exc:

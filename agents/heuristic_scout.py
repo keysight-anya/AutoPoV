@@ -15,6 +15,25 @@ class HeuristicScout:
 
     def __init__(self):
         self.max_findings = settings.SCOUT_MAX_FINDINGS
+        # Confidence values per signal category — higher for patterns that have a
+        # tight source→sink correlation (security-critical sinks with concrete triggers)
+        # vs broader structural signals that often need taint confirmation.
+        self._signal_confidence: dict = {
+            'sql_injection_signal': 0.55,
+            'xss_signal': 0.50,
+            'path_traversal_signal': 0.52,
+            'command_injection_signal': 0.60,
+            'dynamic_execution_signal': 0.55,
+            'unsafe_deserialization_signal': 0.60,
+            'memory_corruption_signal': 0.50,
+            'integer_overflow_signal': 0.38,
+            'lifecycle_misuse_signal': 0.40,
+            # Python-specific source signals: medium confidence as they identify
+            # input *sources* rather than full source→sink flows.
+            'python_cli_taint_signal': 0.42,
+            'python_flask_taint_signal': 0.45,
+            'python_django_taint_signal': 0.45,
+        }
         self._patterns = {
             "sql_injection_signal": [
                 re.compile(r"(SELECT|INSERT|UPDATE|DELETE).*\+", re.IGNORECASE),
@@ -59,6 +78,19 @@ class HeuristicScout:
             ],
             "lifecycle_misuse_signal": [
                 re.compile(r"\bfree\s*\(\s*\w+\s*\)", re.IGNORECASE),
+            ],
+            "python_cli_taint_signal": [
+                re.compile(r"sys\.argv\[\d+\]", re.IGNORECASE),
+                re.compile(r"\.parse_args\(\)\.(\w+)", re.IGNORECASE),
+            ],
+            "python_flask_taint_signal": [
+                re.compile(r"request\.(args|form|values|json|data|get_json)\b", re.IGNORECASE),
+                re.compile(r"flask\.request\.(args|form|values|json)\b", re.IGNORECASE),
+            ],
+            "python_django_taint_signal": [
+                re.compile(r"request\.GET\b", re.IGNORECASE),
+                re.compile(r"request\.POST\b", re.IGNORECASE),
+                re.compile(r"request\.data\b", re.IGNORECASE),
             ],
         }
         self._generic_patterns = [
@@ -153,7 +185,8 @@ class HeuristicScout:
                     for label, patterns in self._patterns.items():
                         for pattern in patterns:
                             if pattern.search(line):
-                                findings.append(self._build_finding(rel_path, line_idx, line, language, label, 0.35, f'Heuristic signal: {label}', 'heuristic'))
+                                conf = self._signal_confidence.get(label, 0.38)
+                                findings.append(self._build_finding(rel_path, line_idx, line, language, label, conf, f'Heuristic signal: {label}', 'heuristic'))
                                 if len(findings) >= self.max_findings:
                                     return findings
                                 break

@@ -15,11 +15,22 @@ RUN apt-get update && apt-get install -y \
     lsb-release \
     nodejs \
     npm \
+    default-jdk \
     python3-dev \
     gcc \
     g++ \
     make \
+    cmake \
+    ninja-build \
+    meson \
+    autoconf \
+    automake \
+    libtool \
+    pkg-config \
+    file \
+    libmagic1 \
     libffi-dev \
+    binutils \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Docker CLI (for Docker-in-Docker)
@@ -40,28 +51,40 @@ RUN wget -q https://github.com/github/codeql-cli-binaries/releases/download/v2.2
 # Set CodeQL environment variable
 ENV CODEQL_CLI_PATH=/usr/local/bin/codeql
 
-# Download CodeQL standard query packs for all supported languages
+# Download CodeQL standard query packs for primary supported languages.
+# These are the languages where CodeQL provides taint analysis and deep semantic
+# queries that Semgrep cannot replicate. Semgrep is used as fallback/supplemental
+# for languages not listed here or when a CodeQL run fails.
+# NOTE: no '|| true' — a failed pack download should fail the build loudly.
 RUN mkdir -p /usr/local/codeql/packs \
     && codeql pack download --dir /usr/local/codeql/packs \
         codeql/cpp-queries \
-        codeql/javascript-queries \
         codeql/python-queries \
-        codeql/java-queries \
-        codeql/go-queries \
-        codeql/ruby-queries \
-        codeql/csharp-queries \
-    || true
+        codeql/javascript-queries \
+        codeql/java-queries
+
+# Install Joern CLI for CPG-based taint analysis (C/C++, Java, JS, Python)
+# Download the pre-built zip directly — the install.sh script silently drops files
+# into a versioned subdirectory that varies by release, making the symlink brittle.
+RUN wget -q https://github.com/joernio/joern/releases/download/v4.0.341/joern-cli.zip \
+    -O /tmp/joern-cli.zip \
+    && unzip -q /tmp/joern-cli.zip -d /usr/local/joern \
+    && rm /tmp/joern-cli.zip \
+    && chmod +x /usr/local/joern/joern-cli/joern \
+    && ln -sf /usr/local/joern/joern-cli/joern /usr/local/bin/joern \
+    && joern --version
+
+ENV JOERN_CLI_PATH=/usr/local/bin/joern
 
 # Copy requirements first for better caching
 COPY requirements.txt .
 
 # Install Python dependencies
-RUN pip install --no-cache-dir --default-timeout=1000 -r requirements.txt
-
-# Cache bust to ensure fresh code copy
-ARG CACHE_BUST=1
+RUN pip install --no-cache-dir --default-timeout=1000 -r requirements.txt     && npm install -g yarn pnpm     && python -m playwright install chromium
 
 # Copy the application code
+# Pass --build-arg CACHE_BUST=$(date +%s) to bust from this point forward.
+ARG CACHE_BUST=1
 COPY . .
 
 # Create necessary directories

@@ -69,6 +69,9 @@ export const scanZip = (formData) => apiClient.post('/scan/zip', formData, {
   }
 })
 export const scanPaste = (data) => apiClient.post('/scan/paste', data)
+export const listBenchmarks = () => apiClient.get('/benchmarks')
+export const installBenchmark = (benchmarkId) => apiClient.post(`/benchmarks/${benchmarkId}/install`)
+export const scanBenchmark = (data) => apiClient.post('/scan/benchmark', data)
 
 export const getScanStatus = (scanId) => apiClient.get(`/scan/${scanId}`)
 

@@ -1,0 +1,19 @@
+{
+  "health": {
+    "status": "healthy",
+    "version": "1.0.0",
+    "docker_available": true,
+    "codeql_available": true,
+    "joern_available": false
+  },
+  "active_scans": {
+    "active_scans": [],
+    "count": 0
+  },
+  "submit": {
+    "scan_id": "658e5a52-615b-4307-aaf5-95bb2a94d2a3",
+    "status": "created",
+    "message": "Git repository scan initiated"
+  },
+  "scan_id": "658e5a52-615b-4307-aaf5-95bb2a94d2a3"
+}

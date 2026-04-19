@@ -282,28 +282,51 @@ try {
             results.append(TestResult(result.get("success", False), result.get("vulnerability_triggered", False), 0, result.get("stdout", ""), result.get("stderr", ""), result.get("exit_code", -1), {"mock_input": mock_input, "test_type": "mock"}))
         return results
 
-    def _evaluate_exploit_oracle(self, cwe_type: str, stdout: str, stderr: str, execution_time: float, exploit_contract: Dict[str, Any] | None = None) -> Dict[str, Any]:
-        combined_output = (stdout + stderr).lower()
+    def _evaluate_exploit_oracle(self, cwe_type: str, stdout: str, stderr: str, execution_time: float, exploit_contract: Dict[str, Any] | None = None, exit_code: int = 0) -> Dict[str, Any]:
+        stdout_lower = (stdout or "").lower()
+        stderr_lower = (stderr or "").lower()
+        combined_output = (stdout or "") + (stderr or "")
+        combined_lower = combined_output.lower()
         evidence = []
+        strong_evidence = []
+        heuristic_evidence = []
         confidence = "low"
         method = None
-        if "vulnerability triggered" in combined_output:
-            evidence.append("PoV printed 'VULNERABILITY TRIGGERED'")
-            confidence = "low"
-            method = "string_match"
         exploit_contract = exploit_contract or {}
         oracle = self.CWE_ORACLES.get(cwe_type, {})
+
+        runtime_error_markers = [
+            "test harness error",
+            "referenceerror",
+            "syntaxerror",
+            "traceback",
+            "nameerror",
+            "typeerror",
+            "exception:",
+        ]
+        hard_runtime_failure = exit_code not in (0, None) and any(marker in stderr_lower for marker in runtime_error_markers)
+
+        if "vulnerability triggered" in combined_lower:
+            msg = "PoV printed 'VULNERABILITY TRIGGERED'"
+            evidence.append(msg)
+            strong_evidence.append(msg)
+            confidence = "high"
+            method = "string_match"
         for pattern in exploit_contract.get("success_indicators", []):
             token = str(pattern).strip().lower()
-            if token and token in combined_output:
-                evidence.append(f"Contract success indicator found: '{pattern}'")
+            if token and token in stdout_lower:
+                msg = f"Contract success indicator found in stdout: '{pattern}'"
+                evidence.append(msg)
+                strong_evidence.append(msg)
                 confidence = "high"
                 method = method or "contract_output"
         expected_patterns = list(oracle.get("expected_output_patterns", []))
         expected_patterns.extend([str(x) for x in exploit_contract.get("success_indicators", []) if x])
         for pattern in expected_patterns:
-            if str(pattern).lower() in combined_output:
-                evidence.append(f"Expected pattern found: '{pattern}'")
+            if str(pattern).lower() in stdout_lower:
+                msg = f"Expected pattern found in stdout: '{pattern}'"
+                evidence.append(msg)
+                strong_evidence.append(msg)
                 confidence = "high"
                 method = method or "output_pattern"
         from app.config import settings
@@ -319,37 +342,53 @@ try {
                     with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                         file_content = f.read()
                     if any(str(pattern).lower() in file_content.lower() for pattern in content_patterns if pattern):
-                        evidence.append(f"Observed side effect file: {file_path}")
+                        msg = f"Observed side effect file: {file_path}"
+                        evidence.append(msg)
+                        strong_evidence.append(msg)
                         confidence = "high"
                         method = method or "side_effect_file"
                     os.remove(file_path)
             except Exception:
                 pass
         for pattern in oracle.get("error_patterns", []):
-            if pattern.lower() in combined_output:
-                evidence.append(f"Error pattern found: '{pattern}'")
+            if pattern.lower() in combined_lower:
+                msg = f"Error pattern found: '{pattern}'"
+                evidence.append(msg)
+                heuristic_evidence.append(msg)
                 if confidence == "low":
                     confidence = "medium"
                     method = method or "error_pattern"
         for pattern in oracle.get("dom_patterns", []):
-            if pattern.lower() in combined_output:
-                evidence.append(f"DOM manipulation found: '{pattern}'")
-                confidence = "high"
+            if pattern.lower() in stdout_lower:
+                msg = f"DOM manipulation found in stdout: '{pattern}'"
+                evidence.append(msg)
+                heuristic_evidence.append(msg)
+                confidence = "medium" if confidence == "low" else confidence
                 method = method or "dom_pattern"
         timing_threshold = oracle.get("timing_threshold_s")
         if timing_threshold and execution_time >= timing_threshold:
-            evidence.append(f"Time-based detection: {execution_time:.2f}s >= {timing_threshold}s")
+            msg = f"Time-based detection: {execution_time:.2f}s >= {timing_threshold}s"
+            evidence.append(msg)
+            heuristic_evidence.append(msg)
             confidence = "medium"
             method = method or "timing"
         generic_indicators = [exploit_contract.get("expected_outcome", ""), exploit_contract.get("goal", ""), *exploit_contract.get("inputs", []), *exploit_contract.get("trigger_steps", [])]
         for indicator in generic_indicators:
             token = str(indicator).strip().lower()
-            if token and token in combined_output:
-                evidence.append(f"Generic exploit indicator found: '{indicator}'")
+            if token and token in stdout_lower:
+                msg = f"Generic exploit indicator found in stdout: '{indicator}'"
+                evidence.append(msg)
+                heuristic_evidence.append(msg)
                 if confidence == "low":
                     confidence = "medium"
                 method = method or "generic_contract"
-        return {"triggered": len(evidence) > 0, "confidence": confidence, "evidence": evidence, "method": method, "cwe_description": oracle.get("description", "Generic exploit validation"), "exploit_goal": exploit_contract.get("goal", "")}
+
+        if hard_runtime_failure and not strong_evidence:
+            evidence.append(f"Runtime failed before a strong exploit oracle was observed (exit_code={exit_code})")
+            return {"triggered": False, "confidence": "low", "evidence": evidence, "method": method or "runtime_error", "cwe_description": oracle.get("description", "Generic exploit validation"), "exploit_goal": exploit_contract.get("goal", "")}
+
+        triggered = len(strong_evidence) > 0 or (exit_code == 0 and len(heuristic_evidence) > 0)
+        return {"triggered": triggered, "confidence": confidence, "evidence": evidence, "method": method, "cwe_description": oracle.get("description", "Generic exploit validation"), "exploit_goal": exploit_contract.get("goal", "")}
 
     def validate_syntax(self, pov_script: str, runtime_profile: str = "python") -> Dict[str, Any]:
         runtime = self._normalize_runtime(runtime_profile)
@@ -381,3 +420,4 @@ unit_test_runner = UnitTestRunner()
 
 def get_unit_test_runner() -> UnitTestRunner:
     return unit_test_runner
+

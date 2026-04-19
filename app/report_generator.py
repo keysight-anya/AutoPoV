@@ -536,6 +536,54 @@ class ReportGenerator:
             proof_parts.append(f"Observed stdout: {str(stdout)[:240]}")
         return ' '.join(proof_parts)
 
+    def _failure_reason_for_finding(self, finding: Dict[str, Any]) -> str:
+        """Return a specific, honest reason explaining why a finding was not proven.
+
+        Covers every gate in the pipeline so the report never shows the misleading
+        fallback 'Proof was attempted but not established' for a finding that was
+        never actually attempted.
+        """
+        status = finding.get('final_status', '')
+        pov_result = finding.get('pov_result') or {}
+
+        if status == 'unproven_low_confidence':
+            conf = finding.get('confidence', 0.0)
+            return (f"Confidence {conf:.2f} was below the proof threshold — "
+                    "investigation verdict was uncertain")
+
+        if status == 'unproven_budget_exhausted':
+            return ("Proof budget cap (PROOF_MAX_FINDINGS) was reached; "
+                    "no attempt was made for this finding")
+
+        if status in {'unproven_contract_gate', 'contract_gate_failed'}:
+            reasons = (
+                finding.get('contract_gate_reasons')
+                or (finding.get('validation_result') or {}).get('issues')
+                or []
+            )
+            if reasons:
+                return "Contract gate blocked PoV: " + "; ".join(str(r) for r in reasons[:3])
+            return "Contract gate blocked PoV generation (missing entrypoint or success indicators)"
+
+        if status == 'pov_generation_failed':
+            err = (pov_result.get('error')
+                   or finding.get('pov_error')
+                   or 'Model returned no usable script')
+            return f"PoV generation failed: {err}"
+
+        if status == 'unproven_lite':
+            return "LITE_MODE is enabled — PoV generation was skipped for all findings"
+
+        if status == 'skipped_lite':
+            return "LITE_MODE is enabled — finding confidence was below threshold, no attempt made"
+
+        # Fallback: script was generated but runtime did not confirm
+        return (
+            pov_result.get('proof_summary')
+            or pov_result.get('stderr')
+            or "Proof script was generated but runtime execution did not confirm the vulnerability"
+        )
+
     def _risk_rating(self, result: ScanResult) -> str:
         if result.confirmed_vulns >= 3:
             return 'High'
@@ -597,7 +645,17 @@ class ReportGenerator:
         language_info = getattr(result, 'language_info', {}) or {}
         detected_language = getattr(result, 'detected_language', None) or language_info.get('primary', 'unknown')
         confirmed = [f for f in (result.findings or []) if f.get('final_status') == 'confirmed']
-        unproven = [f for f in (result.findings or []) if f.get('final_status') in {'failed'} or (f.get('pov_script') and f.get('final_status') != 'confirmed')]
+        _NOT_CONFIRMED = {
+            'failed', 'pov_generation_failed', 'pov_failed',
+            'unproven_low_confidence', 'unproven_budget_exhausted',
+            'unproven_contract_gate', 'contract_gate_failed',
+            'unproven_lite', 'skipped_lite',
+        }
+        unproven = [
+            f for f in (result.findings or [])
+            if f.get('final_status') in _NOT_CONFIRMED
+            or (f.get('llm_verdict') == 'REAL' and f.get('final_status') not in {'confirmed'})
+        ]
         false_positives = [f for f in (result.findings or []) if f.get('final_status') == 'skipped']
 
         pdf = ProfessionalPDFReport()
@@ -704,7 +762,7 @@ class ReportGenerator:
             pdf.table_header(headers, widths)
             for i, finding in enumerate(unproven[:25]):
                 pov_result = finding.get('pov_result') or {}
-                reason = (pov_result.get('proof_summary') or pov_result.get('stderr') or 'Proof was attempted but not established')
+                reason = self._failure_reason_for_finding(finding)
                 pdf.table_row([
                     f"{finding.get('filepath', 'N/A')}:{finding.get('line_number', 'N/A')}",
                     finding.get('final_status', 'unproven'),
@@ -715,6 +773,45 @@ class ReportGenerator:
             pdf.body_text('These findings were investigated and in some cases had PoV scripts generated, but runtime evidence was insufficient to classify them as proven vulnerabilities.')
         else:
             pdf.body_text('No unproven findings were recorded.')
+
+        # Proof Failure Breakdown — categorized count of why proofs did not happen
+        all_findings = result.findings or []
+        breakdown = {
+            'contract_gate': sum(1 for f in all_findings if f.get('final_status') in {'unproven_contract_gate', 'contract_gate_failed'}),
+            'low_confidence': sum(1 for f in all_findings if f.get('final_status') == 'unproven_low_confidence'),
+            'budget_exhausted': sum(1 for f in all_findings if f.get('final_status') == 'unproven_budget_exhausted'),
+            'generation_failed': sum(1 for f in all_findings if f.get('final_status') in {'pov_generation_failed', 'pov_failed'}),
+            'runtime_unconfirmed': sum(
+                1 for f in all_findings
+                if f.get('pov_script') and not (f.get('pov_result') or {}).get('vulnerability_triggered')
+                and f.get('final_status') not in {'confirmed'}
+            ),
+        }
+        if any(v > 0 for v in breakdown.values()):
+            pdf.section_header('Proof Failure Breakdown')
+            pdf.body_text(
+                'The following table shows how many REAL findings failed at each stage of the proof pipeline. '
+                'Each category has a distinct cause and remediation path.'
+            )
+            headers = ['Failure Category', 'Count', 'Cause and Remediation']
+            widths = [58, 16, 112]
+            pdf.table_header(headers, widths)
+            breakdown_rows = [
+                ('Contract gate blocked', breakdown['contract_gate'],
+                 'target_entrypoint or success_indicators not resolved — improve investigation prompt'),
+                (f'Below confidence {settings.MIN_CONFIDENCE_FOR_POV:.2f}', breakdown['low_confidence'],
+                 'Investigation verdict was marginal — lower MIN_CONFIDENCE_FOR_POV or review finding'),
+                ('Proof budget exhausted', breakdown['budget_exhausted'],
+                 'PROOF_MAX_FINDINGS cap hit — raise cap or run scan in smaller batches'),
+                ('Generation model error', breakdown['generation_failed'],
+                 'Model returned no usable script — check token budget and model availability'),
+                ('Runtime not confirmed', breakdown['runtime_unconfirmed'],
+                 'Script ran but did not produce expected crash/signal — review oracle and harness'),
+            ]
+            for i, (label, count, note) in enumerate(breakdown_rows):
+                if count > 0:
+                    pdf.table_row([label, str(count), note], widths, alternate=bool(i % 2))
+            pdf.ln(2)
 
         pdf.section_header('False Positive Disposition')
         pdf.body_text(

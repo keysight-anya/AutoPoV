@@ -28,11 +28,132 @@ function getSeverity(finding) {
 }
 
 
+function getFailureReason(finding) {
+  const status = finding.final_status || ''
+  const povResult = finding.pov_result || {}
+  const validation = finding.validation_result || {}
+
+  if (status === 'unproven_low_confidence') {
+    const conf = (finding.confidence || 0)
+    return `Confidence ${(conf * 100).toFixed(0)}% was below the proof threshold — investigation verdict was uncertain`
+  }
+  if (status === 'unproven_budget_exhausted') {
+    return 'Proof budget cap was reached — no attempt was made for this finding'
+  }
+  if (status === 'contract_gate_failed' || status === 'unproven_contract_gate') {
+    const reasons = finding.contract_gate_reasons || validation.issues || []
+    if (reasons.length > 0) return 'Contract gate blocked PoV: ' + reasons.slice(0, 2).join('; ')
+    return 'Contract gate blocked PoV generation (missing entrypoint or success indicators)'
+  }
+  if (status === 'pov_generation_failed' || status === 'failed') {
+    const err = povResult.error || finding.pov_error || 'Model returned no usable script'
+    return `PoV generation failed: ${err}`
+  }
+  if (status === 'unproven_lite' || status === 'skipped_lite') {
+    return 'LITE_MODE is enabled — PoV generation was skipped'
+  }
+  return null
+}
+
 function sentenceCase(value) {
   if (!value) return ''
   const text = String(value).replace(/[_-]+/g, ' ').trim()
   if (!text) return ''
   return text.charAt(0).toUpperCase() + text.slice(1)
+}
+
+const CWE_LABELS = {
+  'CWE-20': 'Improper Input Validation',
+  'CWE-22': 'Path Traversal',
+  'CWE-78': 'OS Command Injection',
+  'CWE-79': 'Cross-Site Scripting',
+  'CWE-89': 'SQL Injection',
+  'CWE-94': 'Code Injection',
+  'CWE-120': 'Buffer Overflow',
+  'CWE-121': 'Stack Buffer Overflow',
+  'CWE-122': 'Heap Buffer Overflow',
+  'CWE-125': 'Out-of-bounds Read',
+  'CWE-134': 'Format String',
+  'CWE-190': 'Integer Overflow',
+  'CWE-200': 'Information Exposure',
+  'CWE-352': 'Cross-Site Request Forgery',
+  'CWE-416': 'Use After Free',
+  'CWE-476': 'Null Pointer Dereference',
+  'CWE-502': 'Deserialization of Untrusted Data',
+  'CWE-798': 'Hard-coded Credentials',
+  'CWE-862': 'Missing Authorization',
+}
+
+function inferUnmappedWeaknessLabel(finding) {
+  const explanation = String(finding?.llm_explanation || '').toLowerCase()
+  const code = String(finding?.code_chunk || '').toLowerCase()
+  const filepath = String(finding?.filepath || '').toLowerCase()
+  const entrypoint = String(finding?.exploit_contract?.target_entrypoint || '').toLowerCase()
+  const profile = String(finding?.execution_profile || finding?.detected_language || '').toLowerCase()
+
+  if (explanation.includes('null') && explanation.includes('dereference')) return 'Null Dereference Risk'
+  if (code.includes('strcpy') || code.includes('memcpy') || code.includes('sprintf(') || code.includes('gets(')) return 'Unsafe Memory Operation'
+  if (explanation.includes('authorization') || explanation.includes('access control') || explanation.includes('auth bypass')) return 'Authorization Bypass Risk'
+  if (explanation.includes('xss') || explanation.includes('cross-site scripting') || code.includes('innerhtml') || code.includes('<script')) return 'Script Injection Risk'
+  if (explanation.includes('code execution') || explanation.includes('command injection') || explanation.includes('eval(') || code.includes('system(') || code.includes('popen(')) return 'Code Execution Risk'
+  if (explanation.includes('path traversal') || explanation.includes('directory traversal')) return 'Path Traversal Risk'
+  if (explanation.includes('information disclosure') || explanation.includes('information exposure') || explanation.includes('sensitive')) return 'Information Exposure Risk'
+  if (entrypoint.includes('load') || filepath.endsWith('.js') || profile === 'javascript') return 'Unsafe Script Loading Path'
+  if (profile === 'c' || profile === 'cpp' || filepath.endsWith('.c') || filepath.endsWith('.cpp') || filepath.endsWith('.cc')) return 'Unsafe Native Code Path'
+  if (profile === 'php' || filepath.endsWith('.php')) return 'Unsafe Server-side Execution Path'
+  if (profile === 'python' || filepath.endsWith('.py')) return 'Unsafe Python Execution Path'
+  return 'Unmapped Vulnerability Pattern'
+}
+
+function getWeaknessLabel(finding) {
+  const cwe = String(finding?.cwe_type || '').trim().toUpperCase()
+  if (!cwe || cwe === 'UNCLASSIFIED' || cwe === 'UNKNOWN') return inferUnmappedWeaknessLabel(finding)
+  return CWE_LABELS[cwe] || sentenceCase(cwe)
+}
+
+function getClassificationLabel(finding) {
+  const cwe = String(finding?.cwe_type || '').trim().toUpperCase()
+  if (!cwe || cwe === 'UNCLASSIFIED' || cwe === 'UNKNOWN') return 'CWE Unmapped'
+  return cwe
+}
+
+function getVerdictTone(finding) {
+  const verdict = String(finding?.llm_verdict || '').toUpperCase()
+  if (verdict === 'REAL') return { label: 'Real', color: '#f59e0b', border: 'rgba(245,158,11,0.35)' }
+  if (verdict === 'FALSE_POSITIVE') return { label: 'Rejected', color: 'var(--text2)', border: 'var(--border2)' }
+  return { label: 'Needs Review', color: 'var(--text3)', border: 'var(--border2)' }
+}
+
+function getProofTone(finding, povResult) {
+  if (finding.final_status === 'confirmed') {
+    return { label: 'Proven', color: '#22c55e', border: 'rgba(34,197,94,0.35)' }
+  }
+  if (
+    finding.final_status === 'failed' ||
+    finding.final_status === 'pov_generation_failed' ||
+    finding.final_status === 'pov_failed'
+  ) {
+    return { label: 'Proof Failed', color: '#f87171', border: 'rgba(248,113,113,0.35)' }
+  }
+  if (
+    finding.final_status === 'contract_gate_failed' ||
+    finding.final_status === 'unproven_contract_gate'
+  ) {
+    return { label: 'Gate Blocked', color: '#f97316', border: 'rgba(249,115,22,0.35)' }
+  }
+  if (finding.final_status === 'unproven_low_confidence') {
+    return { label: 'Below Threshold', color: '#fde047', border: 'rgba(253,224,71,0.35)' }
+  }
+  if (finding.final_status === 'unproven_budget_exhausted') {
+    return { label: 'Budget Exhausted', color: '#a78bfa', border: 'rgba(167,139,250,0.35)' }
+  }
+  if (finding.final_status === 'unproven_lite' || finding.final_status === 'skipped_lite') {
+    return { label: 'Lite Mode Skip', color: 'var(--text3)', border: 'var(--border2)' }
+  }
+  if (String(finding.final_status || '').startsWith('unproven') || finding.pov_script || finding.validation_result || povResult) {
+    return { label: 'Proof Pending', color: '#fde047', border: 'rgba(253,224,71,0.35)' }
+  }
+  return { label: 'Analyzed', color: 'var(--text3)', border: 'var(--border2)' }
 }
 
 function summarizeObservedOutcome(povResult) {
@@ -120,8 +241,14 @@ export default function FindingCard({ finding, forceExpanded = false, scanId = '
   const staticResult = validation?.static_result
   const povResult = finding.pov_result || finding.pov_test_result
 
+  const failureReason = getFailureReason(finding)
+
   const taxonomyRefs = Array.isArray(finding.taxonomy_refs) ? finding.taxonomy_refs.filter(Boolean) : []
   const proofNarrative = buildProofNarrative(finding, povResult)
+  const weaknessLabel = getWeaknessLabel(finding)
+  const classificationLabel = getClassificationLabel(finding)
+  const verdictTone = getVerdictTone(finding)
+  const proofTone = getProofTone(finding, povResult)
 
   useEffect(() => {
     let cancelled = false
@@ -167,16 +294,7 @@ export default function FindingCard({ finding, forceExpanded = false, scanId = '
     }
   }
 
-  const proofLabel =
-    finding.final_status === 'confirmed' ? 'PROVEN'
-  : finding.final_status === 'failed' ? 'PROOF FAILED'
-  : finding.pov_script || finding.validation_result || povResult ? 'UNPROVEN'
-  : 'ANALYZED'
-
-  const statusColor =
-    finding.final_status === 'confirmed' ? '#22c55e'
-  : finding.final_status === 'failed' ? '#f87171'
-  : '#fde047'
+  const statusColor = proofTone.color
 
   return (
     <div style={{
@@ -198,46 +316,79 @@ export default function FindingCard({ finding, forceExpanded = false, scanId = '
         {/* Status dot */}
         <span style={{ color: statusColor, fontSize: 10, flexShrink: 0 }}>●</span>
 
-        {/* CWE badge */}
-        <span style={{
-          fontFamily: '"JetBrains Mono", monospace',
-          fontSize: 9, letterSpacing: '.1em',
-          padding: '2px 8px',
-          border: `1px solid ${sevColor}`,
-          color: sevColor,
-          flexShrink: 0,
+        <div style={{
+          flex: 1,
+          minWidth: 0,
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
+          overflow: 'hidden',
+          whiteSpace: 'nowrap',
         }}>
-          {finding.cwe_type || 'UNCLASSIFIED'}
-        </span>
-
-        {/* File path */}
-        <span style={{
-          fontFamily: '"JetBrains Mono", monospace',
-          fontSize: 10, color: 'var(--text2)',
-          flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-        }}>
-          {finding.filepath}:{finding.line_number}
-        </span>
-
-        {/* Confidence */}
-        <span style={{
-          fontFamily: '"JetBrains Mono", monospace',
-          fontSize: 9, letterSpacing: '.06em',
-          color: finding.confidence >= 0.8 ? '#22c55e'
-               : finding.confidence >= 0.6 ? '#fde047' : '#f87171',
-          flexShrink: 0,
-        }}>
-          {(finding.confidence * 100).toFixed(0)}%
-        </span>
-
-        <span style={{
-          fontFamily: '"JetBrains Mono", monospace',
-          fontSize: 9, letterSpacing: '.08em',
-          color: statusColor,
-          flexShrink: 0,
-        }}>
-          {proofLabel}
-        </span>
+          <span style={{
+            fontSize: 13,
+            color: 'var(--text1)',
+            fontWeight: 600,
+            flexShrink: 0,
+          }}>
+            {weaknessLabel}
+          </span>
+          <span style={{
+            fontFamily: '"JetBrains Mono", monospace',
+            fontSize: 9,
+            letterSpacing: '.08em',
+            padding: '2px 8px',
+            border: '1px solid var(--border2)',
+            color: 'var(--text2)',
+            flexShrink: 0,
+          }}>
+            {classificationLabel}
+          </span>
+          <span style={{
+            fontFamily: '"JetBrains Mono", monospace',
+            fontSize: 10,
+            color: 'var(--text2)',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+            minWidth: 0,
+            flex: 1,
+          }}>
+            {finding.filepath}:{finding.line_number}
+          </span>
+          <span style={{
+            fontFamily: '"JetBrains Mono", monospace',
+            fontSize: 9,
+            letterSpacing: '.08em',
+            padding: '2px 8px',
+            border: `1px solid ${verdictTone.border}`,
+            color: verdictTone.color,
+            flexShrink: 0,
+          }}>
+            {verdictTone.label.toUpperCase()}
+          </span>
+          <span style={{
+            fontFamily: '"JetBrains Mono", monospace',
+            fontSize: 9,
+            letterSpacing: '.08em',
+            padding: '2px 8px',
+            border: `1px solid ${proofTone.border}`,
+            color: proofTone.color,
+            flexShrink: 0,
+          }}>
+            {proofTone.label.toUpperCase()}
+          </span>
+          <span style={{
+            fontFamily: '"JetBrains Mono", monospace',
+            fontSize: 9,
+            letterSpacing: '.06em',
+            color: finding.confidence >= 0.8 ? '#22c55e'
+                 : finding.confidence >= 0.6 ? '#fde047' : '#f87171',
+            flexShrink: 0,
+          }}>
+            {(finding.confidence * 100).toFixed(0)}% CONFIDENCE
+          </span>
+        </div>
 
         {/* Expand chevron */}
         <span style={{
@@ -251,18 +402,26 @@ export default function FindingCard({ finding, forceExpanded = false, scanId = '
       {/* Expanded content */}
       {isExpanded && (
         <div style={{ borderTop: '1px solid var(--border1)', padding: '14px 16px' }}>
-          {taxonomyRefs.length > 0 && (
-            <div style={{ marginBottom: 14 }}>
-              <div style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: 9, letterSpacing: '.12em', color: 'var(--text3)', marginBottom: 6 }}>TAXONOMY REFS</div>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                {taxonomyRefs.map((ref) => (
-                  <span key={ref} style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: 9, letterSpacing: '.08em', padding: '2px 8px', border: '1px solid var(--border2)', color: 'var(--text2)' }}>
-                    {ref}
-                  </span>
-                ))}
+          <div style={{ marginBottom: 14 }}>
+            <div style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: 9, letterSpacing: '.12em', color: 'var(--text3)', marginBottom: 6 }}>CLASSIFICATION</div>
+            <div style={{ background: 'var(--bg)', border: '1px solid var(--border1)', padding: '10px 12px' }}>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: taxonomyRefs.length > 0 ? 10 : 0 }}>
+                <span style={{ fontSize: 13, color: 'var(--text1)', fontWeight: 600 }}>{weaknessLabel}</span>
+                <span style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: 9, letterSpacing: '.08em', padding: '2px 8px', border: '1px solid var(--border2)', color: 'var(--text2)' }}>
+                  {classificationLabel}
+                </span>
               </div>
+              {taxonomyRefs.length > 0 && (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                  {taxonomyRefs.map((ref) => (
+                    <span key={ref} style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: 9, letterSpacing: '.08em', padding: '2px 8px', border: '1px solid var(--border2)', color: 'var(--text2)' }}>
+                      {ref}
+                    </span>
+                  ))}
+                </div>
+              )}
             </div>
-          )}
+          </div>
 
           {/* Explanation */}
           {finding.llm_explanation && (
@@ -277,6 +436,23 @@ export default function FindingCard({ finding, forceExpanded = false, scanId = '
             <div style={{ marginBottom: 14 }}>
               <div style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: 9, letterSpacing: '.12em', color: 'var(--text3)', marginBottom: 6 }}>VULNERABLE CODE</div>
               <pre style={{ background: 'var(--bg)', border: '1px solid var(--border1)', padding: '10px 12px', margin: 0, overflowX: 'auto', fontSize: 11, color: '#fca5a5', fontFamily: '"JetBrains Mono", monospace' }}>{finding.code_chunk}</pre>
+            </div>
+          )}
+
+          {/* Failure reason — shown when no PoV was run or proof was blocked */}
+          {failureReason && !povResult && (
+            <div style={{ marginBottom: 14 }}>
+              <div style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: 9, letterSpacing: '.12em', color: 'var(--text3)', marginBottom: 6 }}>PROOF FAILURE REASON</div>
+              <div style={{
+                padding: '10px 14px',
+                background: 'rgba(248,113,113,0.07)',
+                border: '1px solid rgba(248,113,113,0.25)',
+                fontSize: 12,
+                color: '#fca5a5',
+                lineHeight: 1.6,
+              }}>
+                {failureReason}
+              </div>
             </div>
           )}
 

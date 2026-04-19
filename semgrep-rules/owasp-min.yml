@@ -1,73 +1,488 @@
+# AutoPoV Security-Focused Semgrep Rules
+# Covers: C/C++, Python, Java, JavaScript/TypeScript
+# Philosophy: surface real security sinks and dangerous patterns only;
+# no code-quality, style, or complexity rules.
+
 rules:
-  - id: js-command-exec-signal
-    languages: [javascript, typescript]
-    message: "Security signal: process execution sink. Review whether attacker-controlled data can reach this call."
+
+  # ─── C / C++ ─────────────────────────────────────────────────────────────
+
+  - id: c-unsafe-buffer-ops
+    languages: [c, cpp]
+    message: "Unsafe buffer operation: $FUNC may write past buffer end."
     severity: ERROR
     pattern-either:
-      - pattern: require("child_process").exec(...)
-      - pattern: require("child_process").execSync(...)
-      - pattern: require("child_process").spawn(...)
-      - pattern: require("child_process").spawnSync(...)
+      - pattern: strcpy($DST, $SRC)
+      - pattern: strcat($DST, $SRC)
+      - pattern: sprintf($DST, $FMT, ...)
+      - pattern: vsprintf($DST, $FMT, $AP)
+      - pattern: gets($BUF)
 
-  - id: js-dynamic-exec-signal
-    languages: [javascript, typescript]
-    message: "Security signal: dynamic code execution sink. Review whether untrusted content can reach this call."
+  - id: c-format-string
+    languages: [c, cpp]
+    message: "Possible attacker-controlled format string passed directly to a printf-family function."
     severity: ERROR
     pattern-either:
-      - pattern: eval(...)
-      - pattern: Function(...)
+      - patterns:
+          - pattern: printf($X)
+          - pattern-not: printf("...")
+          - pattern-not: printf("...", ...)
+      - patterns:
+          - pattern: fprintf($STREAM, $X)
+          - pattern-not: fprintf($STREAM, "...")
+          - pattern-not: fprintf($STREAM, "...", ...)
+      - patterns:
+          - pattern: syslog($PRI, $X)
+          - pattern-not: syslog($PRI, "...")
+          - pattern-not: syslog($PRI, "...", ...)
+      - patterns:
+          - pattern: wprintf($X)
+          - pattern-not: wprintf("...")
+          - pattern-not: wprintf("...", ...)
 
-  - id: js-dom-html-sink
-    languages: [javascript, typescript]
-    message: "Security signal: HTML injection sink. Review whether untrusted content can reach this DOM write."
+  - id: c-unchecked-alloc
+    languages: [c, cpp]
+    message: "Allocation result used without NULL check — may dereference NULL on OOM."
     severity: WARNING
+    patterns:
+      - pattern: $VAR = malloc(...)
+      - pattern-not: |
+          $VAR = malloc(...);
+          ...
+          if ($VAR == NULL) { ... }
+      - pattern-not: |
+          $VAR = malloc(...);
+          ...
+          if (!$VAR) { ... }
+      - pattern-not: |
+          $VAR = malloc(...);
+          ...
+          if (NULL == $VAR) { ... }
+
+  - id: c-use-after-free
+    languages: [c, cpp]
+    message: "Possible use-after-free: free() called on a pointer that may be used afterwards."
+    severity: ERROR
+    pattern-either:
+      - pattern: |
+          free($PTR);
+          $PTR = $X;
+      - pattern: |
+          free($PTR);
+          $FUNC($PTR, ...);
+
+  - id: c-double-free
+    languages: [c, cpp]
+    message: "Possible double-free of $PTR."
+    severity: ERROR
+    pattern: |
+      free($PTR);
+      ...
+      free($PTR);
+
+  - id: c-integer-overflow-alloc
+    languages: [c, cpp]
+    message: "Multiplication used directly as malloc size may overflow."
+    severity: WARNING
+    pattern-either:
+      - pattern: malloc($A * $B)
+      - pattern: malloc($A * $B * $C)
+      - pattern: calloc($A, $B * $C)
+
+  - id: c-stack-buffer-no-bound
+    languages: [c, cpp]
+    message: "strncpy/strncat with a size that may be wrong (off-by-one or wrong buffer)."
+    severity: WARNING
+    pattern-either:
+      - pattern: strncpy($D, $S, sizeof($S))
+      - pattern: strncat($D, $S, sizeof($D))
+
+  - id: c-command-injection
+    languages: [c, cpp]
+    message: "system() / popen() called with a value that may be attacker-controlled."
+    severity: ERROR
+    pattern-either:
+      - pattern: system($CMD)
+      - pattern: popen($CMD, $MODE)
+
+  - id: cpp-new-nothrow-unchecked
+    languages: [cpp]
+    message: "operator new(nothrow) result used without NULL check."
+    severity: WARNING
+    pattern: $VAR = new (std::nothrow) $T
+
+  # ─── Python ──────────────────────────────────────────────────────────────
+
+  - id: python-command-injection
+    languages: [python]
+    message: "Attacker-controlled data may reach a shell execution sink."
+    severity: ERROR
+    pattern-either:
+      - pattern: os.system($CMD)
+      - pattern: subprocess.run($CMD, ..., shell=True, ...)
+      - pattern: subprocess.Popen($CMD, ..., shell=True, ...)
+      - pattern: subprocess.call($CMD, ..., shell=True, ...)
+      - pattern: subprocess.check_output($CMD, ..., shell=True, ...)
+
+  - id: python-eval-exec
+    languages: [python]
+    message: "eval/exec with a non-literal argument may execute attacker-controlled code."
+    severity: ERROR
+    pattern-either:
+      - pattern: eval($X)
+      - pattern: exec($X)
+      - pattern: compile($X, ...)
+
+  - id: python-unsafe-deserialization
+    languages: [python]
+    message: "Unsafe deserialization: $FUNC may deserialize attacker-controlled bytes into arbitrary objects."
+    severity: ERROR
+    pattern-either:
+      - pattern: pickle.loads($DATA)
+      - pattern: pickle.load($FILE)
+      - pattern: marshal.loads($DATA)
+      - pattern: yaml.load($DATA)
+      - pattern: yaml.unsafe_load($DATA)
+      - pattern: jsonpickle.decode($DATA)
+
+  - id: python-path-traversal
+    languages: [python]
+    message: "open() called with a path that may contain attacker-controlled directory components."
+    severity: ERROR
+    pattern-either:
+      - pattern: open(request.$ATTR, ...)
+      - pattern: open(flask.request.$ATTR, ...)
+
+  - id: python-sql-injection
+    languages: [python]
+    message: "SQL query assembled via string concatenation or format — use parameterised queries."
+    severity: ERROR
+    pattern-either:
+      - pattern: cursor.execute("..." + $VAR)
+      - pattern: cursor.execute(f"...", ...)
+      - pattern: cursor.execute("..." % $VAR)
+      - pattern: cursor.execute($QUERY.format(...))
+
+  - id: python-jinja2-autoescape-off
+    languages: [python]
+    message: "Jinja2 Environment created with autoescape=False — XSS risk when rendering untrusted input."
+    severity: ERROR
+    pattern: jinja2.Environment(..., autoescape=False, ...)
+
+  - id: python-xmlrpc-server
+    languages: [python]
+    message: "SimpleXMLRPCServer listens on a network socket; verify it is not exposed publicly."
+    severity: WARNING
+    pattern: SimpleXMLRPCServer(...)
+
+  - id: python-tarfile-traversal
+    languages: [python]
+    message: "tarfile.extractall() may allow path traversal if the archive is attacker-controlled."
+    severity: ERROR
+    pattern-either:
+      - pattern: $TAR.extractall(...)
+      - pattern: tarfile.open(...).extractall(...)
+
+  - id: python-assert-security
+    languages: [python]
+    message: "assert used for security/auth check — will be stripped by -O optimisation flag."
+    severity: WARNING
+    patterns:
+      - pattern: assert $COND
+      - metavariable-regex:
+          metavariable: $COND
+          regex: '(?i)(auth|login|perm|role|admin|token|secret|password|user)'
+
+  - id: python-argv-command-injection
+    languages: [python]
+    message: "sys.argv or argparse value passed to a shell execution sink without sanitization."
+    severity: ERROR
+    pattern-either:
+      - pattern: os.system(sys.argv[$IDX])
+      - pattern: subprocess.run(sys.argv[$IDX], ...)
+      - pattern: subprocess.Popen(sys.argv[$IDX], ...)
+      - pattern: os.system($NS.parse_args().$ARG)
+      - pattern: subprocess.run($NS.parse_args().$ARG, ...)
+      - patterns:
+          - pattern: $CMD = sys.argv[$IDX]
+          - pattern: os.system($CMD)
+      - patterns:
+          - pattern: $CMD = sys.argv[$IDX]
+          - pattern: subprocess.run($CMD, ..., shell=True, ...)
+
+  - id: python-flask-sqli
+    languages: [python]
+    message: "Flask request value used in SQL query — use parameterised queries."
+    severity: ERROR
+    pattern-either:
+      - pattern: cursor.execute("..." + request.args.get(...))
+      - pattern: cursor.execute("..." + request.form.get(...))
+      - pattern: cursor.execute(f"...", ...)
+      - pattern: cursor.execute("..." + request.values.get(...))
+
+  - id: python-flask-path-traversal
+    languages: [python]
+    message: "Flask request argument used in file-system operation — path traversal risk."
+    severity: ERROR
+    pattern-either:
+      - pattern: open(request.args.get(...), ...)
+      - pattern: open(request.form.get(...), ...)
+      - pattern: open(os.path.join($BASE, request.args.get(...)), ...)
+      - pattern: open(os.path.join($BASE, request.form.get(...)), ...)
+
+  - id: python-flask-command-injection
+    languages: [python]
+    message: "Flask request argument passed to a shell execution sink."
+    severity: ERROR
+    pattern-either:
+      - pattern: os.system(request.args.get(...))
+      - pattern: subprocess.run(request.args.get(...), ..., shell=True, ...)
+      - pattern: subprocess.Popen(request.args.get(...), ..., shell=True, ...)
+
+  - id: python-django-sqli
+    languages: [python]
+    message: "Django raw SQL query with user input — use ORM or parameterised queries."
+    severity: ERROR
+    pattern-either:
+      - pattern: $OBJ.objects.raw("..." + $VAR)
+      - pattern: connection.cursor().execute("..." + $VAR)
+      - pattern: cursor.execute(f"...", ...)
+
+  - id: python-ssrf
+    languages: [python]
+    message: "HTTP request made to a URL derived from user input — SSRF risk."
+    severity: ERROR
+    pattern-either:
+      - pattern: requests.get(request.args.get(...))
+      - pattern: requests.post(request.args.get(...))
+      - pattern: urllib.request.urlopen(request.args.get(...))
+      - pattern: httpx.get(request.args.get(...))
+
+  - id: python-template-injection
+    languages: [python]
+    message: "Jinja2/Mako template rendered from user-supplied string — SSTI risk."
+    severity: ERROR
+    pattern-either:
+      - pattern: jinja2.Template($X).render(...)
+      - pattern: Template($X).render(...)
+      - pattern: render_template_string(request.args.get(...))
+      - pattern: render_template_string(request.form.get(...))
+
+  # ─── Java ────────────────────────────────────────────────────────────────
+
+  - id: java-sql-injection
+    languages: [java]
+    message: "SQL query assembled with string concatenation — use PreparedStatement."
+    severity: ERROR
+    pattern-either:
+      - pattern: $STMT.executeQuery("..." + $VAR)
+      - pattern: $STMT.execute("..." + $VAR)
+      - pattern: $STMT.executeUpdate("..." + $VAR)
+
+  - id: java-command-injection
+    languages: [java]
+    message: "Runtime.exec() or ProcessBuilder called with values that may be attacker-controlled."
+    severity: ERROR
+    pattern-either:
+      - pattern: Runtime.getRuntime().exec($CMD)
+      - pattern: new ProcessBuilder($CMD, ...)
+
+  - id: java-path-traversal
+    languages: [java]
+    message: "File path constructed from attacker-controlled input may allow directory traversal."
+    severity: ERROR
+    pattern-either:
+      - pattern: new File(request.getParameter(...))
+      - pattern: new File($BASE, request.getParameter(...))
+      - pattern: Paths.get(request.getParameter(...))
+
+  - id: java-xxe
+    languages: [java]
+    message: "XML parser may be vulnerable to XXE — disable external entity processing."
+    severity: ERROR
+    pattern-either:
+      - pattern: DocumentBuilderFactory.newInstance().newDocumentBuilder()
+      - pattern: SAXParserFactory.newInstance().newSAXParser()
+      - pattern: XMLInputFactory.newInstance()
+
+  - id: java-unsafe-deserialization
+    languages: [java]
+    message: "ObjectInputStream.readObject() deserializes arbitrary classes — gadget chain risk."
+    severity: ERROR
+    pattern: new ObjectInputStream($STREAM).readObject()
+
+  - id: java-weak-crypto
+    languages: [java]
+    message: "Weak or broken cryptographic algorithm in use."
+    severity: WARNING
+    pattern-either:
+      - pattern: Cipher.getInstance("DES")
+      - pattern: Cipher.getInstance("DES/...")
+      - pattern: Cipher.getInstance("RC4")
+      - pattern: MessageDigest.getInstance("MD5")
+      - pattern: MessageDigest.getInstance("SHA-1")
+
+  - id: java-hardcoded-secret
+    languages: [java]
+    message: "Hard-coded credential or key — move to a secrets manager."
+    severity: ERROR
+    pattern-either:
+      - pattern: String password = "...";
+      - pattern: String secret = "...";
+      - pattern: String apiKey = "...";
+      - pattern: String token = "...";
+
+  - id: java-open-redirect
+    languages: [java]
+    message: "Redirect target derived from request parameter — open redirect risk."
+    severity: WARNING
+    pattern-either:
+      - pattern: response.sendRedirect(request.getParameter(...))
+      - pattern: response.sendRedirect($REQ.getParameter(...))
+
+  - id: java-log4shell-jndi
+    languages: [java]
+    message: "JNDI lookup called with a value that may be attacker-controlled — Log4Shell/JNDI injection risk."
+    severity: ERROR
+    pattern-either:
+      - pattern: InitialContext.lookup($X)
+      - pattern: new InitialContext().lookup($X)
+      - pattern: context.lookup($X)
+
+  - id: java-spring-sqli
+    languages: [java]
+    message: "Spring JdbcTemplate query assembled with string concatenation — use parameterised queries."
+    severity: ERROR
+    pattern-either:
+      - pattern: $JDBC.query("..." + $VAR, ...)
+      - pattern: $JDBC.queryForObject("..." + $VAR, ...)
+      - pattern: $JDBC.update("..." + $VAR, ...)
+      - pattern: $JDBC.execute("..." + $VAR)
+
+  - id: java-spring-request-mapping-sqli
+    languages: [java]
+    message: "Spring @RequestParam or @PathVariable value used in SQL query without parameterisation."
+    severity: ERROR
+    patterns:
+      - pattern: $STMT.executeQuery($VAR)
+      - pattern-not: $STMT.executeQuery("...")
+
+  - id: java-expression-language-injection
+    languages: [java]
+    message: "EL/SpEL expression evaluated from user input — expression injection risk."
+    severity: ERROR
+    pattern-either:
+      - pattern: $PARSER.parseExpression($X)
+      - pattern: ExpressionFactory.newInstance().createValueExpression($CTX, $X, ...)
+
+  - id: java-ssrf
+    languages: [java]
+    message: "URL opened from request parameter — Server-Side Request Forgery risk."
+    severity: ERROR
+    pattern-either:
+      - pattern: new URL(request.getParameter(...)).openConnection()
+      - pattern: new URL($REQ.getParameter(...)).openConnection()
+      - pattern: HttpClient.newHttpClient().send(HttpRequest.newBuilder(URI.create(request.getParameter(...))).build(), ...)
+
+  - id: java-unsafe-reflection
+    languages: [java]
+    message: "Class.forName() called with attacker-controlled input — unsafe reflection / class loading."
+    severity: ERROR
+    pattern-either:
+      - pattern: Class.forName(request.getParameter(...))
+      - pattern: Class.forName($REQ.getParameter(...))
+
+  # ─── JavaScript / TypeScript ─────────────────────────────────────────────
+
+  - id: js-command-injection
+    languages: [javascript, typescript]
+    message: "Child-process execution sink — verify no attacker-controlled data reaches this call."
+    severity: ERROR
+    pattern-either:
+      - pattern: require("child_process").exec($CMD, ...)
+      - pattern: require("child_process").execSync($CMD, ...)
+      - pattern: require("child_process").spawn($CMD, ...)
+      - pattern: require("child_process").spawnSync($CMD, ...)
+      - pattern: child_process.exec($CMD, ...)
+      - pattern: child_process.spawn($CMD, ...)
+
+  - id: js-eval-sink
+    languages: [javascript, typescript]
+    message: "eval() / Function() called with a non-literal — code injection risk."
+    severity: ERROR
+    pattern-either:
+      - pattern: eval($X)
+      - pattern: new Function($X)
+      - pattern: setTimeout($X, ...)
+      - pattern: setInterval($X, ...)
+
+  - id: js-dom-xss
+    languages: [javascript, typescript]
+    message: "Attacker-controlled data written into a dangerous DOM sink — XSS risk."
+    severity: ERROR
     pattern-either:
       - pattern: $EL.innerHTML = $X
-      - pattern: document.write($X)
       - pattern: $EL.outerHTML = $X
+      - pattern: document.write($X)
+      - pattern: document.writeln($X)
+      - pattern: $EL.insertAdjacentHTML($POS, $X)
 
-  - id: python-command-exec-signal
-    languages: [python]
-    message: "Security signal: process execution sink. Review whether attacker-controlled data can reach this call."
-    severity: ERROR
-    pattern-either:
-      - pattern: os.system(...)
-      - pattern: subprocess.run(..., shell=True, ...)
-      - pattern: subprocess.Popen(..., shell=True, ...)
-      - pattern: subprocess.call(..., shell=True, ...)
-
-  - id: python-dynamic-exec-signal
-    languages: [python]
-    message: "Security signal: dynamic code execution sink. Review whether untrusted content can reach this call."
-    severity: ERROR
-    pattern-either:
-      - pattern: eval(...)
-      - pattern: exec(...)
-
-  - id: python-unsafe-deser-signal
-    languages: [python]
-    message: "Security signal: unsafe deserialization API. Review whether attacker-controlled data reaches this sink."
-    severity: ERROR
-    pattern-either:
-      - pattern: pickle.loads(...)
-      - pattern: yaml.load(...)
-      - pattern: marshal.loads(...)
-
-  - id: c-unsafe-buffer-copy
-    languages: [c, cpp]
-    message: "Security signal: unsafe buffer copy or formatting primitive. Review bounds and caller control over sizes."
-    severity: ERROR
-    pattern-either:
-      - pattern: strcpy(...)
-      - pattern: strcat(...)
-      - pattern: sprintf(...)
-      - pattern: gets(...)
-
-  - id: c-format-string-signal
-    languages: [c, cpp]
-    message: "Security signal: possible attacker-controlled format string sink."
+  - id: js-open-redirect
+    languages: [javascript, typescript]
+    message: "window.location or document.location assigned from untrusted source — open redirect risk."
     severity: WARNING
     pattern-either:
-      - pattern: printf($X)
-      - pattern: fprintf($STREAM, $X)
-      - pattern: syslog($X)
+      - pattern: window.location = $X
+      - pattern: window.location.href = $X
+      - pattern: document.location = $X
+      - pattern: document.location.href = $X
+
+  - id: js-prototype-pollution
+    languages: [javascript, typescript]
+    message: "Deep property assignment with user-supplied key may allow prototype pollution."
+    severity: ERROR
+    pattern-either:
+      - pattern: $OBJ[req.body.$KEY] = $VAL
+      - pattern: $OBJ[req.query.$KEY] = $VAL
+      - pattern: $OBJ[req.params.$KEY] = $VAL
+
+  - id: js-sql-injection
+    languages: [javascript, typescript]
+    message: "SQL query assembled via template literal or concatenation — use parameterised queries."
+    severity: ERROR
+    pattern-either:
+      - pattern: $DB.query(`...${$VAR}...`)
+      - pattern: $DB.execute(`...${$VAR}...`)
+      - pattern: $DB.raw(`...${$VAR}...`)
+
+  - id: js-path-traversal
+    languages: [javascript, typescript]
+    message: "File-system operation with a path derived from request input — path traversal risk."
+    severity: ERROR
+    pattern-either:
+      - pattern: fs.readFile(req.params.$P, ...)
+      - pattern: fs.readFileSync(req.params.$P, ...)
+      - pattern: fs.readFile(req.query.$P, ...)
+      - pattern: path.join($BASE, req.params.$P)
+      - pattern: path.join($BASE, req.query.$P)
+
+  - id: js-nosql-injection
+    languages: [javascript, typescript]
+    message: "MongoDB / NoSQL query built from request body without sanitization — injection risk."
+    severity: ERROR
+    pattern-either:
+      - pattern: $COL.find(req.body)
+      - pattern: $COL.findOne(req.body)
+      - pattern: '$COL.find({"$KEY": req.body.$VAL})'
+
+  - id: js-hardcoded-secret
+    languages: [javascript, typescript]
+    message: "Hard-coded credential or key embedded in source code."
+    severity: ERROR
+    pattern-either:
+      - pattern: const password = "..."
+      - pattern: const secret = "..."
+      - pattern: const apiKey = "..."
+      - pattern: const token = "..."
+      - pattern: var password = "..."
+      - pattern: let password = "..."

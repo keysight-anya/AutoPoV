@@ -40,7 +40,7 @@ class LiveAppTester:
 
     def _build_request_config(self, pov_script: str, target_config: Dict[str, Any], exploit_contract: Dict[str, Any]) -> Dict[str, Any]:
         config: Dict[str, Any] = {**target_config}
-        route = str(exploit_contract.get("target_entrypoint") or target_config.get("path") or "")
+        route = str(exploit_contract.get("target_route") or exploit_contract.get("target_entrypoint") or target_config.get("path") or "")
         base_url = str(target_config.get("url", "") or "")
         if base_url and route and not route.startswith("http"):
             config["url"] = base_url.rstrip("/") + "/" + route.lstrip("/")
