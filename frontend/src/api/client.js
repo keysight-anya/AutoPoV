@@ -80,7 +80,7 @@ export const getScanLogs = (scanId) => {
   return new EventSource(streamUrl, { withCredentials: true })
 }
 
-export const getHistory = (limit = 100, offset = 0) => apiClient.get(`/history?limit=${limit}&offset=${offset}`)
+export const getHistory = (limit = 50, offset = 0) => apiClient.get(`/history?limit=${limit}&offset=${offset}`)
 export const getReport = (scanId, format = 'json') => apiClient.get(`/report/${scanId}?format=${format}`, {
   responseType: format === 'pdf' ? 'blob' : 'json'
 })
@@ -89,6 +89,8 @@ export const getFindingArtifactFile = (scanId, findingIndex, name) => apiClient.
   params: { name }
 })
 export const getMetrics = () => apiClient.get('/metrics')
+export const getProbeResult = (scanId, findingIndex) => apiClient.get(`/scan/${scanId}/findings/${findingIndex}/probe`)
+export const getScanProbe = (scanId) => apiClient.get(`/scan/${scanId}/probe`)
 
 export const generateApiKey = (name = 'default') => apiClient.post('/keys/generate', null, {
   params: { name }

@@ -300,16 +300,24 @@ class AgenticDiscovery:
         return None
 
     def _get_semgrep_configs(self, languages: List[str]) -> List[str]:
-        """Return the local security-focused ruleset.
+        """Return security-focused rulesets for Semgrep.
 
-        The local ruleset covers C/C++, Python, Java, and JavaScript/TypeScript
-        with rules that surface real security sinks and dangerous patterns only.
-        No code-quality, complexity, or style rules are included.
+        Priority:
+        1. Local custom security ruleset (covers C/C++, Python, Java, JS/TS)
+        2. Semgrep registry 'auto' config for broader language/vulnerability coverage
+        
+        The system supports ANY language Semgrep can analyze, not just the ones
+        in the local ruleset. When the local ruleset exists, we use both for
+        maximum coverage.
         """
+        configs = []
         local_rule_path = Path(__file__).resolve().parents[1] / self.LOCAL_SEMGREP_RULES
         if local_rule_path.is_file():
-            return [str(local_rule_path)]
-        return []
+            configs.append(str(local_rule_path))
+        # Add registry security rules for broader coverage (Go, Ruby, PHP, Rust, etc.)
+        # 'p/security-audit' covers common security patterns across all supported langs
+        configs.append('p/security-audit')
+        return configs
 
     def _get_semgrep_command(self) -> List[str]:
         """Resolve a working Semgrep invocation for the current runtime."""
@@ -326,8 +334,32 @@ class AgenticDiscovery:
         start_time = time.time()
         results: List[DiscoveryResult] = []
 
+        # Extract recon_report from state (produced by _node_recon before discovery)
+        _recon_report = state.get('recon_report')
+        # Stash on self so _candidate_codeql_build_commands() can prepend recon
+        # build commands into the CodeQL manual-build fallback list.
+        self._current_recon_report = _recon_report
+        if _recon_report:
+            _build_sys = _recon_report.get('build_system', 'unknown')
+            _runtime = _recon_report.get('runtime_family', 'unknown')
+            self._log(state, f'[AgenticDiscovery] Recon context: build_system={_build_sys}, runtime={_runtime}')
+            if _recon_report.get('binary_candidates'):
+                self._log(state, f'[AgenticDiscovery] Recon binary candidates: {", ".join(_recon_report["binary_candidates"][:5])}')
+        
+        # Extract high-value files from git history — these get priority in LLM Scout
+        _high_value_file_set: set = set()
+        _hv_files = (_recon_report or {}).get('high_value_files') or []
+        for hv in _hv_files:
+            _high_value_file_set.add(hv.get('file', ''))
+        if _high_value_file_set:
+            self._log(state,
+                f'[AgenticDiscovery] {len(_high_value_file_set)} high-value files '
+                f'from git history will get discovery priority')
+        # Stash for use in _run_llm_scout confidence boost
+        self._high_value_file_set = _high_value_file_set
+        
         self._log(state, '[AgenticDiscovery] Step 1: Language Profiling')
-        lang_profile = self._profile_languages(codebase_path)
+        lang_profile = self._profile_languages(codebase_path, recon_report=_recon_report)
 
         self._log(state, f'[AgenticDiscovery] Primary language: {lang_profile.primary}')
         self._log(state, f'[AgenticDiscovery] All languages: {", ".join(lang_profile.all_languages)}')
@@ -427,26 +459,45 @@ class AgenticDiscovery:
         self._log(state, f'[AgenticDiscovery] Discovery completed in {total_time:.2f}s')
         return results
 
-    def _profile_languages(self, codebase_path: str) -> LanguageProfile:
-        extensions: Dict[str, int] = {}
-        for root, _, files in os.walk(codebase_path):
-            for file in files:
-                ext = os.path.splitext(file)[1].lower()
-                if ext:
-                    extensions[ext] = extensions.get(ext, 0) + 1
+    # Directories that typically contain generated/vendored/non-source files.
+    # Files inside these are excluded from the language profile to prevent
+    # Doxygen docs, vendored JS, etc. from skewing the primary language.
+    _SKIP_DIRS: set = {
+        'docs', 'doc', 'documentation', 'vendor', 'node_modules', 'dist',
+        'build', '.git', 'third_party', 'external', '3rdparty', 'deps',
+        '__pycache__', '.tox', '.eggs', 'site-packages', 'bower_components',
+        'coverage', '.nyc_output', 'target',  # Maven/Cargo output
+    }
 
-        lang_map = {
-            '.py': 'python', '.js': 'javascript', '.ts': 'typescript', '.tsx': 'typescript', '.jsx': 'javascript',
-            '.java': 'java', '.c': 'c', '.cpp': 'cpp', '.cc': 'cpp', '.cxx': 'cpp', '.h': 'c', '.hpp': 'cpp',
-            '.go': 'go', '.rb': 'ruby', '.php': 'php', '.cs': 'csharp', '.swift': 'swift', '.kt': 'kotlin',
-            '.scala': 'scala', '.rs': 'rust', '.r': 'r', '.lua': 'lua', '.sh': 'bash', '.dockerfile': 'docker'
-        }
-
+    def _profile_languages(self, codebase_path: str, recon_report: Optional[Dict[str, Any]] = None) -> LanguageProfile:
+        # Reuse language counts from recon if available, avoiding a redundant
+        # full filesystem walk that _scan_project_structure() already performed.
         lang_counts: Dict[str, int] = {}
-        for ext, count in extensions.items():
-            lang = lang_map.get(ext)
-            if lang:
-                lang_counts[lang] = lang_counts.get(lang, 0) + count
+        if recon_report and recon_report.get('language_counts'):
+            lang_counts = dict(recon_report['language_counts'])
+        else:
+            extensions: Dict[str, int] = {}
+            for root, dirs, files in os.walk(codebase_path):
+                # Prune non-source directories in-place so os.walk skips them
+                dirs[:] = [d for d in dirs if d.lower() not in self._SKIP_DIRS]
+                for file in files:
+                    ext = os.path.splitext(file)[1].lower()
+                    if ext:
+                        extensions[ext] = extensions.get(ext, 0) + 1
+
+            lang_map = {
+                '.py': 'python', '.js': 'javascript', '.ts': 'typescript', '.tsx': 'typescript', '.jsx': 'javascript',
+                '.java': 'java', '.c': 'c', '.cpp': 'cpp', '.cc': 'cpp', '.cxx': 'cpp', '.h': 'c', '.hpp': 'cpp',
+                '.go': 'go', '.rb': 'ruby', '.php': 'php', '.cs': 'csharp', '.swift': 'swift', '.kt': 'kotlin',
+                '.scala': 'scala', '.rs': 'rust', '.r': 'r', '.lua': 'lua', '.sh': 'bash', '.dockerfile': 'docker',
+                # HTML/HTM files contain embedded JavaScript — treat as JS runtime
+                '.html': 'javascript', '.htm': 'javascript',
+            }
+
+            for ext, count in extensions.items():
+                lang = lang_map.get(ext)
+                if lang:
+                    lang_counts[lang] = lang_counts.get(lang, 0) + count
 
         sorted_langs = sorted(lang_counts.items(), key=lambda x: x[1], reverse=True)
         primary = sorted_langs[0][0] if sorted_langs else 'unknown'
@@ -560,7 +611,7 @@ classpath = os.pathsep.join(jars) if jars else ''
 base_cmd = [javac, '-proc:none', '-g', '-d', str(out_dir)]
 if classpath:
     base_cmd.extend(['-classpath', classpath])
-main_like = [p for p in ordered if '/src/test/' not in str(p).replace('\\','/') and '/test/' not in str(p).replace('\\','/')]
+main_like = [p for p in ordered if '/src/test/' not in str(p) and '/test/' not in str(p)]
 batches = [main_like or ordered, ordered]
 for batch in batches:
     try:
@@ -636,6 +687,175 @@ raise SystemExit(0 if compiled else 1)
         os.chmod(helper_path, 0o700)
         return helper_path
 
+    def _extract_build_dependencies(self, codebase_path: str) -> List[str]:
+        """Extract declared build dependencies from build manifests.
+
+        Parses configure.ac, CMakeLists.txt, and meson.build for declared
+        package dependencies and maps them to apt package names.
+
+        Returns a list of apt package names that should be installed before
+        building the project.
+        """
+        import re
+        root = Path(codebase_path)
+        apt_packages: List[str] = []
+
+        # --- configure.ac / configure.in ---
+        conf_file = root / 'configure.ac'
+        if not conf_file.exists():
+            conf_file = root / 'configure.in'
+        if conf_file.exists():
+            try:
+                content = conf_file.read_text(encoding='utf-8', errors='replace')
+                # PKG_CHECK_MODULES([VAR], [pkg-name >= version])
+                pkg_names = re.findall(
+                    r'PKG_CHECK_MODULES\s*\([^,]+,\s*\[?([a-z][a-z0-9_+-]*)',
+                    content, re.IGNORECASE
+                )
+                for pkg in pkg_names:
+                    pkg_lower = pkg.lower()
+                    # Map pkg-config name to apt: lib<name>-dev is the common pattern
+                    for candidate in [f'lib{pkg_lower}-dev', f'{pkg_lower}-dev', f'lib{pkg_lower}1-dev']:
+                        apt_packages.append(candidate)
+                        break  # just use first candidate pattern
+                # AC_CHECK_LIB(libname, function)
+                ac_libs = re.findall(
+                    r'AC_CHECK_LIB\s*\(\s*\[?([a-z][a-z0-9_+-]*)',
+                    content, re.IGNORECASE
+                )
+                for lib in ac_libs:
+                    apt_packages.append(f'lib{lib.lower()}-dev')
+            except Exception:
+                pass
+
+        # --- CMakeLists.txt ---
+        cmake_file = root / 'CMakeLists.txt'
+        if cmake_file.exists():
+            try:
+                content = cmake_file.read_text(encoding='utf-8', errors='replace')
+                # find_package(PackageName ...)
+                cmake_pkgs = re.findall(
+                    r'find_package\s*\(\s*([A-Za-z][A-Za-z0-9_]*)',
+                    content, re.IGNORECASE
+                )
+                skip_builtins = {'threads', 'openmp', 'git', 'doxygen', 'pkgconfig',
+                                 'python', 'python3', 'perl', 'latex', 'java'}
+                for pkg in cmake_pkgs:
+                    pkg_lower = pkg.lower()
+                    if pkg_lower in skip_builtins:
+                        continue
+                    apt_packages.append(f'lib{pkg_lower}-dev')
+                # pkg_check_modules(VAR REQUIRED pkg-name)
+                pkgcm_names = re.findall(
+                    r'pkg_check_modules\s*\([^)]*?\s+([a-z][a-z0-9_+-]*?)\s*\)',
+                    content, re.IGNORECASE
+                )
+                for pkg in pkgcm_names:
+                    pkg_lower = pkg.lower()
+                    if pkg_lower in ('required', 'quiet', 'imported_target'):
+                        continue
+                    apt_packages.append(f'lib{pkg_lower}-dev')
+            except Exception:
+                pass
+
+        # --- meson.build ---
+        meson_file = root / 'meson.build'
+        if meson_file.exists():
+            try:
+                content = meson_file.read_text(encoding='utf-8', errors='replace')
+                # dependency('pkg-name')
+                meson_deps = re.findall(
+                    r"dependency\s*\(\s*'([a-z][a-z0-9_+-]*)'",
+                    content
+                )
+                for dep in meson_deps:
+                    apt_packages.append(f'lib{dep}-dev')
+            except Exception:
+                pass
+
+        # --- Subdirectory scan (e.g. libexpat/expat/CMakeLists.txt) ---
+        try:
+            for subdir in root.iterdir():
+                if not subdir.is_dir():
+                    continue
+                if subdir.name.startswith('.') or subdir.name in (
+                    'test', 'tests', 'doc', 'docs', 'examples', 'build', 'node_modules'
+                ):
+                    continue
+                sub_cmake = subdir / 'CMakeLists.txt'
+                if sub_cmake.exists():
+                    try:
+                        content = sub_cmake.read_text(encoding='utf-8', errors='replace')
+                        cmake_pkgs = re.findall(
+                            r'find_package\s*\(\s*([A-Za-z][A-Za-z0-9_]*)',
+                            content, re.IGNORECASE
+                        )
+                        for pkg in cmake_pkgs:
+                            pkg_lower = pkg.lower()
+                            if pkg_lower in skip_builtins:
+                                continue
+                            apt_packages.append(f'lib{pkg_lower}-dev')
+                    except Exception:
+                        pass
+                sub_conf = subdir / 'configure.ac'
+                if sub_conf.exists():
+                    try:
+                        content = sub_conf.read_text(encoding='utf-8', errors='replace')
+                        pkg_names = re.findall(
+                            r'PKG_CHECK_MODULES\s*\([^,]+,\s*\[?([a-z][a-z0-9_+-]*)',
+                            content, re.IGNORECASE
+                        )
+                        for pkg in pkg_names:
+                            apt_packages.append(f'lib{pkg.lower()}-dev')
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # De-duplicate and return
+        return list(dict.fromkeys(apt_packages))
+
+    def _detect_gradle_version(self, root: Path) -> Optional[str]:
+        """Read gradle/wrapper/gradle-wrapper.properties and extract the Gradle version."""
+        wrapper_props = root / 'gradle' / 'wrapper' / 'gradle-wrapper.properties'
+        if not wrapper_props.exists():
+            return None
+        try:
+            text = wrapper_props.read_text(encoding='utf-8', errors='ignore')
+            m = re.search(r'gradle-([0-9]+\.[0-9]+(?:\.[0-9]+)?)-', text)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+        return None
+
+    def _select_java_home(self, root: Path, codeql_lang: str) -> str:
+        """Select a JAVA_HOME compatible with the project's build system.
+
+        Gradle < 7.0 is incompatible with Java 17+ (e.g. Java 21).  When an
+        older Gradle wrapper is detected we fall back to Java 11 which is
+        installed alongside the default JDK in the backend container.
+        """
+        if codeql_lang != 'java':
+            return ''
+
+        gradle_ver = self._detect_gradle_version(root)
+        if gradle_ver:
+            try:
+                major = int(gradle_ver.split('.')[0])
+                if major < 7:
+                    java11 = '/usr/lib/jvm/java-11-openjdk-amd64'
+                    if os.path.islink(java11) or os.path.isdir(java11):
+                        return java11
+            except ValueError:
+                pass
+
+        # Default chain: default-java -> 21 -> 17 -> 11
+        for _jh in ['/usr/lib/jvm/default-java', '/usr/lib/jvm/java-21-openjdk-amd64', '/usr/lib/jvm/java-17-openjdk-amd64', '/usr/lib/jvm/java-11-openjdk-amd64']:
+            if os.path.islink(_jh) or os.path.isdir(_jh):
+                return _jh
+        return ''
+
     def _candidate_codeql_build_commands(self, codebase_path: str, codeql_lang: str, scan_id: str = 'scan') -> List[str]:
         if not self._supports_manual_build_fallback(codeql_lang):
             return []
@@ -644,6 +864,16 @@ raise SystemExit(0 if compiled else 1)
         jobs = max(2, min(4, os.cpu_count() or 2))
         build_dir = '.autopov-codeql-build'
         commands: List[str] = []
+
+        # A2: Prepend recon-discovered build commands — the recon agent has
+        # already analysed the build system and produced exact commands, so
+        # they should be tried first before generic fallbacks.
+        _recon_report = getattr(self, '_current_recon_report', None)
+        if _recon_report and _recon_report.get('build_commands'):
+            for _rc in _recon_report['build_commands']:
+                _rc = str(_rc).strip()
+                if _rc and _rc not in commands:
+                    commands.append(_rc)
 
         benchmark_commands = self._load_benchmark_build_commands(codebase_path)
         for command in benchmark_commands:
@@ -685,16 +915,21 @@ raise SystemExit(0 if compiled else 1)
                     add(f'make -j{jobs}')
                     break
         elif codeql_lang == 'java':
+            # Detect JAVA_HOME — gradlew/mvn require it even when java is in PATH.
+            # For older Gradle (< 7.0) we must use Java 11 because Java 21 is
+            # incompatible with the Groovy version bundled in those Gradles.
+            _java_home = self._select_java_home(root, codeql_lang)
+            _java_prefix = f'export JAVA_HOME={_java_home} && ' if _java_home else ''
             if (root / 'mvnw').exists():
-                add('chmod +x ./mvnw && ./mvnw -q -DskipTests compile')
+                add(f'{_java_prefix}chmod +x ./mvnw && ./mvnw -q -DskipTests compile')
             if (root / 'pom.xml').exists() and shutil.which('mvn'):
-                add('mvn -q -DskipTests compile')
+                add(f'{_java_prefix}mvn -q -DskipTests compile')
             if (root / 'gradlew').exists():
-                add('chmod +x ./gradlew && ./gradlew --no-daemon compileJava classes -q')
-                add('chmod +x ./gradlew && ./gradlew --no-daemon classes -q')
+                add(f'{_java_prefix}chmod +x ./gradlew && ./gradlew --no-daemon compileJava classes -q')
+                add(f'{_java_prefix}chmod +x ./gradlew && ./gradlew --no-daemon classes -q')
             if ((root / 'build.gradle').exists() or (root / 'build.gradle.kts').exists()) and shutil.which('gradle'):
-                add('gradle --no-daemon compileJava classes -q')
-                add('gradle --no-daemon classes -q')
+                add(f'{_java_prefix}gradle --no-daemon compileJava classes -q')
+                add(f'{_java_prefix}gradle --no-daemon classes -q')
 
         return commands
 
@@ -788,6 +1023,16 @@ raise SystemExit(0 if compiled else 1)
             else:
                 self._log(state, f'[AgenticDiscovery] CodeQL returned 0 findings; the codebase may not contain detectable vulnerabilities')
 
+            # FIX-11: Attach build_profile to metadata so agent_graph can
+            # propagate it into each finding's exploit_contract.  docker_runner
+            # uses this to skip wrong build strategies (e.g. cmake on a Makefile
+            # repo) and replay the exact build command that succeeded.
+            _build_profile: Dict[str, Any] = {
+                'build_strategy': create_result['strategy'],
+                'build_command': create_result.get('command'),
+                'build_language': codeql_lang,
+                'build_dependencies': self._extract_build_dependencies(codebase_path),
+            }
             return DiscoveryResult(
                 strategy=DiscoveryStrategy.CODEQL,
                 findings=findings,
@@ -800,6 +1045,7 @@ raise SystemExit(0 if compiled else 1)
                     'findings_count': len(findings),
                     'build_strategy': create_result['strategy'],
                     'build_command': create_result.get('command'),
+                    'build_profile': _build_profile,
                 }
             )
         except subprocess.TimeoutExpired:
@@ -857,11 +1103,13 @@ raise SystemExit(0 if compiled else 1)
                 region = loc.get('region', {})
                 rule_id = res.get('ruleId', '')
                 rule_meta = rules_by_id.get(rule_id, {})
+                _tool_cwe = self._extract_codeql_classification(rule_meta, rule_id)
                 findings.append({
                     'filepath': artifact.get('uri', ''),
                     'line_number': region.get('startLine', 0),
-                    'cwe_type': 'UNCLASSIFIED',
-                    'taxonomy_refs': [ref for ref in [self._extract_codeql_classification(rule_meta, rule_id), rule_id] if ref and ref != 'UNCLASSIFIED'],
+                    'cwe_type': _tool_cwe,
+                    'cwe_source': 'tool' if _tool_cwe != 'UNCLASSIFIED' else 'pending',
+                    'taxonomy_refs': [ref for ref in [_tool_cwe, rule_id] if ref and ref != 'UNCLASSIFIED'],
                     'code_chunk': res.get('message', {}).get('text', ''),
                     'confidence': 0.82,
                     'source': 'codeql',
@@ -907,8 +1155,14 @@ raise SystemExit(0 if compiled else 1)
         seen: set[tuple[str, int, str]] = set()
         semgrep_cmd = self._get_semgrep_command()
 
+        # Build --exclude flags from _SKIP_DIRS so semgrep skips the same
+        # non-source directories that _profile_languages() already prunes.
+        _exclude_args: List[str] = []
+        for _skip_d in self._SKIP_DIRS:
+            _exclude_args.extend(['--exclude', _skip_d])
+
         for config in configs:
-            cmd = semgrep_cmd + ['--config', config, '--json', '--quiet', codebase_path]
+            cmd = semgrep_cmd + _exclude_args + ['--config', config, '--json', '--quiet', codebase_path]
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=settings.SEMGREP_TIMEOUT_S)
             except FileNotFoundError:
@@ -933,11 +1187,13 @@ raise SystemExit(0 if compiled else 1)
                 if key in seen:
                     continue
                 seen.add(key)
+                _sg_cwe = self._map_semgrep_to_cwe(match.get('extra', {}).get('metadata', {}).get('cwe', ''))
                 findings.append({
                     'filepath': match.get('path', ''),
                     'line_number': match.get('start', {}).get('line', 0),
-                    'cwe_type': 'UNCLASSIFIED',
-                    'taxonomy_refs': [ref for ref in [self._map_semgrep_to_cwe(match.get('extra', {}).get('metadata', {}).get('cwe', '')), match.get('check_id', '')] if ref and ref != 'UNCLASSIFIED'],
+                    'cwe_type': _sg_cwe,
+                    'cwe_source': 'tool' if _sg_cwe != 'UNCLASSIFIED' else 'pending',
+                    'taxonomy_refs': [ref for ref in [_sg_cwe, match.get('check_id', '')] if ref and ref != 'UNCLASSIFIED'],
                     'code_chunk': match.get('extra', {}).get('lines', ''),
                     'confidence': 0.72,
                     'source': 'semgrep',
@@ -968,11 +1224,23 @@ raise SystemExit(0 if compiled else 1)
                             candidates.append(finding)
 
         max_candidates = settings.SCOUT_MAX_FILES  # Use full configured limit (default 25)
+
+        # Boost confidence for files identified as high-value by git history
+        # BEFORE the cap so git-flagged files survive truncation
+        _hv_files = getattr(self, '_high_value_file_set', set())
+        if _hv_files:
+            for finding in candidates:
+                _fp = finding.get('filepath', '')
+                if _fp in _hv_files:
+                    finding['confidence'] = max(finding.get('confidence', 0), 0.85)
+                    finding['git_history_flagged'] = True
+
         if len(candidates) > max_candidates:
             # Sort by confidence desc before capping
             candidates = sorted(candidates, key=lambda f: f.get('confidence', 0), reverse=True)[:max_candidates]
 
         candidates = [c for c in candidates if not self._is_test_artifact_path(c.get('filepath', ''))]
+
         if not candidates:
             self._log(state, '[AgenticDiscovery] No high-confidence candidates for LLM scout; skipping')
             return None
@@ -1027,6 +1295,27 @@ raise SystemExit(0 if compiled else 1)
             '_test.',
             '.spec.',
             '.test.',
+            # Generated documentation (Doxygen, Sphinx, etc.)
+            '/docs/',
+            '/doc/',
+            '/documentation/',
+            '/doxygen/',
+            '/html/',
+            # Fuzz harnesses and OSS-Fuzz integration
+            '/fuzz/',
+            '/fuzzing/',
+            '/fuzzers/',
+            '/ossfuzz/',
+            '/oss-fuzz/',
+            'fuzz_',
+            # Example / demo / benchmark code
+            '/examples/',
+            # NOTE: '/example/' removed — it false-positives on Java package
+            # names like com/example/ which are legitimate source paths.
+            '/demos/',
+            # NOTE: '/demo/' removed for the same reason (com/demo/ packages).
+            '/benchmark/',
+            '/benchmarks/',
         ]
         return any(marker in lowered for marker in markers)
 
@@ -1075,7 +1364,9 @@ raise SystemExit(0 if compiled else 1)
         lang_map = {
             '.py': 'python', '.js': 'javascript', '.ts': 'typescript', '.tsx': 'typescript', '.jsx': 'javascript',
             '.java': 'java', '.c': 'c', '.cpp': 'cpp', '.cc': 'cpp', '.cxx': 'cpp', '.h': 'c', '.hpp': 'cpp',
-            '.go': 'go', '.rb': 'ruby', '.php': 'php', '.cs': 'csharp'
+            '.go': 'go', '.rb': 'ruby', '.php': 'php', '.cs': 'csharp',
+            # HTML/HTM files contain embedded JavaScript — treat as JS runtime
+            '.html': 'javascript', '.htm': 'javascript',
         }
         return lang_map.get(ext, 'unknown')
 
@@ -1090,8 +1381,8 @@ raise SystemExit(0 if compiled else 1)
 
     def _log(self, state: Dict[str, Any], message: str):
         if 'logs' in state:
-            from datetime import datetime
-            entry = f'[{datetime.utcnow().isoformat()}] {message}'
+            from datetime import datetime, timezone
+            entry = f'[{datetime.now(timezone.utc).isoformat()}] {message}'
             state['logs'].append(entry)
             try:
                 from app.scan_manager import get_scan_manager

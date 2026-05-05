@@ -10,7 +10,7 @@ import json
 import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, List, Tuple
 from fastapi import HTTPException, Security, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -105,7 +105,7 @@ class APIKeyManager:
                 key_id=key_id,
                 key_hash=key_hash,
                 name=SYSTEM_API_KEY_NAME,
-                created_at=datetime.utcnow().isoformat(),
+                created_at=datetime.now(timezone.utc).isoformat(),
                 last_used=None,
                 is_active=True
             )
@@ -132,7 +132,7 @@ class APIKeyManager:
                 key_id=key_id,
                 key_hash=self._hash_key(raw_key),
                 name=SYSTEM_API_KEY_NAME,
-                created_at=datetime.utcnow().isoformat(),
+                created_at=datetime.now(timezone.utc).isoformat(),
                 last_used=None,
                 is_active=True
             )
@@ -164,7 +164,7 @@ class APIKeyManager:
         self._pending_last_used.clear()
         self._last_flush_time = time.monotonic()
         with open(self.storage_path, 'w') as f:
-            data = {k: v.dict() for k, v in self._keys.items()}
+            data = {k: v.model_dump() for k, v in self._keys.items()}
             json.dump(data, f, indent=2)
 
     def _flush_last_used_if_due(self):
@@ -186,7 +186,7 @@ class APIKeyManager:
             key_id=key_id,
             key_hash=key_hash,
             name=name,
-            created_at=datetime.utcnow().isoformat()
+            created_at=datetime.now(timezone.utc).isoformat()
         )
 
         with self._lock:
@@ -210,7 +210,7 @@ class APIKeyManager:
             for api_key in self._keys.values():
                 if hmac.compare_digest(api_key.key_hash, key_hash) and api_key.is_active:
                     # Track last_used in memory; flush to disk periodically
-                    now = datetime.utcnow().isoformat()
+                    now = datetime.now(timezone.utc).isoformat()
                     self._pending_last_used[api_key.key_id] = now
                     self._flush_last_used_if_due()
                     return api_key.name

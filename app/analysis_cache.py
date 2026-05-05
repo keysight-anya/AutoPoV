@@ -8,7 +8,7 @@ import json
 import hashlib
 import threading
 from typing import Dict, Any, Optional, List, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, asdict
 import re
 
@@ -185,7 +185,7 @@ class AnalysisCache:
             if cached:
                 # Check if expired
                 created = datetime.fromisoformat(cached.created_at)
-                if datetime.utcnow() - created > timedelta(days=cached.ttl_days):
+                if datetime.now(timezone.utc) - created > timedelta(days=cached.ttl_days):
                     del self._prompt_cache[cache_key]
                     self._save_prompt_cache()
                     return None
@@ -223,7 +223,7 @@ class AnalysisCache:
                 confidence=confidence,
                 explanation=explanation,
                 vulnerable_code=vulnerable_code[:500],
-                created_at=datetime.utcnow().isoformat(),
+                created_at=datetime.now(timezone.utc).isoformat(),
                 hit_count=0
             )
             
@@ -244,7 +244,7 @@ class AnalysisCache:
             if cached:
                 # Check if expired
                 created = datetime.fromisoformat(cached.get('created_at', '2000-01-01'))
-                if datetime.utcnow() - created > timedelta(days=7):  # 7 day TTL for full results
+                if datetime.now(timezone.utc) - created > timedelta(days=7):  # 7 day TTL for full results
                     del self._result_cache[codebase_hash]
                     self._save_result_cache()
                     return None
@@ -261,7 +261,7 @@ class AnalysisCache:
             # Store with metadata
             cache_entry = {
                 'codebase_hash': codebase_hash,
-                'created_at': datetime.utcnow().isoformat(),
+                'created_at': datetime.now(timezone.utc).isoformat(),
                 'findings': result.get('findings', []),
                 'total_findings': result.get('total_findings', 0),
                 'confirmed_vulns': result.get('confirmed_vulns', 0),
@@ -305,7 +305,7 @@ class AnalysisCache:
     def clear_expired(self) -> Tuple[int, int]:
         """Clear expired cache entries. Returns (prompts_cleared, results_cleared)"""
         with self._cache_lock:
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             
             # Clear expired prompt cache
             expired_prompts = []

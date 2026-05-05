@@ -230,7 +230,7 @@ def test_test_binary_target_binary_cli_failure_includes_stage_artifacts(monkeypa
     })
     monkeypatch.setattr(tester, '_evaluate_proof_outcome', lambda *args, **kwargs: {'triggered': False, 'reason': 'no_oracle_match', 'proof_verdict': 'failed', 'path_relevant': False, 'matched_evidence_markers': []})
     monkeypatch.setattr(tester, '_run_script', lambda *args, **kwargs: {'stdout': '', 'stderr': 'no crash', 'exit_code': 1})
-    monkeypatch.setattr(tester, '_repair_native_runtime_script', lambda script: script)
+    monkeypatch.setattr(tester, '_repair_native_runtime_script', lambda script, **kwargs: script)
     monkeypatch.setattr(tester, '_patch_target_refs', lambda script, **kwargs: script)
     monkeypatch.setattr(tester, '_native_script_guardrail_issues', lambda *args, **kwargs: [])
     monkeypatch.setattr(tester, '_build_runtime_evidence', lambda *args, **kwargs: {'summary': 'Runtime harness executed'})

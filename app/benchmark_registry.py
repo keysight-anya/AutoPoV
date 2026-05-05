@@ -162,6 +162,7 @@ class BenchmarkRegistry:
                     copied_paths.append(rel_path)
             case_workspace_paths[case['case_id']] = copied_paths
 
+        self._write_juliet_workspace_makefile(workspace_root, manifest)
         self._write_workspace_metadata(workspace_root, manifest, selected_cases)
         metadata = self._build_benchmark_metadata(manifest, selected_cases, workspace_root=workspace_root)
         for case in metadata['cases']:
@@ -268,6 +269,26 @@ if failures:
         )
         return script_relpath
 
+    def _write_juliet_workspace_makefile(self, workspace_root: Path, manifest: Dict[str, Any]) -> None:
+        if manifest.get('benchmark_family') != 'juliet_dynamic':
+            return
+        makefile_content = (
+            "# AutoPoV workspace build — builds only CWE directories present.\n"
+            ".PHONY: all clean\n\n"
+            "all:\n"
+            "\t@for d in testcases/CWE*/; do \\\n"
+            "\t    [ -f \"$$d/Makefile\" ] || continue; \\\n"
+            "\t    echo \"[autopov-build] Building $$(basename $$d)...\" >&2; \\\n"
+            "\t    $(MAKE) --no-print-directory -C \"$$d\" 2>/tmp/juliet_build_$$(basename $$d).log \\\n"
+            "\t    || echo \"[autopov-build] Warning: $$(basename $$d) had errors\" >&2; \\\n"
+            "\tdone\n\n"
+            "clean:\n"
+            "\t@for d in testcases/CWE*/; do \\\n"
+            "\t    [ -f \"$$d/Makefile\" ] && $(MAKE) -C \"$$d\" clean 2>/dev/null || true; \\\n"
+            "\tdone\n"
+        )
+        (workspace_root / 'Makefile').write_text(makefile_content, encoding='utf-8')
+
     def _benchmark_codeql_build_commands(self, manifest: Dict[str, Any], selected_cases: List[Dict[str, Any]], build_script_relpath: Optional[str] = None) -> List[str]:
         family = manifest.get('benchmark_family')
         if family == 'juliet_dynamic':
@@ -322,7 +343,7 @@ if failures:
         vulnerable_cases = sum(1 for case in cases if case.get('expected_vulnerable'))
         safe_cases = len(cases) - vulnerable_cases
 
-        return {
+        result: Dict[str, Any] = {
             'benchmark_family': benchmark_metadata.get('benchmark_family'),
             'benchmark_id': benchmark_metadata.get('benchmark_id'),
             'language': benchmark_metadata.get('language'),
@@ -347,6 +368,12 @@ if failures:
             },
             'cases': case_results,
         }
+        if benchmark_metadata.get('benchmark_family') == 'juliet_dynamic':
+            result['notes'] = [
+                'Juliet Dynamic: all cases are expected_vulnerable=True (each file contains a real bad() function). '
+                'False-positive measurement requires a separate safe-code corpus.',
+            ]
+        return result
 
     def _detect_builtin_benchmark(self, root: Path) -> Optional[str]:
         if (root / 'test_juliet.py').exists() and (root / 'testcases').exists() and (root / 'testcasesupport').exists():

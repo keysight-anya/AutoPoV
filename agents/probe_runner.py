@@ -24,7 +24,7 @@ import os
 import re
 import tarfile
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -65,11 +65,18 @@ class ProbeResult:
         self.probe_duration_s: float = 0.0
         self.probe_error: str = ''
         # Surface-adaptive fields (Task 1)
-        self.probe_surface_type: str = ''          # native_elf | python_module | node_module | web_service
+        self.probe_surface_type: str = ''          # native_elf | python_module | node_module | web_service | java_module
         self.probe_entry_command: str = ''         # full command to invoke target
         self.probe_install_ok: bool = False        # True if package install succeeded
         self.probe_base_url: str = ''              # for web_service: http://localhost:<port>
         self.probe_exports: str = ''               # Task 2B: exported names from Python/Node package
+        self.probe_format_hint: str = ''             # T3: detected input format (xml|json|image|archive|...)
+        self.probe_binary_is_test: bool = False          # Task 3: True if selected binary matches test-runner patterns
+        # Adaptive intelligence fields (replaces hardcoded maps)
+        self.probe_discovered_subcommands: List[str] = []   # subcommands parsed from --help text
+        self.probe_inferred_extensions: List[str] = []       # file extensions this binary accepts
+        self.probe_rejection_patterns: List[str] = []        # error strings indicating format rejection
+        self.probe_bootstrap_subcommand: str = ''            # init/keygen subcommand if detected
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -86,6 +93,7 @@ class ProbeResult:
             'probe_help_text': self.probe_help_text,
             'probe_exports': self.probe_exports,
             'probe_input_surface': self.probe_input_surface,
+            'probe_format_hint': self.probe_format_hint,
             'probe_baseline_exit_code': self.probe_baseline_exit_code,
             'probe_baseline_stderr': self.probe_baseline_stderr[:500] if self.probe_baseline_stderr else '',
             'probe_skipped': self.probe_skipped,
@@ -96,6 +104,12 @@ class ProbeResult:
             'probe_entry_command': self.probe_entry_command,
             'probe_install_ok': self.probe_install_ok,
             'probe_base_url': self.probe_base_url,
+            'probe_binary_is_test': self.probe_binary_is_test,
+            # Adaptive intelligence
+            'probe_discovered_subcommands': self.probe_discovered_subcommands,
+            'probe_inferred_extensions': self.probe_inferred_extensions,
+            'probe_rejection_patterns': self.probe_rejection_patterns,
+            'probe_bootstrap_subcommand': self.probe_bootstrap_subcommand,
         }
 
 
@@ -138,6 +152,8 @@ def format_probe_context(probe: ProbeResult) -> str:
         lines.append('crash_probe: no crash with empty/trivial inputs')
     if probe.probe_interesting_strings:
         lines.append('interesting_strings: ' + '; '.join(probe.probe_interesting_strings[:10]))
+    if probe.probe_format_hint:
+        lines.append(f'expected_input_format: {probe.probe_format_hint}')
     if probe.probe_error:
         lines.append(f'probe_error: {probe.probe_error}')
     return '\n'.join(lines)
@@ -186,6 +202,16 @@ def _classify_js_input_surface(codebase_path: str) -> str:
         return 'function_call'
 
     return 'unknown'
+
+
+def classify_input_surface(help_text: str, binary_path: str = '') -> str:
+    """Public wrapper for _classify_input_surface.
+
+    Task 12: Provides a stable public API for external modules (e.g. prompts.py)
+    to call without importing a private underscore-prefixed function.
+    """
+    return _classify_input_surface(help_text, binary_path)
+
 
 def _classify_input_surface(help_text: str, binary_path: str = '') -> str:
     """Derive the primary input surface for a binary from its --help text.
@@ -255,6 +281,77 @@ def _classify_input_surface(help_text: str, binary_path: str = '') -> str:
         return 'argv_only'
 
     return 'unknown'
+
+
+# ---------------------------------------------------------------------------
+# T3: Classify input format hint from binary/file name
+# ---------------------------------------------------------------------------
+
+def _classify_format_hint(binary_path: str, codebase_path: str = '') -> str:
+    """Return a format classification hint based on binary name and codebase files.
+
+    Returns: 'xml' | 'json' | 'html' | 'image' | 'pdf' | 'archive' | 'audio' | 'font' | ''
+    """
+    name = os.path.basename(binary_path or '').lower()
+    cb = (codebase_path or '').lower()
+    _XML = ('xml', 'expat', 'libxml', 'xmlwf', 'xmllint', 'tidy', 'pugixml', 'rapidxml', 'mxml', 'xerces')
+    _JSON = ('json', 'cjson', 'jansson', 'parson', 'jsmn', 'ujson', 'yajl', 'simdjson')
+    _HTML = ('html', 'htmlparser', 'gumbo', 'modest', 'lexbor', 'w3m', 'lynx', 'links', 'elinks')
+    _IMG = ('jpeg', 'jpg', 'jhead', 'jpegtran', 'jpegoptim', 'png', 'gif', 'tiff', 'bmp', 'webp',
+            'exif', 'imgfile', 'libjpeg', 'libpng')
+    _PDF = ('pdf', 'mupdf', 'poppler', 'ghostscript')
+    _ARC = ('zip', 'tar', 'gzip', 'bzip2', 'bsdtar', 'bsdcat', 'libarchive', 'zstd', 'lz4', 'zlib', 'snappy')
+    _AUD = ('mp3', 'ogg', 'flac', 'wav', 'opus', 'vorbis', 'libsndfile', 'sox', 'ffmpeg')
+    _FNT = ('ttf', 'otf', 'woff', 'freetype', 'harfbuzz')
+    for sig in _XML:
+        if sig in name:
+            return 'xml'
+    for sig in _JSON:
+        if sig in name:
+            return 'json'
+    for sig in _HTML:
+        if sig in name:
+            return 'html'
+    for sig in _IMG:
+        if sig in name:
+            return 'image'
+    for sig in _PDF:
+        if sig in name:
+            return 'pdf'
+    for sig in _ARC:
+        if sig in name:
+            return 'archive'
+    for sig in _AUD:
+        if sig in name:
+            return 'audio'
+    for sig in _FNT:
+        if sig in name:
+            return 'font'
+    # Fallback: check codebase path for XML/JSON library indicators
+    for sig in _XML:
+        if sig in cb:
+            return 'xml'
+    for sig in _JSON:
+        if sig in cb:
+            return 'json'
+    return ''
+
+
+def _classify_format_hint_from_help(help_text: str) -> str:
+    """Infer input format from probe help/error text when binary name isn't informative."""
+    if not help_text:
+        return ''
+    ht = help_text.lower()
+    # XML indicators
+    if any(p in ht for p in ('not well-formed', 'xml', 'no element found', 'parse error at line')):
+        return 'xml'
+    # JSON indicators
+    if any(p in ht for p in ('json', 'unexpected token', 'expected value')):
+        return 'json'
+    # Image indicators
+    if any(p in ht for p in ('jpeg', 'png', 'gif', 'tiff', 'image', 'exif')):
+        return 'image'
+    return ''
 
 
 # ---------------------------------------------------------------------------
@@ -373,11 +470,76 @@ if [ -z "$(_has_elf)" ]; then
     || make -C "$CB" -j4 2>/tmp/_probe_make_plain.log \
     && PROBE_BUILD_STATUS="make_plain_ok" \
     || PROBE_BUILD_STATUS="make_failed"
+  # ── Maven ─────────────────────────────────────────────────────────────────────────
+  elif [ -f "$CB/pom.xml" ]; then
+    if command -v mvn >/dev/null 2>&1; then
+      mvn -f "$CB/pom.xml" package -DskipTests -q 2>/tmp/_probe_mvn.log \
+      && PROBE_BUILD_STATUS="maven_ok" \
+      || PROBE_BUILD_STATUS="maven_failed"
+    else
+      PROBE_BUILD_STATUS="maven_not_installed"
+    fi
+  # ── Gradle ────────────────────────────────────────────────────────────────────────
+  elif [ -f "$CB/build.gradle" ] || [ -f "$CB/build.gradle.kts" ]; then
+    if command -v gradle >/dev/null 2>&1; then
+      gradle -p "$CB" build -x test -q 2>/tmp/_probe_gradle.log \
+      && PROBE_BUILD_STATUS="gradle_ok" \
+      || PROBE_BUILD_STATUS="gradle_failed"
+    else
+      PROBE_BUILD_STATUS="gradle_not_installed"
+    fi
+  fi
+  # ── Subdirectory fallback: if root build failed or no build system found at root,
+  # try immediate subdirectories (e.g. libexpat has buildable code in expat/) ──────
+  if [ "$PROBE_BUILD_STATUS" = "skipped" ] || echo "$PROBE_BUILD_STATUS" | grep -q "failed"; then
+    for _SUBDIR in "$CB"/*/; do
+      [ -d "$_SUBDIR" ] || continue
+      # Skip common non-source subdirectories
+      _SDNAME=$(basename "$_SUBDIR")
+      case "$_SDNAME" in
+        .git|node_modules|test|tests|doc|docs|examples|samples|build|.autopov*) continue ;;
+      esac
+      if [ -f "$_SUBDIR/CMakeLists.txt" ]; then
+        _SUB_BUILD="$_SUBDIR/.autopov-probe-build"
+        cmake -S "$_SUBDIR" -B "$_SUB_BUILD" \
+          -DCMAKE_BUILD_TYPE=Debug \
+          -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+          -DCMAKE_C_FLAGS="-O0 -g -fsanitize=address,undefined -fno-omit-frame-pointer" \
+          -DCMAKE_CXX_FLAGS="-O0 -g -fsanitize=address,undefined -fno-omit-frame-pointer" \
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
+          -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined" \
+          -G Ninja 2>/tmp/_probe_cmake_sub.log \
+        && cmake --build "$_SUB_BUILD" --parallel 4 2>>/tmp/_probe_cmake_sub.log \
+        && PROBE_BUILD_STATUS="cmake_subdir_ok" && break
+      elif [ -f "$_SUBDIR/configure.ac" ] || [ -f "$_SUBDIR/configure.in" ]; then
+        (cd "$_SUBDIR" \
+          && ([ -x ./autogen.sh ] && ./autogen.sh 2>/tmp/_probe_auto_sub.log \
+              || autoreconf -i 2>/tmp/_probe_auto_sub.log || true) \
+          && ./configure CC=clang CFLAGS="-O0 -g -fsanitize=address,undefined" 2>>/tmp/_probe_auto_sub.log \
+          && make -j4 2>>/tmp/_probe_auto_sub.log) \
+        && PROBE_BUILD_STATUS="autoconf_subdir_ok" && break
+      elif [ -f "$_SUBDIR/Makefile" ] || [ -f "$_SUBDIR/makefile" ]; then
+        make -C "$_SUBDIR" -j4 \
+          CC=clang CFLAGS="-O0 -g -fsanitize=address,undefined -fno-omit-frame-pointer" \
+          LDFLAGS="-fsanitize=address,undefined" \
+          2>/tmp/_probe_make_sub.log \
+        && PROBE_BUILD_STATUS="make_subdir_ok" && break
+      fi
+    done
   fi
 else
   PROBE_BUILD_STATUS="prebuilt"
 fi
 echo "PROBE_BUILD_STATUS=$PROBE_BUILD_STATUS"
+# FIX-4: Copy build artifacts to shared build cache volume if available
+if [ -n "${AUTOPOV_BUILD_CACHE:-}" ] && [ -d "${AUTOPOV_BUILD_CACHE}" ]; then
+  echo "$PROBE_BUILD_STATUS" | grep -qE "_ok$" && {
+    cp -a "$CB" "${AUTOPOV_BUILD_CACHE}/codebase" 2>/dev/null || true
+    echo "PROBE_BUILD_CACHED=1"
+  } || echo "PROBE_BUILD_CACHED=0"
+else
+  echo "PROBE_BUILD_CACHED=0"
+fi
 set -e
 
 # ── Step 1: Locate the most-recently-built ELF binary ──────────────────────
@@ -415,6 +577,21 @@ if [ -z "$PROBE_BIN" ]; then
   # Do NOT exit -- continue so later steps can still record partial data.
 else
   echo "PROBE_BINARY=$PROBE_BIN"
+  # Task 3: Flag test-like binaries so downstream can route to c_library_harness
+  _PROBE_BNAME=$(basename "$PROBE_BIN")
+  case "$_PROBE_BNAME" in
+    test_*|*_test|*_tests|check_*|*_check|bench_*|*_bench|fuzz_*|*_fuzz|run_test*|unity*|selftest*)
+      echo "PROBE_BINARY_IS_TEST=1" ;;
+    *)
+      # Also flag if binary lives in a test/example/sample/demo/contrib directory
+      case "$PROBE_BIN" in
+        */test/*|*/tests/*|*/examples/*|*/example/*|*/samples/*|*/sample/*|*/demo/*|*/demos/*|*/contrib/*)
+          echo "PROBE_BINARY_IS_TEST=1" ;;
+        *)
+          echo "PROBE_BINARY_IS_TEST=0" ;;
+      esac
+      ;;
+  esac
 fi
 # Relax set -e from here: remaining steps are best-effort.
 set +e
@@ -533,9 +710,28 @@ if [ -f "$CB/setup.py" ] || [ -f "$CB/pyproject.toml" ] || [ -f "$CB/setup.cfg" 
   PROBE_ENTRY_CMD=$(python3 -c \
     "import sys\ntry:\n    import pkg_resources\n    for d in pkg_resources.working_set:\n        for name in d.get_entry_map().get('console_scripts',{}):\n            print(name); sys.exit(0)\nexcept Exception: pass\n" 2>/dev/null | head -1)
   # Task 2B: extract exported names for the LLM
-  PROBE_EXPORTS=$(python3 -c \
-    "import sys, os, ast\nroot='$CB'\nexports=[]\nfor dp,dn,fn in os.walk(root):\n    dn[:]=[ d for d in dn if not d.startswith('.') and d not in ('node_modules','.git','__pycache__')]\n    for f in fn:\n        if f.endswith('.py'):\n            try:\n                src=open(os.path.join(dp,f)).read()\n                tree=ast.parse(src)\n                for n in ast.walk(tree):\n                    if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)):\n                        if not n.name.startswith('_'):\n                            exports.append(n.name)\n            except: pass\nprint(','.join(sorted(set(exports))[:60]))" \
-    2>/dev/null | head -1)
+  # FIX-10: Write Python probe to a temp file to avoid shell quoting issues
+  # with $CB inside inline python3 -c strings.
+  cat > /tmp/_autopov_exports.py << 'PYEOF'
+import sys, os, ast
+root = sys.argv[1] if len(sys.argv) > 1 else '/workspace/codebase'
+exports = []
+for dp, dn, fn in os.walk(root):
+    dn[:] = [d for d in dn if not d.startswith('.') and d not in ('node_modules', '.git', '__pycache__')]
+    for f in fn:
+        if f.endswith('.py'):
+            try:
+                src = open(os.path.join(dp, f)).read()
+                tree = ast.parse(src)
+                for n in ast.walk(tree):
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        if not n.name.startswith('_'):
+                            exports.append(n.name)
+            except Exception:
+                pass
+print(','.join(sorted(set(exports))[:60]))
+PYEOF
+  PROBE_EXPORTS=$(python3 /tmp/_autopov_exports.py "$CB" 2>/dev/null | head -1)
   if [ -z "$PROBE_ENTRY_CMD" ]; then
     _MAIN=$(find "$CB" -name '__main__.py' ! -path '*/.git/*' 2>/dev/null | head -1)
     if [ -n "$_MAIN" ]; then
@@ -572,6 +768,22 @@ elif [ -f "$CB/package.json" ]; then
     PROBE_SURFACE_TYPE="web_service"
     PROBE_BASE_URL="http://localhost:$_PORT"
   fi
+
+# ── Java surface detection ───────────────────────────────────────────────────────────
+elif [ -f "$CB/pom.xml" ] || [ -f "$CB/build.gradle" ] || [ -f "$CB/build.gradle.kts" ]; then
+  PROBE_SURFACE_TYPE="java_module"
+  # Find built jar from Maven or Gradle output
+  JAVA_JAR=$(find "$CB" \( -path '*/target/*.jar' -o -path '*/build/libs/*.jar' \) \
+    ! -name '*-sources.jar' ! -name '*-javadoc.jar' 2>/dev/null | head -1)
+  if [ -n "$JAVA_JAR" ]; then
+    PROBE_ENTRY_CMD="java -jar $JAVA_JAR"
+    PROBE_INSTALL_OK="1"
+  fi
+  # Extract main class from manifest if jar exists
+  if [ -n "$JAVA_JAR" ]; then
+    PROBE_EXPORTS=$(unzip -p "$JAVA_JAR" META-INF/MANIFEST.MF 2>/dev/null \
+      | grep -i 'Main-Class' | cut -d: -f2 | tr -d ' \r' || true)
+  fi
 fi
 
 if [ -n "$PROBE_SURFACE_TYPE" ]; then
@@ -596,8 +808,13 @@ def _run_probe_container(
     repo_name: str,
     image: str,
     timeout: int = 90,
+    scan_id: str = '',
 ) -> str:
-    """Run the probe shell script in a Docker container and return combined stdout."""
+    """Run the probe shell script in a Docker container and return combined stdout.
+
+    FIX-4: When scan_id is provided, a named Docker volume is created to persist
+    build artifacts. The PoV container can mount the same volume to skip rebuilding.
+    """
     if not DOCKER_AVAILABLE:
         return 'PROBE_ERROR=docker_not_available'
 
@@ -627,6 +844,16 @@ def _run_probe_container(
                 tar.add(codebase_path, arcname='workspace/codebase', recursive=True)
         archive_buf.seek(0)
 
+        # FIX-4: Create a named build volume for artifact reuse by PoV container
+        _build_volume_name = f'autopov_build_{scan_id}' if scan_id else ''
+        _volumes = {}
+        if _build_volume_name:
+            try:
+                client.volumes.create(name=_build_volume_name)
+                _volumes[_build_volume_name] = {'bind': '/workspace/build_cache', 'mode': 'rw'}
+            except Exception:
+                _build_volume_name = ''  # fall back to no volume
+
         container = client.containers.create(
             image=image,
             command=['bash', '-lc', 'chmod +x /probe/probe.sh && /probe/probe.sh'],
@@ -640,7 +867,11 @@ def _run_probe_container(
                 'AUTOPOV_REPO_NAME': repo_name,
                 'DEBIAN_FRONTEND': 'noninteractive',
                 'PIP_NO_CACHE_DIR': '1',
+                'AUTOPOV_BUILD_CACHE': '/workspace/build_cache' if _build_volume_name else '',
             },
+            cap_add=["SYS_PTRACE"],
+            security_opt=["seccomp=unconfined"],
+            volumes=_volumes or None,
             detach=True,
         )
         container.put_archive('/', archive_buf.getvalue())
@@ -726,6 +957,9 @@ def _parse_probe_output(raw: str) -> ProbeResult:
         elif line.startswith('PROBE_BINARY='):
             result.probe_binary_path = line[len('PROBE_BINARY='):]
 
+        elif line.startswith('PROBE_BINARY_IS_TEST='):
+            result.probe_binary_is_test = line[len('PROBE_BINARY_IS_TEST='):].strip() == '1'
+
         elif line.startswith('PROBE_LDD_MISSING='):
             val = line[len('PROBE_LDD_MISSING='):]
             result.probe_ldd_missing = [v.strip() for v in val.split(',') if v.strip()]
@@ -754,6 +988,9 @@ def _parse_probe_output(raw: str) -> ProbeResult:
             result.probe_help_text = help_text
             # Classify the input surface from the help text
             result.probe_input_surface = _classify_input_surface(help_text, result.probe_binary_path)
+            # T3: classify input format from binary name
+            if result.probe_binary_path and not result.probe_format_hint:
+                result.probe_format_hint = _classify_format_hint(result.probe_binary_path)
 
         elif line.startswith('PROBE_CRASHED='):
             result.probe_crash_observed = line[len('PROBE_CRASHED='):] == '1'
@@ -813,6 +1050,25 @@ def _parse_probe_output(raw: str) -> ProbeResult:
     # binary presence if the sentinel wasn't emitted (older probe script versions).
     if not result.probe_build_log:
         result.probe_build_succeeded = bool(result.probe_binary_path)
+
+    # Fallback: if a binary was found but surface type is still empty,
+    # the shell script's native_elf sentinel may not have been emitted
+    # (e.g. due to subdirectory builds or script concatenation issues).
+    if result.probe_binary_path and not result.probe_surface_type:
+        result.probe_surface_type = 'native_elf'
+
+    # T3-fix: classify input format from binary name unconditionally.
+    # Previously this only ran inside the PROBE_HELP_BEGIN block, so repos
+    # whose probe didn't emit help text never got a format hint.
+    if result.probe_binary_path and not result.probe_format_hint:
+        result.probe_format_hint = _classify_format_hint(result.probe_binary_path)
+
+    # Task 4: fallback — infer format from help/error text when binary name is uninformative
+    if not result.probe_format_hint and result.probe_help_text:
+        result.probe_format_hint = _classify_format_hint_from_help(result.probe_help_text)
+    if not result.probe_format_hint and result.probe_baseline_stderr:
+        result.probe_format_hint = _classify_format_hint_from_help(result.probe_baseline_stderr)
+
     return result
 
 
@@ -850,7 +1106,7 @@ def run_probe(
         Selects the Docker image used for the probe container.
     """
     result = ProbeResult()
-    start = datetime.utcnow()
+    start = datetime.now(timezone.utc)
 
     if not DOCKER_AVAILABLE:
         result.probe_skipped = True
@@ -886,6 +1142,7 @@ def run_probe(
             repo_name=repo_name,
             image=image,
             timeout=timeout,
+            scan_id=scan_id,
         )
         result = _parse_probe_output(raw_output)
     except Exception as ex:
@@ -900,8 +1157,197 @@ def run_probe(
         if js_surface != 'unknown':
             result.probe_input_surface = js_surface
 
-    result.probe_duration_s = (datetime.utcnow() - start).total_seconds()
+    # Derive adaptive intelligence from probe results
+    _enrich_probe_intelligence(result)
+
+    result.probe_duration_s = (datetime.now(timezone.utc) - start).total_seconds()
     return result
+
+
+def _enrich_probe_intelligence(result: ProbeResult) -> None:
+    """Post-process probe results to derive adaptive intelligence.
+
+    Extracts subcommands, file extensions, rejection patterns, and bootstrap
+    hints from the raw probe output — replacing hardcoded maps downstream.
+    """
+    # 1. Extract subcommands from help text
+    result.probe_discovered_subcommands = _extract_subcommands_from_help(
+        result.probe_help_text, result.probe_binary_path
+    )
+
+    # 2. Infer accepted file extensions from format hint + help text
+    result.probe_inferred_extensions = _infer_extensions_from_format(
+        result.probe_format_hint, result.probe_help_text, result.probe_binary_path
+    )
+
+    # 3. Extract format rejection patterns from baseline stderr
+    result.probe_rejection_patterns = _extract_rejection_patterns(
+        result.probe_baseline_stderr, result.probe_crash_output
+    )
+
+    # 4. Detect bootstrap/keygen subcommand
+    _BOOTSTRAP_KEYWORDS = {
+        'keygen', 'init', 'setup', 'configure', 'generate-key', 'genkey',
+        'key-gen', 'key_gen', 'gen-key', 'generate_key', 'create-key',
+    }
+    for sub in result.probe_discovered_subcommands:
+        if sub.lower() in _BOOTSTRAP_KEYWORDS:
+            result.probe_bootstrap_subcommand = sub
+            break
+
+
+def _extract_subcommands_from_help(help_text: str, binary_path: str = '') -> List[str]:
+    """Parse subcommands from binary --help output.
+
+    Looks for common patterns like:
+      - 'commands:' / 'subcommands:' header followed by indented names
+      - 'usage: binary <command>' patterns
+      - Lines like '  encrypt     Encrypt a file'
+    """
+    if not help_text:
+        return []
+
+    subcmds: List[str] = []
+    lines = help_text.splitlines()
+    binary_name = os.path.basename(binary_path or '').lower()
+    in_command_section = False
+
+    for line in lines:
+        stripped = line.strip()
+        low = stripped.lower()
+
+        # Detect command section headers
+        if re.match(r'^(commands|subcommands|available commands|actions|operations)\s*:', low):
+            in_command_section = True
+            continue
+
+        # End of command section on blank line or non-indented non-command line
+        if in_command_section:
+            if not stripped:
+                in_command_section = False
+                continue
+            # Indented lines in command section: '  encrypt     Encrypt a file'
+            m = re.match(r'^\s{2,}([a-z][a-z0-9_-]{1,30})(?:\s|$)', line)
+            if m:
+                subcmds.append(m.group(1))
+                continue
+            # Non-indented line ends the section
+            if not line.startswith(' '):
+                in_command_section = False
+
+        # Usage line: 'usage: binary <command>' or 'binary {encrypt|decrypt|keygen}'
+        m = re.search(r'\{([a-z][a-z0-9_|-]+)\}', low)
+        if m:
+            for part in m.group(1).split('|'):
+                part = part.strip()
+                if part and len(part) <= 30:
+                    subcmds.append(part)
+
+        # Standalone indented command-description lines (even without section header)
+        # Pattern: '  <word>   <description text>' where word is 2-20 chars
+        if not in_command_section and line.startswith('  ') and not line.startswith('   -'):
+            m = re.match(r'^\s{2,4}([a-z][a-z0-9_-]{1,20})\s{2,}\S', line)
+            if m:
+                candidate = m.group(1)
+                # Filter out common non-subcommand words
+                _NOISE = {'the', 'and', 'for', 'with', 'from', 'usage', 'options',
+                          'help', 'version', 'where', 'note', 'example', 'examples',
+                          'see', 'also', 'default', 'optional', 'required'}
+                if candidate not in _NOISE:
+                    subcmds.append(candidate)
+
+    # Deduplicate preserving order
+    seen = set()
+    unique = []
+    for s in subcmds:
+        if s not in seen:
+            seen.add(s)
+            unique.append(s)
+    return unique
+
+
+# Extension mapping from format hints — derived from runtime, not binary name
+_FORMAT_TO_EXTENSIONS: Dict[str, List[str]] = {
+    'xml': ['.xml'],
+    'json': ['.json'],
+    'html': ['.html', '.htm'],
+    'csv': ['.csv'],
+    'image': ['.jpg', '.png', '.bmp', '.gif', '.tif', '.webp'],
+    'pdf': ['.pdf'],
+    'archive': ['.zip', '.tar', '.gz', '.bz2', '.xz', '.zst', '.lz4'],
+    'audio': ['.mp3', '.ogg', '.flac', '.wav'],
+    'font': ['.ttf', '.otf', '.woff'],
+}
+
+
+def _infer_extensions_from_format(
+    format_hint: str, help_text: str = '', binary_path: str = ''
+) -> List[str]:
+    """Infer accepted file extensions from the probe's format classification.
+
+    Returns a list of likely extensions the binary processes, derived from
+    actual runtime classification rather than binary name fragment matching.
+    """
+    exts: List[str] = []
+    fmt = (format_hint or '').lower().strip()
+    if fmt in _FORMAT_TO_EXTENSIONS:
+        exts.extend(_FORMAT_TO_EXTENSIONS[fmt])
+
+    # Supplement from help text patterns like '--input FILE.xml' or 'reads .json'
+    if help_text:
+        ht = help_text.lower()
+        for m in re.finditer(r'\.(xml|json|html?|csv|jpe?g|png|gif|tiff?|bmp|webp|pdf|zip|tar|gz|mp3|ogg|flac|wav|ttf|otf|woff|enc|bin)\b', ht):
+            ext = '.' + m.group(1)
+            if ext == '.htm':
+                ext = '.html'
+            if ext not in exts:
+                exts.append(ext)
+
+    # For encryption tools: detect from help text
+    if not exts and help_text:
+        ht = help_text.lower()
+        if any(kw in ht for kw in ('encrypt', 'decrypt', 'cipher', 'archive')):
+            exts.append('.enc')
+
+    return exts
+
+
+def _extract_rejection_patterns(baseline_stderr: str, crash_output: str = '') -> List[str]:
+    """Extract format rejection error strings from probe stderr/crash output.
+
+    These are the actual error messages the binary emits when it receives
+    input in the wrong format — used downstream to detect format-rejection
+    (replacing the hardcoded _FORMAT_REJECTION_RE).
+    """
+    patterns: List[str] = []
+    combined = ((baseline_stderr or '') + '\n' + (crash_output or '')).strip()
+    if not combined:
+        return patterns
+
+    # Common format rejection phrases — extract them if present in actual output
+    _REJECTION_INDICATORS = [
+        r'unhandled file type', r'premature end of file', r'bad \w+ chunk',
+        r'not a (?:jpeg|png|valid|pdf|zip)', r'invalid (?:jpeg|png|file|format|header)',
+        r'unsupported format', r'cannot open', r'not recognized',
+        r'file format not recognized', r'unknown file type', r'invalid file',
+        r'illegally sized', r'illegal value', r'bad components',
+        r'no element found', r'not well-?formed', r'syntax error',
+        r'unexpected token', r'expected value', r'parse error',
+        r'malformed', r'corrupt', r'truncated',
+    ]
+    for indicator in _REJECTION_INDICATORS:
+        m = re.search(indicator, combined, re.IGNORECASE)
+        if m:
+            # Extract the surrounding context (up to 80 chars) as the pattern
+            start = max(0, m.start() - 10)
+            end = min(len(combined), m.end() + 40)
+            snippet = combined[start:end].strip()
+            # Clean to single line
+            snippet = snippet.split('\n')[0].strip()
+            if snippet and snippet not in patterns:
+                patterns.append(snippet)
+
+    return patterns[:10]  # Cap at 10 patterns
 
 
 # ---------------------------------------------------------------------------

@@ -1,3 +1,0 @@
-"""
-AutoPoV App Module
-"""

@@ -7,7 +7,7 @@ import os
 import json
 import requests
 from typing import Dict, Any, List, Optional, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dataclasses import asdict
 
 from app.config import settings
@@ -77,7 +77,7 @@ class ProfessionalPDFReport(FPDF):
         self.cell(120, 6, 'AutoPoV Security Assessment Report', 0, 0, 'L')
         self.set_font('Arial', '', 8)
         self.set_text_color(107, 114, 128)
-        self.cell(66, 6, datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC'), 0, 0, 'R')
+        self.cell(66, 6, datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'), 0, 0, 'R')
         self.ln(14)
 
     def footer(self):
@@ -258,7 +258,7 @@ class ReportGenerator:
         
         report_data = {
             "report_metadata": {
-                "generated_at": datetime.utcnow().isoformat(),
+                "generated_at": datetime.now(timezone.utc).isoformat(),
                 "tool": "AutoPoV",
                 "version": settings.APP_VERSION,
                 "report_type": "comprehensive_security_assessment"
@@ -669,7 +669,7 @@ class ReportGenerator:
         pdf.set_text_color(75, 85, 99)
         pdf.cell(0, 7, _safe(f'Target: {target_name}'), 0, 1, 'L')
         pdf.cell(0, 7, _safe(f'Scan ID: {result.scan_id}'), 0, 1, 'L')
-        pdf.cell(0, 7, _safe(f'Completed: {result.end_time or datetime.utcnow().isoformat()}'), 0, 1, 'L')
+        pdf.cell(0, 7, _safe(f'Completed: {result.end_time or datetime.now(timezone.utc).isoformat()}'), 0, 1, 'L')
         pdf.ln(4)
 
         pdf.section_header('Executive Summary')
@@ -841,7 +841,7 @@ class ReportGenerator:
         pdf.section_header('Appendix')
         pdf.key_value_row('Scan ID', result.scan_id)
         pdf.key_value_row('Codebase path', result.codebase_path)
-        pdf.key_value_row('Report generated', datetime.utcnow().isoformat())
+        pdf.key_value_row('Report generated', datetime.now(timezone.utc).isoformat())
         pdf.key_value_row('Application version', settings.APP_VERSION)
 
         pdf.output(report_path)
@@ -900,8 +900,8 @@ class ReportGenerator:
             return []
         
         # Get activity for scan date
-        start_time = datetime.utcnow() - timedelta(hours=1)  # Approximate
-        end_time = datetime.utcnow()
+        start_time = datetime.now(timezone.utc) - timedelta(hours=1)  # Approximate
+        end_time = datetime.now(timezone.utc)
         
         return self.activity_tracker.get_activity_for_scan(start_time, end_time)
 
@@ -1134,7 +1134,7 @@ class ReportGenerator:
                 "verdict": finding.get("llm_verdict"),
                 "confidence": finding.get("confidence"),
                 "severity": self._calculate_severity(finding),
-                "explanation": finding.get("llm_explanation"),
+                "explanation": finding.get("proof_narrative") or finding.get("llm_explanation"),
                 "root_cause": finding.get("root_cause"),
                 "impact": finding.get("impact"),
                 "vulnerable_code": finding.get("code_chunk"),
@@ -1171,7 +1171,7 @@ class ReportGenerator:
                     f.write(f"# Classification: {finding.get('cwe_type', 'UNCLASSIFIED')}\n")
                     f.write(f"# File: {finding.get('filepath', 'unknown')}\n")
                     f.write(f"# Line: {finding.get('line_number', 0)}\n")
-                    f.write(f"# Generated: {datetime.utcnow().isoformat()}\n\n")
+                    f.write(f"# Generated: {datetime.now(timezone.utc).isoformat()}\n\n")
                     f.write(finding['pov_script'])
                 
                 saved_paths.append(pov_path)

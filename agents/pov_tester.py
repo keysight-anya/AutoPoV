@@ -9,7 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -42,6 +42,12 @@ class PoVTester:
         "error while finding module specification",
         "pkg_resources.distributionnotfound",
         "distributionnotfound",
+        # PoV script infrastructure failures (not target crashes)
+        "nameerror",
+        "connectionrefusederror",
+        "connection refused",
+        "cannot find module",
+        "econnrefused",
     ]
     INVALID_NATIVE_ENTRYPOINTS = {
         "if", "for", "while", "switch", "return", "sizeof", "malloc", "calloc", "realloc", "free",
@@ -95,11 +101,44 @@ class PoVTester:
             pov_script = pov_script.replace("{{target_binary}}", target_binary).replace("{target_binary}", target_binary)
         return pov_script
 
-    def _repair_native_runtime_script(self, pov_script: str) -> str:
+    def _repair_native_runtime_script(self, pov_script: str, runtime_profile: str = '') -> str:
         script = str(pov_script or '')
+        # Skip for non-native runtimes — JS/TS/Python targets don't use TARGET_BINARY.
+        # Python PoVs should use CODEBASE_PATH / TARGET_URL, not a compiled binary.
+        if runtime_profile.lower() in ('javascript', 'node', 'typescript', 'python'):
+            # For Python targets, strip TARGET_BINARY references if they exist
+            # and the script tries to exec a binary (which won't exist for Python/Flask)
+            if runtime_profile.lower() == 'python' and 'TARGET_BINARY' in script:
+                # Replace TARGET_BINARY with CODEBASE_PATH-based approach
+                script = script.replace(
+                    'if not binary or not os.path.isfile(binary):\n',
+                    '# Python target — no native binary expected\nif True:\n'
+                )
+                script = script.replace(
+                    "if not binary or not os.path.isfile(binary):",
+                    "# Python target — no native binary expected\nif True:"
+                )
+            return script
         if not script or 'TARGET_BINARY' not in script:
             return script
         script = script.replace('    global TARGET_BINARY\n', '')
+
+        # ── Structural shadowing repair ──────────────────────────────────────
+        # Detect any indented TARGET_BINARY = os.environ.get(...) / os.getenv(...)
+        # (inside a function) and remove it.  The existing injection logic below
+        # will ensure the assignment exists at module level instead.
+        _lines = script.split('\n')
+        _new_lines = []
+        _found_shadowed = False
+        for _line in _lines:
+            _stripped = _line.strip()
+            _indent = len(_line) - len(_line.lstrip())
+            if _indent > 0 and 'TARGET_BINARY' in _stripped and ('os.environ' in _stripped or 'os.getenv' in _stripped):
+                _found_shadowed = True
+                continue  # remove the shadowed assignment
+            _new_lines.append(_line)
+        if _found_shadowed:
+            script = '\n'.join(_new_lines)
 
         # If the script uses TARGET_BINARY as a bare module-level name but never
         # assigns it via os.environ.get(), inject the assignment at the top of the
@@ -306,13 +345,17 @@ class PoVTester:
             'keygen', 'init', 'setup', 'configure', 'generate-key', 'genkey',
             'key-gen', 'key_gen', 'gen-key', 'generate_key',
         }
+        # Use probe-discovered bootstrap subcommand if available (replaces hardcoded hints)
+        _probe_bootstrap = str(contract.get('probe_bootstrap_subcommand') or '').strip()
+        _probe_subcmds = contract.get('probe_discovered_subcommands') or []
         needs_keygen = (
             any('key material' in item or 'bootstrap key material' in item for item in requirements)
+            or bool(_probe_bootstrap)  # Probe found a bootstrap subcommand
             or bool(known_subcommands and _BOOTSTRAP_SUBCOMMAND_HINTS & set(known_subcommands))
+            or bool(_probe_subcmds and _BOOTSTRAP_SUBCOMMAND_HINTS & {s.lower() for s in _probe_subcmds})
             or (
                 # Fallback: no known_subcommands but binary name suggests a crypto tool
-                # that likely requires key material to function.
-                not known_subcommands
+                not known_subcommands and not _probe_subcmds
                 and any(kw in binary_name_lower for kw in ('crypt', 'pgp', 'gpg', 'age', 'vault', 'pass', 'encrypt', 'sign'))
             )
         )
@@ -756,21 +799,56 @@ class PoVTester:
         )
         baseline_exit_code = int(contract.get('probe_baseline_exit_code') or -1)
         baseline_stderr = str(contract.get('probe_baseline_stderr') or '')
-        op_result = oracle_policy.evaluate_proof_outcome(
-            stdout=stdout,
-            stderr=stderr,
-            exit_code=exit_code,
-            target_entrypoint=target_entrypoint,
-            filepath=filepath,
-            pov_script=pov_script,
-            expected_oracle=expected_oracle,
-            target_binary=target_binary,
-            stage=execution_stage,
-            relevance_anchors=relevance_anchors,
-            asan_disabled=asan_disabled,
-            baseline_exit_code=baseline_exit_code,
-            baseline_stderr=baseline_stderr,
-        )
+        # GAP-10 FIX: Route to dynamic proof oracle when proof_strategy is present
+        # and proof_type is not crash_signal, matching docker_runner behaviour.
+        _proof_strategy = contract.get('proof_strategy') or {}
+        _proof_type = str(_proof_strategy.get('proof_type', '')).strip().lower()
+        # Native C/C++ targets with behavioral_deviation should use crash_signal oracle.
+        # ASan/UBSan/SEGV are the correct proof path for native code — the behavioral
+        # oracle looks for output markers that native binaries never produce.
+        _runtime_fam = str(contract.get('runtime_family') or '').lower()
+        _runtime_prof = str(contract.get('runtime_profile') or '').lower()
+        _is_native = _runtime_fam in ('c', 'cpp', 'native', 'binary') or _runtime_prof in ('c', 'cpp', 'native', 'binary')
+        if _is_native and _proof_type == 'behavioral_deviation':
+            _proof_type = 'crash_signal'
+        execution_surface = str(
+            contract.get('execution_surface') or
+            (contract.get('proof_plan') or {}).get('execution_surface') or ''
+        ).strip().lower()
+        if _proof_strategy and _proof_type and _proof_type != 'crash_signal':
+            op_result = oracle_policy.evaluate_dynamic_proof_outcome(
+                stdout=stdout,
+                stderr=stderr,
+                exit_code=exit_code,
+                proof_strategy=_proof_strategy,
+                target_entrypoint=target_entrypoint,
+                filepath=filepath,
+                pov_script=pov_script,
+                expected_oracle=expected_oracle,
+                target_binary=target_binary,
+                relevance_anchors=relevance_anchors,
+                asan_disabled=asan_disabled,
+                baseline_exit_code=baseline_exit_code,
+                baseline_stderr=baseline_stderr,
+                execution_surface=execution_surface,
+            )
+        else:
+            op_result = oracle_policy.evaluate_proof_outcome(
+                stdout=stdout,
+                stderr=stderr,
+                exit_code=exit_code,
+                target_entrypoint=target_entrypoint,
+                filepath=filepath,
+                pov_script=pov_script,
+                expected_oracle=expected_oracle,
+                target_binary=target_binary,
+                stage=execution_stage,
+                relevance_anchors=relevance_anchors,
+                asan_disabled=asan_disabled,
+                baseline_exit_code=baseline_exit_code,
+                baseline_stderr=baseline_stderr,
+                execution_surface=execution_surface,
+            )
         # Task 6: c_library_harness behavioral oracle fallback
         _exec_surf_pt = str(contract.get('execution_surface') or
                             (contract.get('proof_plan') or {}).get('execution_surface') or '').strip().lower()
@@ -1718,7 +1796,7 @@ class PoVTester:
             'stderr': str(getattr(live_result, 'error', '') or ''),
             'exit_code': 0 if getattr(live_result, 'success', False) else -1,
             'execution_time_s': float(getattr(live_result, 'response_time_ms', 0.0) or 0.0) / 1000.0,
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'target_url': target_url,
             'evidence': list(getattr(live_result, 'evidence', []) or []),
             'validation_method': validation_method,
@@ -1873,7 +1951,7 @@ class PoVTester:
         return {"success": True, "error": None, "binary_path": binary_path, "build_method": f"targeted_native_harness:{strategy}", "temp_dir": temp_dir}
 
     def test_pov_against_app(self, pov_script: str, scan_id: str, cwe_type: str, target_url: str, language: str = "python", exploit_contract: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        start_time = datetime.utcnow()
+        start_time = datetime.now(timezone.utc)
         temp_dir = tempfile.mkdtemp(prefix=f"pov_{scan_id}_")
         preflight = {
             "ok": bool(target_url),
@@ -1895,22 +1973,22 @@ class PoVTester:
                 setup_result = self._build_setup_result(stage='setup', success=False, stderr='\n'.join(preflight.get('issues') or []), artifacts=list(setup_result.get('artifacts') or []), notes=list(dict.fromkeys((setup_result.get('notes') or []) + [check.get('check') for check in (preflight.get('checks') or []) if check.get('ok')])))
             guardrail_issues = self._non_native_script_guardrail_issues(patched, exploit_contract, mode='live_app')
             if guardrail_issues:
-                end_time = datetime.utcnow()
+                end_time = datetime.now(timezone.utc)
                 stderr = '\n'.join(guardrail_issues)
                 return {"success": True, "vulnerability_triggered": False, "stdout": "", "stderr": stderr, "exit_code": -1, "execution_time_s": (end_time - start_time).total_seconds(), "timestamp": end_time.isoformat(), "target_url": target_url, "validation_method": "script_against_live_app", "preflight": preflight, "oracle_result": {"triggered": False, "reason": "guardrail_rejected", "matched_evidence_markers": [], "path_relevant": False, "execution_stage": "trigger", "proof_verdict": "failed"}, "failure_category": "guardrail_rejected", "setup_result": {**setup_result, "setup_plan": asdict(setup_plan)}, "trigger_result": {"stage": "trigger", "success": False, "stdout": "", "stderr": stderr, "exit_code": -1, "oracle_reason": "guardrail_rejected", "path_relevant": False, "matched_evidence_markers": [], "trigger_plan": asdict(trigger_plan)}, "proof_verdict": "failed"}
             result = self._run_script(temp_dir, pov_filename, language, env)
             oracle = self._evaluate_proof_outcome(result.get("stdout", ""), result.get("stderr", ""), result.get("exit_code", -1), exploit_contract, pov_script=patched, execution_stage='trigger')
-            end_time = datetime.utcnow()
+            end_time = datetime.now(timezone.utc)
             failure_category = self._failure_category_from_outcome(setup_success=bool(setup_result.get('success')), triggered=bool(oracle.get("triggered")), oracle_reason=oracle.get('reason', ''), execution_success=not bool(result.get("failure_category")), error=str(result.get("failure_category") or result.get("stderr", "")))
             return {"success": True, "vulnerability_triggered": bool(oracle.get("triggered")), "stdout": result.get("stdout", ""), "stderr": result.get("stderr", ""), "exit_code": result.get("exit_code", -1), "execution_time_s": (end_time - start_time).total_seconds(), "timestamp": end_time.isoformat(), "target_url": target_url, "validation_method": "script_against_live_app", "preflight": preflight, "oracle_result": oracle, "failure_category": failure_category, "setup_result": setup_result, "trigger_result": self._build_trigger_result(oracle=oracle, stdout=result.get("stdout", ""), stderr=result.get("stderr", ""), exit_code=result.get("exit_code", -1)), "proof_verdict": oracle.get('proof_verdict', 'failed')}
         except Exception as e:
-            end_time = datetime.utcnow()
+            end_time = datetime.now(timezone.utc)
             return {"success": False, "vulnerability_triggered": False, "stdout": "", "stderr": str(e), "exit_code": -1, "execution_time_s": (end_time - start_time).total_seconds(), "timestamp": end_time.isoformat(), "target_url": target_url, "preflight": preflight, "failure_category": "execution_error"}
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     def test_pov_against_repo(self, pov_script: str, scan_id: str, cwe_type: str, codebase_path: str, language: str = "python", exploit_contract: Optional[Dict[str, Any]] = None, filepath: str = "") -> Dict[str, Any]:
-        start_time = datetime.utcnow()
+        start_time = datetime.now(timezone.utc)
         temp_dir = tempfile.mkdtemp(prefix=f"pov_repo_{scan_id}_")
         preflight = self._repo_preflight(codebase_path, exploit_contract, filepath=filepath)
         try:
@@ -1933,19 +2011,19 @@ class PoVTester:
                 setup_result = self._build_setup_result(stage='setup', success=False, stderr='\n'.join(preflight.get('issues') or []), artifacts=list(setup_result.get('artifacts') or []), notes=list(dict.fromkeys((setup_result.get('notes') or []) + [check.get('check') for check in (preflight.get('checks') or []) if check.get('ok')])))
             guardrail_issues = self._non_native_script_guardrail_issues(Path(pov_path).read_text(encoding='utf-8'), exploit_contract, mode='repo_script')
             if guardrail_issues:
-                end_time = datetime.utcnow()
+                end_time = datetime.now(timezone.utc)
                 stderr = '\n'.join(guardrail_issues)
                 return {"success": True, "vulnerability_triggered": False, "stdout": "", "stderr": stderr, "exit_code": -1, "execution_time_s": (end_time - start_time).total_seconds(), "timestamp": end_time.isoformat(), "validation_method": "script_against_repo", "preflight": preflight, "oracle_result": {"triggered": False, "reason": "guardrail_rejected", "matched_evidence_markers": [], "path_relevant": False, "execution_stage": "trigger", "proof_verdict": "failed"}, "failure_category": "guardrail_rejected", "setup_result": {**setup_result, "setup_plan": asdict(setup_plan)}, "trigger_result": {"stage": "trigger", "success": False, "stdout": "", "stderr": stderr, "exit_code": -1, "oracle_reason": "guardrail_rejected", "path_relevant": False, "matched_evidence_markers": [], "trigger_plan": asdict(trigger_plan)}, "proof_verdict": "failed"}
             result = self._run_script(codebase_path, pov_path, language, env)
             oracle = self._evaluate_proof_outcome(result.get("stdout", ""), result.get("stderr", ""), result.get("exit_code", -1), exploit_contract, filepath=filepath, pov_script=pov_script, execution_stage='trigger')
-            end_time = datetime.utcnow()
+            end_time = datetime.now(timezone.utc)
             failure_category = self._failure_category_from_outcome(setup_success=bool(setup_result.get('success')), triggered=bool(oracle.get("triggered")), oracle_reason=oracle.get('reason', ''), execution_success=not bool(result.get("failure_category")), error=str(result.get("failure_category") or result.get("stderr", "")))
             return {"success": True, "vulnerability_triggered": bool(oracle.get("triggered")), "stdout": result.get("stdout", ""), "stderr": result.get("stderr", ""), "exit_code": result.get("exit_code", -1), "execution_time_s": (end_time - start_time).total_seconds(), "timestamp": end_time.isoformat(), "validation_method": "script_against_repo", "preflight": preflight, "oracle_result": oracle, "failure_category": failure_category, "setup_result": setup_result, "trigger_result": self._build_trigger_result(oracle=oracle, stdout=result.get("stdout", ""), stderr=result.get("stderr", ""), exit_code=result.get("exit_code", -1)), "proof_verdict": oracle.get('proof_verdict', 'failed')}
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     def test_binary_target(self, pov_script: str, scan_id: str, cwe_type: str, codebase_path: str, language: str, exploit_contract: Dict[str, Any], vulnerable_code: str = "", filepath: str = "") -> Dict[str, Any]:
-        start_time = datetime.utcnow()
+        start_time = datetime.now(timezone.utc)
         build = get_app_runner().build_native_binary(scan_id, codebase_path, language=language)
         script_result = None
         target_entrypoint = str((exploit_contract or {}).get("target_entrypoint") or "")
@@ -1974,14 +2052,14 @@ class PoVTester:
             direct_triggered = direct_oracle.get('triggered', False)
             direct_evidence = self._build_runtime_evidence(direct_binary_result, validation_method="native_binary_contract", target_binary=selected_binary)
             if direct_triggered:
-                end_time = datetime.utcnow()
+                end_time = datetime.now(timezone.utc)
                 return {"success": True, "vulnerability_triggered": True, "stdout": direct_binary_result.get("stdout", ""), "stderr": direct_binary_result.get("stderr", ""), "exit_code": direct_binary_result.get("exit_code", -1), "execution_time_s": (end_time - start_time).total_seconds(), "timestamp": end_time.isoformat(), "target_binary": selected_binary, "validation_method": "native_binary_contract", "proof_summary": direct_evidence["summary"], "evidence": direct_evidence, "preflight": preflight, "oracle_result": direct_oracle, "failure_category": None, "surface": direct_binary_result.get("surface"), "baseline_result": direct_binary_result.get("baseline_result")}
 
             temp_dir = tempfile.mkdtemp(prefix=f"pov_native_{scan_id}")
             try:
                 script_language = "javascript" if "console.log" in pov_script or "require(" in pov_script else "python"
                 pov_filename = "pov.js" if script_language == "javascript" else "pov.py"
-                patched = self._repair_native_runtime_script(self._patch_target_refs(pov_script, target_binary=selected_binary))
+                patched = self._repair_native_runtime_script(self._patch_target_refs(pov_script, target_binary=selected_binary), runtime_profile=str(effective_contract.get('runtime_profile') or ''))
                 with open(os.path.join(temp_dir, pov_filename), "w", encoding="utf-8") as handle:
                     handle.write(patched)
                 env = os.environ.copy()
@@ -1994,7 +2072,7 @@ class PoVTester:
                     env["TARGET_INPUT"] = json.dumps(first_input) if isinstance(first_input, dict) else str(first_input)
                 guardrail_issues = self._native_script_guardrail_issues(patched, effective_contract, direct_binary_result.get("surface") or preflight.get("surface"))
                 if guardrail_issues:
-                    end_time = datetime.utcnow()
+                    end_time = datetime.now(timezone.utc)
                     stderr = "\n".join(guardrail_issues)
                     evidence = self._build_runtime_evidence({"stdout": "", "stderr": stderr, "exit_code": -1}, validation_method="native_binary_guardrails", target_binary=selected_binary)
                     failure_category = 'guardrail_rejected'
@@ -2004,10 +2082,10 @@ class PoVTester:
                 triggered = oracle.get('triggered', False)
                 evidence = self._build_runtime_evidence(script_result, validation_method="native_binary_harness", target_binary=selected_binary)
                 if triggered:
-                    end_time = datetime.utcnow()
+                    end_time = datetime.now(timezone.utc)
                     return {"success": True, "vulnerability_triggered": True, "stdout": script_result.get("stdout", ""), "stderr": script_result.get("stderr", ""), "exit_code": script_result.get("exit_code", -1), "execution_time_s": (end_time - start_time).total_seconds(), "timestamp": end_time.isoformat(), "target_binary": selected_binary, "validation_method": "native_binary_harness", "proof_summary": evidence["summary"], "evidence": evidence, "preflight": preflight, "oracle_result": oracle, "failure_category": None, "surface": direct_binary_result.get("surface"), "baseline_result": script_result.get("baseline_result"), 'setup_result': {**(direct_binary_result.get('setup_result') or setup_result), 'setup_plan': asdict(setup_plan)}, 'trigger_result': {**self._build_trigger_result(oracle=oracle, stdout=script_result.get("stdout", ""), stderr=script_result.get("stderr", ""), exit_code=script_result.get("exit_code", -1)), 'trigger_plan': asdict(trigger_plan)}, 'proof_verdict': oracle.get('proof_verdict', 'failed')}
                 if binary_target:
-                    end_time = datetime.utcnow()
+                    end_time = datetime.now(timezone.utc)
                     failure_category = 'preflight_failed' if not preflight.get('ok', True) else ('path_exercised_no_oracle' if direct_binary_result.get('path_exercised') or script_result.get('path_exercised') else 'oracle_not_observed')
                     staged_setup_result = direct_binary_result.get('setup_result') or setup_result
                     staged_trigger_result = self._build_trigger_result(oracle=oracle, stdout=script_result.get("stdout", ""), stderr=script_result.get("stderr", ""), exit_code=script_result.get("exit_code", -1))
@@ -2016,7 +2094,7 @@ class PoVTester:
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
         elif binary_target:
-            end_time = datetime.utcnow()
+            end_time = datetime.now(timezone.utc)
             stderr = build.get("error", "Failed to build target binary")
             oracle = {'triggered': False, 'reason': 'setup_failed', 'path_relevant': False, 'matched_evidence_markers': [], 'proof_verdict': 'failed'}
             return {
@@ -2042,12 +2120,12 @@ class PoVTester:
                 native_result = self._run_binary(targeted["binary_path"])
                 triggered = self._native_triggered(native_result.get("stdout", ""), native_result.get("stderr", ""), native_result.get("exit_code", -1), exploit_contract)
                 evidence = self._build_runtime_evidence(native_result, validation_method="targeted_native_sanitizer_harness", target_binary=targeted["binary_path"])
-                end_time = datetime.utcnow()
+                end_time = datetime.now(timezone.utc)
                 return {"success": True, "vulnerability_triggered": bool(triggered), "stdout": native_result.get("stdout", ""), "stderr": native_result.get("stderr", ""), "exit_code": native_result.get("exit_code", -1), "execution_time_s": (end_time - start_time).total_seconds(), "timestamp": end_time.isoformat(), "target_binary": targeted["binary_path"], "validation_method": "targeted_native_sanitizer_harness", "proof_summary": evidence["summary"], "evidence": evidence}
             finally:
                 shutil.rmtree(targeted.get("temp_dir") or "", ignore_errors=True)
 
-        end_time = datetime.utcnow()
+        end_time = datetime.now(timezone.utc)
         stderr = (script_result or {}).get("stderr") or targeted.get("error") or build.get("error", "Failed to build target binary")
         failure_result = {"stdout": (script_result or {}).get("stdout", ""), "stderr": stderr, "exit_code": (script_result or {}).get("exit_code", -1)}
         evidence = self._build_runtime_evidence(failure_result, validation_method="native_binary_build", target_binary=build.get("binary_path"))
@@ -2057,7 +2135,7 @@ class PoVTester:
         setup_result = self._build_setup_result(stage='setup', success=setup_success, stderr='' if setup_success else stderr, artifacts=setup_artifacts, notes=['native build prepared for trigger execution'] if setup_success else ['native build or harness preparation failed'])
         oracle = {'triggered': False, 'reason': 'setup_failed' if proof_infra else 'no_oracle_match', 'path_relevant': False, 'matched_evidence_markers': [], 'proof_verdict': 'failed'}
         trigger_result = self._build_trigger_result(oracle=oracle, stdout=failure_result["stdout"], stderr=stderr, exit_code=failure_result["exit_code"])
-        return {"success": False, "vulnerability_triggered": False, "stdout": failure_result["stdout"], "stderr": stderr, "exit_code": failure_result["exit_code"], "execution_time_s": (end_time - start_time).total_seconds(), "timestamp": datetime.utcnow().isoformat(), "validation_method": "native_binary_build", "proof_infrastructure_error": proof_infra, "proof_summary": evidence["summary"], "evidence": evidence, "failure_category": 'infrastructure_failure' if proof_infra else 'harness_unsupported', 'setup_result': setup_result, 'trigger_result': trigger_result, 'proof_verdict': oracle['proof_verdict'], 'oracle_result': oracle}
+        return {"success": False, "vulnerability_triggered": False, "stdout": failure_result["stdout"], "stderr": stderr, "exit_code": failure_result["exit_code"], "execution_time_s": (end_time - start_time).total_seconds(), "timestamp": datetime.now(timezone.utc).isoformat(), "validation_method": "native_binary_build", "proof_infrastructure_error": proof_infra, "proof_summary": evidence["summary"], "evidence": evidence, "failure_category": 'infrastructure_failure' if proof_infra else 'harness_unsupported', 'setup_result': setup_result, 'trigger_result': trigger_result, 'proof_verdict': oracle['proof_verdict'], 'oracle_result': oracle}
 
     def test_with_contract(self, pov_script: str, scan_id: str, cwe_type: str, codebase_path: str, exploit_contract: Optional[Dict[str, Any]], target_language: str = "python", vulnerable_code: str = "", filepath: str = "") -> Dict[str, Any]:
         """Emergency fallback harness for when Docker is unavailable.
@@ -2122,7 +2200,7 @@ class PoVTester:
                 'stderr': str(started.get('error', '') or 'Failed to start target application'),
                 'exit_code': -1,
                 'execution_time_s': 0.0,
-                'timestamp': datetime.utcnow().isoformat(),
+                'timestamp': datetime.now(timezone.utc).isoformat(),
                 'target_url': str(target_url or ''),
                 'evidence': [],
                 'validation_method': 'browser_live_contract' if browser_dom else 'live_app_contract',

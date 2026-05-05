@@ -26,6 +26,9 @@ class ValidationResult:
 class StaticValidator:
     """Validates PoV scripts using static analysis."""
 
+    # CWE_PATTERNS provides supplementary hint patterns for well-known CWE types.
+    # These are NOT gatekeeping — unknown CWEs are validated via generic signals,
+    # contract matching, and code relevance. The system works for ANY vulnerability.
     CWE_PATTERNS = {
         'CWE-89': {
             'required_imports': ['sqlite3', 'mysql', 'psycopg2', 'sqlalchemy', 'pymongo', 'requests', 'http.client', 'urllib'],
@@ -81,18 +84,26 @@ class StaticValidator:
         patterns = self.CWE_PATTERNS.get(cwe_type, {})
 
         warnings: List[str] = []
-        if 'VULNERABILITY TRIGGERED' in pov_script:
+        _has_generic_marker = 'VULNERABILITY TRIGGERED' in pov_script
+        _has_crash_propagation = 'sys.exit(result.returncode)' in pov_script or 'sys.exit(r.returncode)' in pov_script
+        _has_specific_marker = any(m in pov_script for m in (
+            'FILE_CREATED_OUTSIDE_ALLOWED_DIR', 'INSECURE_PERMISSION', 'SENSITIVE_DATA_LEAKED',
+            'EXCEPTION_TRIGGERED', 'TIMING_ANOMALY', 'RESOURCE_EXHAUSTION',
+        ))
+        if _has_generic_marker or _has_crash_propagation or _has_specific_marker:
             matched_patterns.append('has_vulnerability_indicator')
             details['has_vulnerability_check'] = True
         else:
             # Downgraded from blocking issue to warning — the runtime oracle can confirm
             # via crash_signal or sanitizer_output even without the print statement.
-            # The scaffold already emits print('VULNERABILITY TRIGGERED'); if the model
-            # stripped it we still want to attempt execution rather than hard-blocking.
+            # For crash proofs, sys.exit(result.returncode) propagates crash signals.
+            # For behavioral proofs, specific evidence markers are required.
             warnings.append(
-                "PoV does not print 'VULNERABILITY TRIGGERED' — oracle will rely on "
-                "crash signal / sanitizer output. Add print('VULNERABILITY TRIGGERED') "
-                "after the trigger call if the binary does not crash."
+                "PoV does not print evidence markers or propagate crash exit code — "
+                "oracle will rely on crash signal / sanitizer output. "
+                "For crash proofs: add sys.exit(result.returncode). "
+                "For behavioral proofs: add specific evidence markers like "
+                "FILE_CREATED_OUTSIDE_ALLOWED_DIR or INSECURE_PERMISSION."
             )
 
         contract_signals = self._match_contract_signals(pov_script, exploit_contract)
@@ -255,40 +266,71 @@ class StaticValidator:
             # inside the PoV script, OR writing a C source file and compiling it.
             # The binary is pre-built by the harness; recompilation
             # never works inside the proof container and wastes all retry attempts.
-            _COMPILE_SIGNALS = [
-                'subprocess.run.*clang', 'subprocess.run.*gcc', 'subprocess.call.*clang',
-                'subprocess.call.*gcc', 'subprocess.check_call.*clang', 'subprocess.check_call.*gcc',
-                'subprocess.run.*cmake', 'subprocess.call.*cmake', 'subprocess.check_call.*cmake',
-                'subprocess.run.*["\']make', 'subprocess.call.*["\']make', 'subprocess.check_call.*["\']make',
-                'cc -', 'gcc -', 'clang -', 'compile_cmd', 'link_cmd', 'compile_command',
-                'fsanitize=address', '-fsanitize=address',
-            ]
-            # C file-dropper variant: model writes a .c file and compiles it via a harness path.
-            # Signals: writing to *.c files, open(.*\.c.*w), pov_payload.c, exploit.c, etc.
-            _C_DROPPER_SIGNALS_RE = [
-                r"open\([^)]*\.c[\"'\s]",
-                r'with open\([^)]*\.c',
-                r'pov_payload\.c',
-                r'/tmp/exploit\.c',
-                r'exploit\.c',
-                r'payload\.c',
-                r'subprocess\.run.*\.c\b',
-            ]
-            import re as _re_sv
-            _self_compile = (
-                any(_re_sv.search(sig, pov_lower) for sig in _COMPILE_SIGNALS if '.' in sig)
-                or any(sig in pov_lower for sig in _COMPILE_SIGNALS if '.' not in sig)
-                or any(_re_sv.search(sig, pov_script) for sig in _C_DROPPER_SIGNALS_RE)
+            # EXCEPTION: c_library_harness mode requires inline harness compilation.
+            _exec_surf_sv = str((exploit_contract or {}).get('execution_surface') or '').strip().lower()
+            _repo_surf_sv = str((exploit_contract or {}).get('repo_surface_class') or '').strip().lower()
+            _is_lib_harness = (
+                _exec_surf_sv == 'c_library_harness'
+                or _repo_surf_sv in ('library_c', 'library_c_with_cli')
+                # Task 4 (Gap 4): Also exempt when probe detected c_library surface
+                # or proof_strategy specifies compiled_harness.
+                or str((exploit_contract or {}).get('probe_surface_type') or '').strip().lower() == 'c_library'
+                or str(((exploit_contract or {}).get('proof_strategy') or {}).get('harness_type') or '').strip().lower() == 'compiled_harness'
             )
-            if _self_compile:
-                issues.append(
-                    'PoV attempts to self-compile the target binary — the binary is already '
-                    'built with ASan by the harness and exposed via TARGET_BINARY. '
-                    'Remove all compilation steps and use TARGET_BINARY directly.'
+            if not _is_lib_harness:
+                _COMPILE_SIGNALS = [
+                    'subprocess.run.*clang', 'subprocess.run.*gcc', 'subprocess.call.*clang',
+                    'subprocess.call.*gcc', 'subprocess.check_call.*clang', 'subprocess.check_call.*gcc',
+                    'subprocess.run.*cmake', 'subprocess.call.*cmake', 'subprocess.check_call.*cmake',
+                    'subprocess.run.*["\']make', 'subprocess.call.*["\']make', 'subprocess.check_call.*["\']make',
+                    # Issue #7: Additional subprocess variants
+                    'subprocess.Popen.*clang', 'subprocess.Popen.*gcc', 'subprocess.Popen.*cmake',
+                    'subprocess.Popen.*make',
+                    # Issue #7: os.system and os.popen compile commands
+                    'os.system.*gcc', 'os.system.*clang', 'os.system.*make', 'os.system.*cmake',
+                    'os.popen.*gcc', 'os.popen.*clang', 'os.popen.*make', 'os.popen.*cmake',
+                    # Issue #7: shutil.which for compilers
+                    'shutil.which.*gcc', 'shutil.which.*clang', 'shutil.which.*cc',
+                    # Issue #7: Additional build systems
+                    'subprocess.run.*ninja', 'subprocess.call.*ninja', 'subprocess.Popen.*ninja',
+                    'subprocess.run.*meson', 'subprocess.call.*meson', 'subprocess.Popen.*meson',
+                    'os.system.*ninja', 'os.system.*meson',
+                    'ninja -C', 'meson compile', 'meson setup',
+                    'cc -', 'gcc -', 'clang -', 'compile_cmd', 'link_cmd', 'compile_command',
+                    'fsanitize=address', '-fsanitize=address',
+                ]
+                # C file-dropper variant: model writes a .c file and compiles it via a harness path.
+                # Signals: writing to *.c files, open(.*\.c.*w), pov_payload.c, exploit.c, etc.
+                _C_DROPPER_SIGNALS_RE = [
+                    r"open\([^)]*\.c[\"'\s]",
+                    r'with open\([^)]*\.c',
+                    r'pov_payload\.c',
+                    r'/tmp/exploit\.c',
+                    r'exploit\.c',
+                    r'payload\.c',
+                    r'subprocess\.run.*\.c\b',
+                    # Issue #7: Additional C file dropper patterns
+                    r'harness\.c',
+                    r'write.*\.c["\']',
+                    r'\.c["\'].*[wW]\b',
+                    r'open\([^)]*\.cc[\"\'\s]',
+                    r'open\([^)]*\.cpp[\"\'\s]',
+                ]
+                import re as _re_sv
+                _self_compile = (
+                    any(_re_sv.search(sig, pov_lower) for sig in _COMPILE_SIGNALS if '.' in sig)
+                    or any(sig in pov_lower for sig in _COMPILE_SIGNALS if '.' not in sig)
+                    or any(_re_sv.search(sig, pov_script) for sig in _C_DROPPER_SIGNALS_RE)
                 )
-                # Signal back to validate() via a sentinel in matches list so that
-                # details['self_compile_detected'] can be set there (details is not in scope here).
-                matches.append('__self_compile_detected__')
+                if _self_compile:
+                    issues.append(
+                        'PoV attempts to self-compile the target binary \u2014 the binary is already '
+                        'built with ASan by the harness and exposed via TARGET_BINARY. '
+                        'Remove all compilation steps and use TARGET_BINARY directly.'
+                    )
+                    # Signal back to validate() via a sentinel in matches list so that
+                    # details['self_compile_detected'] can be set there (details is not in scope here).
+                    matches.append('__self_compile_detected__')
 
         # Detect: model initializes `binary = ''` or `binary = None` without first reading
         # TARGET_BINARY. This causes binary-not-found failures when TARGET_BINARY is set.

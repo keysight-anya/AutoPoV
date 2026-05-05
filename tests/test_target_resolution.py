@@ -417,11 +417,9 @@ def test_normalize_internal_native_symbol_switches_to_function_call():
     contract = {
         'runtime_profile': 'native',
         'target_entrypoint': 'optparse_arg',
-        'target_binary': 'enchive',
         'proof_plan': {'execution_surface': 'binary_cli'},
     }
     runtime_feedback = {
-        'target_binary': 'enchive',
         'observed_surface': {'help_text': 'Commands: keygen, archive, extract, fingerprint'},
     }
     result = _normalize(v, contract, filepath='enchive.c', runtime_feedback=runtime_feedback)
@@ -436,14 +434,12 @@ def test_function_call_native_plan_clears_stale_subcommand():
     contract = {
         'runtime_profile': 'native',
         'target_entrypoint': 'optparse_arg',
-        'target_binary': 'enchive',
         'proof_plan': {
             'execution_surface': 'binary_cli',
             'subcommand': 'extract',
         },
     }
     runtime_feedback = {
-        'target_binary': 'enchive',
         'observed_surface': {'help_text': 'Commands: keygen, archive, extract, fingerprint'},
     }
     result = _normalize(v, contract, filepath='enchive.c', runtime_feedback=runtime_feedback)
@@ -456,7 +452,6 @@ def test_function_call_native_plan_rebinds_target_entrypoint_and_clears_cli_meta
     contract = {
         'runtime_profile': 'native',
         'target_entrypoint': 'dupstr',
-        'target_binary': 'enchive',
         'proof_plan': {
             'execution_surface': 'binary_cli',
             'target_entrypoint': 'command_archive',
@@ -467,7 +462,6 @@ def test_function_call_native_plan_rebinds_target_entrypoint_and_clears_cli_meta
         },
     }
     runtime_feedback = {
-        'target_binary': 'enchive',
         'observed_surface': {'help_text': 'Commands: keygen, archive, extract, fingerprint'},
     }
     result = _normalize(v, contract, filepath='enchive.c', runtime_feedback=runtime_feedback)
@@ -541,7 +535,7 @@ def test_build_handoff_payload_populates_stage_requirements_and_relevance_anchor
         filepath='src/enchive.c',
     )
     contract = payload['contract']
-    assert 'bootstrap key material before trigger execution' in contract['setup_requirements']
+    assert 'bootstrap key material via `keygen` subcommand before trigger execution' in contract['setup_requirements']
     assert 'reach target entrypoint: command_extract' in contract['trigger_requirements']
     assert 'command_extract' in contract['relevance_anchors']
     assert 'extract' in contract['relevance_anchors']
@@ -567,3 +561,41 @@ def test_exploit_contract_schema_supports_route_and_dom_fields():
     contract = ExploitContract(target_route='/search', target_dom_selector='#search', execution_surface='browser_dom')
     assert contract.target_route == '/search'
     assert contract.target_dom_selector == '#search'
+
+
+def test_extract_target_entrypoint_rejects_c_keywords():
+    """C control-flow keywords like 'if' must never be returned as entrypoints."""
+    verifier = VulnerabilityVerifier()
+    # Code with `if (x) {` that the greedy regex would match
+    code = """if (argc > 1) {
+    process(argc);
+}
+void vulnerable_fn(char *buf) {
+    memcpy(buf, src, len);
+}
+"""
+    result = verifier._extract_target_entrypoint(code, 'src/main.c')
+    assert result != 'if', f"Expected 'if' to be filtered, got: {result}"
+    assert result == 'vulnerable_fn'
+
+
+def test_normalize_exploit_contract_strips_path_from_target_binary():
+    """Full paths like /workspace/codebase/enchive must be stripped to basename."""
+    verifier = VulnerabilityVerifier()
+    normalized = verifier._normalize_exploit_contract(
+        {'target_binary': '/workspace/codebase/enchive', 'runtime_profile': 'c'},
+        'CWE-120', '', '', filepath='src/main.c',
+    )
+    assert normalized.get('target_binary') == 'enchive'
+
+
+def test_normalize_exploit_contract_clears_example_binary_names():
+    """Example binary names like 'readme_examples' should be cleared so the harness
+    falls back to a more appropriate execution surface."""
+    verifier = VulnerabilityVerifier()
+    normalized = verifier._normalize_exploit_contract(
+        {'target_binary': 'readme_examples', 'runtime_profile': 'c'},
+        'CWE-131', '', '', filepath='cJSON.c',
+    )
+    # readme_examples is an example binary — should be cleared
+    assert 'target_binary' not in normalized or normalized.get('target_binary') is None

