@@ -128,6 +128,32 @@ class HeuristicScout:
             },
         ]
 
+    def inject_recon_patterns(self, recon_report: dict) -> None:
+        """Dynamically add patterns from recon report's attack surfaces.
+        
+        This allows the heuristic scout to look for project-specific vulnerability
+        indicators discovered during reconnaissance, rather than relying solely on
+        generic hardcoded patterns.
+        """
+        if not recon_report:
+            return
+        attack_surfaces = recon_report.get('attack_surfaces') or []
+        for surface in attack_surfaces[:10]:
+            entry = str(surface.get('entry', '')).strip()
+            surface_type = str(surface.get('type', '')).strip()
+            if entry and len(entry) >= 3:
+                # Create a dynamic pattern that looks for this specific entry point
+                # being called with external input
+                label = f'recon_{surface_type}_signal' if surface_type else 'recon_attack_surface_signal'
+                try:
+                    pattern = re.compile(rf'\b{re.escape(entry)}\s*\(', re.IGNORECASE)
+                    if label not in self._patterns:
+                        self._patterns[label] = []
+                        self._signal_confidence[label] = 0.45
+                    self._patterns[label].append(pattern)
+                except re.error:
+                    continue
+
     def _is_code_file(self, filepath: str) -> bool:
         ext = os.path.splitext(filepath)[1].lower()
         return ext in {'.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.c', '.cpp', '.cc', '.h', '.hpp', '.go', '.rs', '.rb', '.php', '.cs'}
@@ -163,11 +189,19 @@ class HeuristicScout:
             'language': language,
         }
 
+    # Same non-source directory exclusion set used by AgenticDiscovery._SKIP_DIRS
+    _SKIP_DIRS: set = {
+        'docs', 'doc', 'documentation', 'vendor', 'node_modules', 'dist',
+        'build', '.git', 'third_party', 'external', '3rdparty', 'deps',
+        '__pycache__', '.tox', '.eggs', 'site-packages', 'bower_components',
+        'coverage', '.nyc_output', 'target',
+    }
+
     def scan_directory(self, codebase_path: str, cwes: List[str]) -> List[Dict[str, Any]]:
         findings: List[Dict[str, Any]] = []
 
         for root, dirs, files in os.walk(codebase_path):
-            dirs[:] = [d for d in dirs if not d.startswith('.')]
+            dirs[:] = [d for d in dirs if d.lower() not in self._SKIP_DIRS and not d.startswith('.')]
             for filename in files:
                 filepath = os.path.join(root, filename)
                 if not self._is_code_file(filepath):

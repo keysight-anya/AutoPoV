@@ -70,6 +70,29 @@ logger = logging.getLogger(__name__)
 SANITIZER_MARKER = "# __pov_sanitizer_applied__"
 
 
+def check_web_pov_misuse(script: str, exploit_contract: dict) -> Optional[str]:
+    """Task 5: Check if a web target PoV incorrectly uses TARGET_BINARY/subprocess.
+
+    Returns a warning string if misuse detected, None otherwise.
+    """
+    if not script or not exploit_contract:
+        return None
+    _surface = str(exploit_contract.get('execution_surface') or '').lower()
+    _target_url = str(exploit_contract.get('target_url') or exploit_contract.get('base_url') or '').strip()
+    _is_web = _surface in {'http_request', 'web', 'rest_api', 'browser_dom'} or bool(_target_url and _target_url.startswith('http'))
+    if not _is_web:
+        return None
+    _lower = script.lower()
+    _has_target_binary = 'target_binary' in _lower or 'target_bin' in _lower
+    _has_subprocess = 'subprocess.run' in _lower or 'subprocess.popen' in _lower or 'subprocess.call' in _lower
+    if _has_target_binary or _has_subprocess:
+        return (
+            'WEB TARGET MISUSE: This PoV uses TARGET_BINARY/subprocess for a web application target. '
+            'Use Python requests library with AUTOPOV_TARGET_URL instead.'
+        )
+    return None
+
+
 def sanitize_pov_script(script: str) -> str:
     """
     Detect and repair C-harness string-escaping issues in a generated PoV script.

@@ -6,7 +6,7 @@ Persists scan outcomes to support model routing and self-improvement.
 import os
 import sqlite3
 from typing import Optional, Any, List
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.config import settings
 
@@ -88,7 +88,7 @@ class LearningStore:
                     confidence,
                     model,
                     cost_usd,
-                    datetime.utcnow().isoformat()
+                    datetime.now(timezone.utc).isoformat()
                 )
             )
             conn.commit()
@@ -117,7 +117,7 @@ class LearningStore:
                     cost_usd,
                     1 if success else 0,
                     validation_method,
-                    datetime.utcnow().isoformat()
+                    datetime.now(timezone.utc).isoformat()
                 )
             )
             conn.commit()

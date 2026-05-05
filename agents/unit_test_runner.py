@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 
@@ -95,7 +95,7 @@ class UnitTestRunner:
         runtime_profile: str = "python",
         filepath: str = "",
     ) -> TestResult:
-        start_time = datetime.utcnow()
+        start_time = datetime.now(timezone.utc)
         runtime = self._normalize_runtime(runtime_profile, filepath, vulnerable_code)
 
         try:
@@ -110,7 +110,7 @@ class UnitTestRunner:
                 runtime_profile=runtime,
             )
             result = self._run_isolated_test(test_harness, scan_id, runtime)
-            end_time = datetime.utcnow()
+            end_time = datetime.now(timezone.utc)
             execution_time = (end_time - start_time).total_seconds()
 
             oracle_result = self._evaluate_exploit_oracle(
@@ -139,7 +139,7 @@ class UnitTestRunner:
             self.test_history.append(test_result)
             return test_result
         except Exception as e:
-            end_time = datetime.utcnow()
+            end_time = datetime.now(timezone.utc)
             return TestResult(False, False, (end_time - start_time).total_seconds(), "", str(e), -1, {"error": str(e), "runtime_profile": runtime})
 
     def _extract_function(self, code: str, runtime_profile: str = "python") -> Optional[str]:

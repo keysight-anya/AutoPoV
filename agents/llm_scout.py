@@ -114,6 +114,14 @@ class LLMScout:
         }
         return lang_map.get(ext, "unknown")
 
+    # Same non-source directory exclusion set used by AgenticDiscovery._SKIP_DIRS
+    _SKIP_DIRS: set = {
+        'docs', 'doc', 'documentation', 'vendor', 'node_modules', 'dist',
+        'build', '.git', 'third_party', 'external', '3rdparty', 'deps',
+        '__pycache__', '.tox', '.eggs', 'site-packages', 'bower_components',
+        'coverage', '.nyc_output', 'target',
+    }
+
     def scan_directory(self, codebase_path: str, cwes: List[str], model_name: Optional[str] = None) -> List[Dict[str, Any]]:
         budget = settings.get_offline_scout_budget(model_name, purpose="directory") if self._is_offline_model(model_name) else {
             "max_files": settings.SCOUT_MAX_FILES,
@@ -125,7 +133,7 @@ class LLMScout:
 
         files: List[str] = []
         for root, dirs, filenames in os.walk(codebase_path):
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            dirs[:] = [d for d in dirs if d.lower() not in self._SKIP_DIRS and not d.startswith(".")]
             for name in filenames:
                 path = os.path.join(root, name)
                 if self._is_code_file(path):
@@ -254,9 +262,12 @@ class LLMScout:
         findings: List[Dict[str, Any]] = []
         for item in data.get("findings", []):
             cwe = item.get("cwe") or "UNCLASSIFIED"
+            # Task 1: Use the LLM's CWE directly instead of forcing UNCLASSIFIED
+            _resolved_cwe = cwe if cwe != 'UNCLASSIFIED' and cwe.startswith('CWE-') else 'UNCLASSIFIED'
             findings.append({
                 "cve_id": item.get("cve_id"),
-                "cwe_type": "UNCLASSIFIED",
+                "cwe_type": _resolved_cwe,
+                "cwe_source": "llm_inferred" if _resolved_cwe != 'UNCLASSIFIED' else 'pending',
                 "taxonomy_refs": [ref for ref in [cwe, item.get("cve_id")] if ref and ref != "UNCLASSIFIED"],
                 "filepath": item.get("filepath", ""),
                 "line_number": int(item.get("line", 0) or 0),

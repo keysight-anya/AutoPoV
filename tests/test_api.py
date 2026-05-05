@@ -3,6 +3,9 @@ Tests for FastAPI endpoints
 """
 
 import pytest
+
+pytest.importorskip('fastapi', reason='fastapi not installed')
+
 from fastapi.testclient import TestClient
 from app.main import app
 
@@ -61,7 +64,7 @@ class TestWebhookEndpoints:
     
     def test_github_webhook_no_signature(self):
         """Test GitHub webhook without signature fails"""
-        response = client.post("/api/webhook/github", data=b"{}")
+        response = client.post("/api/webhook/github", content=b"{}")
         assert response.status_code == 200  # Returns error in body
         
         data = response.json()
@@ -69,7 +72,7 @@ class TestWebhookEndpoints:
     
     def test_gitlab_webhook_no_token(self):
         """Test GitLab webhook without token fails"""
-        response = client.post("/api/webhook/gitlab", data=b"{}")
+        response = client.post("/api/webhook/gitlab", content=b"{}")
         assert response.status_code == 200  # Returns error in body
         
         data = response.json()

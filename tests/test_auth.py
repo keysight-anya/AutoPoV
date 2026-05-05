@@ -8,6 +8,8 @@ import tempfile
 
 import pytest
 
+pytest.importorskip('fastapi', reason='fastapi not installed')
+
 from app.auth import APIKeyManager, SYSTEM_API_KEY_NAME
 
 

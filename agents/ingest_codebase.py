@@ -239,6 +239,28 @@ class CodeIngester:
         }
         ext = os.path.splitext(filepath)[1].lower()
         return ext in code_extensions
+
+    # FIX-13: Ingest dependency manifests and config files so the LLM has
+    # access to dependency versions, build configuration, and project
+    # metadata when reasoning about vulnerability exploitability.
+    _CONTEXT_FILENAMES = {
+        'package.json', 'package-lock.json', 'yarn.lock',
+        'pom.xml', 'build.gradle', 'build.gradle.kts', 'settings.gradle',
+        'requirements.txt', 'setup.py', 'setup.cfg', 'pyproject.toml', 'Pipfile',
+        'Gemfile', 'Gemfile.lock',
+        'go.mod', 'go.sum',
+        'Cargo.toml', 'Cargo.lock',
+        'composer.json', 'composer.lock',
+        'CMakeLists.txt', 'Makefile', 'GNUmakefile', 'makefile', 'meson.build',
+        'configure.ac', 'configure.in',
+        'Dockerfile', 'docker-compose.yml', 'docker-compose.yaml',
+        '.env.example',
+    }
+
+    def _is_context_file(self, filepath: str) -> bool:
+        """Check if file is a dependency/config file we should ingest."""
+        basename = os.path.basename(filepath)
+        return basename in self._CONTEXT_FILENAMES
     
     def _is_binary(self, filepath: str, chunk_size: int = 1024) -> bool:
         """Check if file is binary"""
@@ -356,8 +378,8 @@ class CodeIngester:
                 filepath = os.path.join(root, filename)
                 rel_path = os.path.relpath(filepath, directory)
                 
-                # Skip non-code files
-                if not self._is_code_file(filepath):
+                # Skip non-code files (FIX-13: also accept dependency/config files)
+                if not self._is_code_file(filepath) and not self._is_context_file(filepath):
                     stats["files_skipped"] += 1
                     continue
                 

@@ -1,6 +1,6 @@
 // frontend/src/components/FindingCard.jsx
 import { useEffect, useState } from 'react'
-import { getFindingArtifacts, getFindingArtifactFile } from '../api/client'
+import { getFindingArtifacts, getFindingArtifactFile, getProbeResult } from '../api/client'
 
 const SEVERITY_COLORS = {
   critical: '#ef4444',
@@ -232,6 +232,8 @@ export default function FindingCard({ finding, forceExpanded = false, scanId = '
   const [selectedArtifact, setSelectedArtifact] = useState(null)
   const [selectedArtifactContent, setSelectedArtifactContent] = useState('')
   const [artifactContentLoading, setArtifactContentLoading] = useState(false)
+  const [probeData, setProbeData] = useState(null)
+  const [probeLoading, setProbeLoading] = useState(false)
   const isExpanded = forceExpanded || expanded
 
   const severity = getSeverity(finding)
@@ -276,6 +278,24 @@ export default function FindingCard({ finding, forceExpanded = false, scanId = '
     return () => {
       cancelled = true
     }
+  }, [isExpanded, scanId, findingIndex])
+
+  // Load probe data when expanded
+  useEffect(() => {
+    let cancelled = false
+    if (!isExpanded || !scanId || findingIndex === null || findingIndex === undefined) return undefined
+    setProbeLoading(true)
+    getProbeResult(scanId, findingIndex)
+      .then((res) => {
+        if (!cancelled) setProbeData(res?.data?.probe || null)
+      })
+      .catch(() => {
+        if (!cancelled) setProbeData(null)
+      })
+      .finally(() => {
+        if (!cancelled) setProbeLoading(false)
+      })
+    return () => { cancelled = true }
   }, [isExpanded, scanId, findingIndex])
 
   const openArtifact = async (name) => {
@@ -423,11 +443,11 @@ export default function FindingCard({ finding, forceExpanded = false, scanId = '
             </div>
           </div>
 
-          {/* Explanation */}
-          {finding.llm_explanation && (
+          {/* Explanation — prefer proof_narrative for confirmed findings */}
+          {(finding.proof_narrative || finding.llm_explanation) && (
             <div style={{ marginBottom: 14 }}>
-              <div style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: 9, letterSpacing: '.12em', color: 'var(--text3)', marginBottom: 6 }}>EXPLANATION</div>
-              <p style={{ fontSize: 12, color: 'var(--text2)', lineHeight: 1.6, margin: 0 }}>{finding.llm_explanation}</p>
+              <div style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: 9, letterSpacing: '.12em', color: 'var(--text3)', marginBottom: 6 }}>{finding.proof_narrative ? 'PROOF NARRATIVE' : 'EXPLANATION'}</div>
+              <p style={{ fontSize: 12, color: 'var(--text2)', lineHeight: 1.6, margin: 0 }}>{finding.proof_narrative || finding.llm_explanation}</p>
             </div>
           )}
 
@@ -596,6 +616,38 @@ export default function FindingCard({ finding, forceExpanded = false, scanId = '
                     {povResult.evidence.combined_excerpt}
                   </pre>
                 )}
+                {povResult.stderr && povResult.stderr !== (povResult.evidence?.combined_excerpt || '') && (
+                  <details style={{ marginTop: 10 }}>
+                    <summary style={{ cursor: 'pointer', fontFamily: '"JetBrains Mono", monospace', fontSize: 9, letterSpacing: '.1em', color: 'var(--text3)', userSelect: 'none' }}>RAW STDERR</summary>
+                    <pre style={{ background: 'var(--surface2)', border: '1px solid var(--border1)', padding: '10px 12px', margin: '6px 0 0', overflowX: 'auto', whiteSpace: 'pre-wrap', fontSize: 11, color: '#fca5a5', fontFamily: '"JetBrains Mono", monospace', maxHeight: 260 }}>
+                      {povResult.stderr}
+                    </pre>
+                  </details>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Metadata */}
+          {/* Probe results */}
+          {probeLoading && (
+            <div style={{ marginBottom: 14 }}>
+              <div style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: 9, letterSpacing: '.12em', color: 'var(--text3)', marginBottom: 6 }}>PROBE RESULTS</div>
+              <div style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: 10, color: 'var(--text3)' }}>Loading probe data...</div>
+            </div>
+          )}
+          {probeData && !probeLoading && (
+            <div style={{ marginBottom: 14 }}>
+              <div style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: 9, letterSpacing: '.12em', color: 'var(--text3)', marginBottom: 6 }}>PROBE RESULTS</div>
+              <div style={{ background: 'var(--bg)', border: '1px solid var(--border1)', padding: '10px 12px' }}>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16, fontFamily: '"JetBrains Mono", monospace', fontSize: 9, letterSpacing: '.06em', color: 'var(--text3)' }}>
+                  {probeData.probe_binary_path && <span>BINARY <span style={{ color: 'var(--text2)' }}>{probeData.probe_binary_path}</span></span>}
+                  {probeData.probe_input_surface && <span>INPUT SURFACE <span style={{ color: 'var(--text2)' }}>{probeData.probe_input_surface}</span></span>}
+                  {probeData.probe_surface_type && <span>SURFACE TYPE <span style={{ color: 'var(--text2)' }}>{probeData.probe_surface_type}</span></span>}
+                  {typeof probeData.probe_crash_observed !== 'undefined' && <span>CRASH <span style={{ color: probeData.probe_crash_observed ? '#f87171' : 'var(--text2)' }}>{probeData.probe_crash_observed ? 'YES' : 'NO'}</span></span>}
+                  {probeData.probe_format_hint && <span>FORMAT <span style={{ color: 'var(--text2)' }}>{probeData.probe_format_hint}</span></span>}
+                  {probeData.probe_ldd_missing && <span>MISSING LIBS <span style={{ color: '#f87171' }}>{probeData.probe_ldd_missing}</span></span>}
+                </div>
               </div>
             </div>
           )}

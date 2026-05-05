@@ -16,9 +16,12 @@ RUN apt-get update && apt-get install -y \
     nodejs \
     npm \
     default-jdk \
+    maven \
     python3-dev \
     gcc \
     g++ \
+    clang \
+    llvm \
     make \
     cmake \
     ninja-build \
@@ -32,6 +35,21 @@ RUN apt-get update && apt-get install -y \
     libffi-dev \
     binutils \
     && rm -rf /var/lib/apt/lists/*
+
+# Install OpenJDK 11 from Eclipse Temurin — required for older Gradle versions (< 7.0)
+# that are incompatible with Java 21. Debian Trixie no longer ships openjdk-11-jdk.
+RUN wget -q 'https://api.adoptium.net/v3/binary/latest/11/ga/linux/x64/jdk/hotspot/normal/eclipse?project=jdk' -O /tmp/openjdk11.tar.gz \
+    && mkdir -p /usr/lib/jvm \
+    && tar -xzf /tmp/openjdk11.tar.gz -C /usr/lib/jvm \
+    && extracted=$(tar -tzf /tmp/openjdk11.tar.gz | head -n1 | sed 's|/.*||') \
+    && mv "/usr/lib/jvm/$extracted" /usr/lib/jvm/java-11-openjdk-amd64 \
+    && rm /tmp/openjdk11.tar.gz
+
+# Install Gradle 8.7 (not available in Debian repos)
+RUN wget -q https://services.gradle.org/distributions/gradle-8.7-bin.zip -O /tmp/gradle.zip \
+    && unzip -q /tmp/gradle.zip -d /opt \
+    && ln -s /opt/gradle-8.7/bin/gradle /usr/local/bin/gradle \
+    && rm /tmp/gradle.zip
 
 # Install Docker CLI (for Docker-in-Docker)
 RUN install -m 0755 -d /etc/apt/keyrings \
@@ -75,6 +93,14 @@ RUN wget -q https://github.com/joernio/joern/releases/download/v4.0.341/joern-cl
     && joern --version
 
 ENV JOERN_CLI_PATH=/usr/local/bin/joern
+
+# Install Syft for SBOM-based dependency discovery (catches vendored deps,
+# fat JARs, and dependencies missed by manifest parsing)
+RUN curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+
+# Install Trivy for filesystem vulnerability scanning (container image CVEs,
+# vendored library detection complementary to Syft)
+RUN curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
 
 # Copy requirements first for better caching
 COPY requirements.txt .

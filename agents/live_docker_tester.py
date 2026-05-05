@@ -8,7 +8,7 @@ import time
 import base64
 from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 try:
     from playwright.sync_api import sync_playwright
@@ -127,7 +127,7 @@ class LiveDockerTester:
 
     def test_vulnerability(self, scan_id: str, cwe_type: str, target_url: str, exploit_payload: str, target_param: str = "input", http_method: str = "GET", screenshot: bool = True, exploit_contract: Optional[Dict[str, Any]] = None) -> LiveTestResult:
         import requests
-        start_time = datetime.utcnow()
+        start_time = datetime.now(timezone.utc)
         evidence: List[str] = []
         screenshot_path = None
         screenshot_base64 = None
@@ -142,7 +142,7 @@ class LiveDockerTester:
             else:
                 full_url = target_url
                 response = requests.post(target_url, data={target_param: exploit_payload}, timeout=10, allow_redirects=True, headers={"User-Agent": "AutoPoV-LiveTest/1.0", "Content-Type": "application/x-www-form-urlencoded"})
-            end_time = datetime.utcnow()
+            end_time = datetime.now(timezone.utc)
             response_time = (end_time - start_time).total_seconds() * 1000
             analysis = self._analyze_response(response, cwe_type, exploit_contract or {})
             if screenshot and PLAYWRIGHT_AVAILABLE:
@@ -163,42 +163,48 @@ class LiveDockerTester:
             return LiveTestResult(False, False, target_url, self.running_containers.get(scan_id, {}).get("container_id"), 0, 0, "", None, None, [], "low", str(e))
 
     def _analyze_response(self, response, cwe_type: str, exploit_contract: Dict[str, Any]) -> Dict[str, Any]:
+        """Analyze HTTP response for vulnerability evidence.
+
+        FIX-2: Delegates to oracle_policy.evaluate_live_proof_outcome() instead
+        of hardcoding CWE-specific string checks.  Evidence markers are built
+        from the exploit contract's success_indicators and side_effects.
+        """
+        import agents.oracle_policy as _oracle_policy
+
         response_text = response.text
         response_lower = response_text.lower()
         evidence: List[str] = []
         triggered = False
+
+        # Build evidence markers from contract indicators found in response
         for indicator in exploit_contract.get("success_indicators", []) or []:
             if str(indicator).strip() and str(indicator).lower() in response_lower:
-                evidence.append(f"Success indicator observed: {indicator}")
-                triggered = True
+                evidence.append(f"success_indicator:{indicator}")
         for effect in exploit_contract.get("side_effects", []) or []:
             if str(effect).strip() and str(effect).lower() in response_lower:
-                evidence.append(f"Expected side effect observed: {effect}")
-                triggered = True
-        if cwe_type == "CWE-79" and ("<script>" in response_text or "alert(" in response_text):
-            evidence.append("XSS payload reflected in response")
-            triggered = True
-        elif cwe_type == "CWE-89":
-            for error in ["sql syntax", "mysql_fetch", "pg_query", "sqlite3", "ora-", "microsoft ole db", "odbc driver"]:
-                if error in response_lower:
-                    evidence.append(f"SQL error detected: {error}")
-                    triggered = True
-                    break
-        elif cwe_type == "CWE-22":
-            for indicator in ["root:x:", "etc/passwd", "boot.ini", "[boot loader]"]:
-                if indicator in response_lower:
-                    evidence.append(f"File content detected: {indicator}")
-                    triggered = True
-                    break
-        elif cwe_type == "CWE-78":
-            for indicator in ["uid=", "gid=", "root:", "bin/bash", "windows"]:
-                if indicator in response_lower:
-                    evidence.append(f"Command output detected: {indicator}")
-                    triggered = True
-                    break
+                evidence.append(f"side_effect:{effect}")
+
+        # Server error is always evidence
         if response.status_code >= 500:
-            evidence.append(f"Server error (status {response.status_code})")
-            triggered = True
+            evidence.append(f"server_error:{response.status_code}")
+
+        # Delegate to oracle_policy for taxonomy-agnostic evaluation
+        try:
+            target_route = str(exploit_contract.get('target_entrypoint') or '').strip()
+            result = _oracle_policy.evaluate_live_proof_outcome(
+                evidence_markers=evidence,
+                target_route=target_route,
+                response_preview=response_text[:500],
+                runtime_family='http',
+            )
+            triggered = result.get('triggered', False)
+            matched = result.get('matched_evidence_markers', [])
+            if matched:
+                evidence.extend([str(m) for m in matched if str(m) not in evidence])
+        except Exception:
+            # Fallback: if oracle_policy fails, triggered = evidence found
+            triggered = bool(evidence)
+
         return {"triggered": triggered, "evidence": evidence}
 
     def _capture_screenshot(self, url: str) -> Tuple[str, str]:
@@ -211,7 +217,7 @@ class LiveDockerTester:
             from app.config import settings
             screenshot_dir = os.path.join(settings.RESULTS_DIR, "screenshots")
             os.makedirs(screenshot_dir, exist_ok=True)
-            timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             screenshot_path = os.path.join(screenshot_dir, f"screenshot_{timestamp}.png")
             page.screenshot(path=screenshot_path, full_page=True)
             browser.close()
@@ -222,7 +228,7 @@ class LiveDockerTester:
 
     def test_browser_interaction(self, scan_id: str, cwe_type: str, request_config: Dict[str, Any], exploit_contract: Optional[Dict[str, Any]] = None) -> LiveTestResult:
         import requests
-        start_time = datetime.utcnow()
+        start_time = datetime.now(timezone.utc)
         exploit_contract = exploit_contract or {}
         url = str(request_config.get('url') or '')
         method = str(request_config.get('method') or 'GET').upper()
@@ -277,7 +283,7 @@ class LiveDockerTester:
                 browser.close()
             if triggered:
                 confidence = 'high' if len(evidence) > 1 else 'medium'
-            end_time = datetime.utcnow()
+            end_time = datetime.now(timezone.utc)
             result = LiveTestResult(True, triggered, str(request_config.get('url') or ''), self.running_containers.get(scan_id, {}).get('container_id'), (end_time - start_time).total_seconds() * 1000, status_code, response_preview, screenshot_path, screenshot_base64, evidence, confidence)
             self.test_history.append(result)
             return result

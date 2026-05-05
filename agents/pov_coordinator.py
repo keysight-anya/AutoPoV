@@ -77,6 +77,144 @@ def _heuristic_decision(
     oracle_reason = str(last.get('oracle_reason') or '')
     exit_code = int(last.get('exit_code') or -1)
 
+    # ── v2: proof-type-aware recovery strategies ──────────────────────────
+    _proof_strategy = exploit_contract.get('proof_strategy') or {}
+    _proof_type = str(_proof_strategy.get('proof_type', '')).strip().lower()
+    
+    # Exit code 127: command not found (wrong binary name)
+    if exit_code == 127 and 'not found' in combined:
+        return CoordinatorDecision(
+            action='fix_binary_name',
+            rationale=f'Exit code 127: binary not found. The command executed does not exist.',
+            injected_constraints={
+                'binary_not_found': (
+                    f"CRITICAL: The binary you tried to run was not found (exit code 127). "
+                    f"Check stderr for 'not found' error. "
+                    f"Use os.environ.get('TARGET_BINARY') to get the correct path. "
+                    f"Do NOT hardcode binary names."
+                )
+            },
+        )
+    
+    # Exit code 126: permission denied
+    if exit_code == 126:
+        return CoordinatorDecision(
+            action='refine_payload',
+            rationale='Exit code 126: permission denied trying to execute binary.',
+            injected_constraints={
+                'permission_denied': (
+                    "CRITICAL: Permission denied when executing binary (exit code 126). "
+                    "The binary exists but is not executable. "
+                    "This usually means the build failed or produced a wrong file type. "
+                    "Check build output for errors."
+                )
+            },
+        )
+    
+    # Exit code 139: SIGSEGV but oracle didn't detect it
+    if exit_code == 139 and oracle_reason in ('no_oracle_match', 'non_evidence'):
+        return CoordinatorDecision(
+            action='refine_payload',
+            rationale='Exit code 139 (SIGSEGV) occurred but oracle did not detect vulnerability.',
+            injected_constraints={
+                'segfault_detected': (
+                    "IMPORTANT: The binary crashed with SIGSEGV (exit code 139), "
+                    "which suggests the exploit MAY have worked, but the oracle didn't detect it. "
+                    "Make sure your PoV prints 'VULNERABILITY TRIGGERED' to stdout. "
+                    "Also check stderr for AddressSanitizer output."
+                )
+            },
+        )
+    
+    # Check for compilation errors in stderr
+    if 'error:' in stderr and ('gcc' in stderr or 'clang' in stderr or 'make' in stderr):
+        # Extract first error message
+        error_lines = [line for line in stderr.split('\n') if 'error:' in line.lower()]
+        first_error = error_lines[0] if error_lines else 'compilation failed'
+        return CoordinatorDecision(
+            action='refine_payload',
+            rationale=f'Compilation error: {first_error[:100]}',
+            injected_constraints={
+                'compilation_error': (
+                    f"COMPILATION FAILED: {first_error[:200]}\n"
+                    f"Fix the compilation error and try again. "
+                    f"Common issues: missing #include, wrong function signature, undefined symbols."
+                )
+            },
+        )
+    
+    # Check for usage/help text (wrong arguments)
+    usage_patterns = ['usage:', 'try --help', 'invalid option', 'missing operand', 'expected argument']
+    if any(pattern in combined for pattern in usage_patterns):
+        return CoordinatorDecision(
+            action='switch_entrypoint',
+            rationale='Binary printed usage/help text - wrong arguments or missing required input.',
+            injected_constraints={
+                'wrong_arguments': (
+                    "The binary printed usage/help text, which means you provided wrong arguments "
+                    "or missing required input. "
+                    "Check the usage message and provide the correct subcommand and arguments. "
+                    "The binary needs REAL INPUT DATA, not help flags."
+                )
+            },
+        )
+
+    if _proof_type == 'behavioral_deviation' and oracle_reason in ('no_oracle_match', 'non_evidence', 'no_behavioral_evidence'):
+        return CoordinatorDecision(
+            action='refine_payload',
+            rationale='Behavioral deviation proof produced no observable difference.',
+            injected_constraints={
+                'behavioral_fix': (
+                    'PROOF TYPE: behavioral_deviation. The PoV must compare actual output '
+                    'against expected output and print the EXACT observable_evidence strings '
+                    'from the proof_strategy when a deviation is detected. '
+                    'Add explicit comparison logic: expected vs actual, then print the evidence marker.'
+                )
+            },
+        )
+
+    if _proof_type == 'timing_difference' and oracle_reason in ('no_oracle_match', 'non_evidence', 'no_timing_evidence'):
+        return CoordinatorDecision(
+            action='refine_payload',
+            rationale='Timing proof produced no measurable difference.',
+            injected_constraints={
+                'timing_fix': (
+                    'PROOF TYPE: timing_difference. Increase the number of measurement samples '
+                    'to at least 100 iterations. Amplify the timing gap by using larger inputs '
+                    'for the vulnerable path vs the non-vulnerable path. Print timing ratios '
+                    'and the observable_evidence markers from proof_strategy.'
+                )
+            },
+        )
+
+    if _proof_type == 'resource_exhaustion' and oracle_reason in ('no_oracle_match', 'non_evidence', 'no_resource_evidence'):
+        return CoordinatorDecision(
+            action='refine_payload',
+            rationale='Resource exhaustion proof produced no leak evidence.',
+            injected_constraints={
+                'resource_fix': (
+                    'PROOF TYPE: resource_exhaustion. Compile with -fsanitize=leak if native, '
+                    'or measure RSS growth over repeated calls. Use a loop of at least 10000 '
+                    'iterations calling the vulnerable function. Print memory stats and '
+                    'the observable_evidence markers from proof_strategy.'
+                )
+            },
+        )
+
+    if _proof_type == 'multi_step_chain' and oracle_reason in ('no_oracle_match', 'non_evidence', 'no_multi_step_evidence'):
+        return CoordinatorDecision(
+            action='refine_payload',
+            rationale='Multi-step chain incomplete — not all steps executed.',
+            injected_constraints={
+                'multi_step_fix': (
+                    'PROOF TYPE: multi_step_chain. Add explicit print/assert after EACH setup '
+                    'step to verify it succeeded before proceeding. If any step fails, print '
+                    'which step failed and why. The final step must print the observable_evidence '
+                    'markers from proof_strategy.'
+                )
+            },
+        )
+
     # ── bytes/text encoding error ──────────────────────────────────────────
     if "'bytes' object has no attribute 'encode'" in combined or \
        'bytes.*text=true' in combined:
@@ -104,9 +242,9 @@ def _heuristic_decision(
                 injected_constraints={
                     'binary_name_fix': (
                         f"CRITICAL: Wrong binary name. "
-                        f"Change TARGET_SYMBOL = {probe_bin!r}. "
-                        f"Also set: TARGET_BINARY = os.environ.get('TARGET_BINARY') "
-                        f"or os.environ.get('TARGET_BIN') or {probe_bin!r}"
+                        f"The probe discovered the binary is '{probe_bin}'. "
+                        f"Use os.environ.get('TARGET_BINARY') to get the correct path. "
+                        f"The harness sets TARGET_BINARY to '{probe_bin}'."
                     )
                 },
             )
@@ -172,7 +310,18 @@ def _heuristic_decision(
         import hashlib
         hashes = set()
         for att in attempt_log:
-            h = hashlib.md5(str(att.get('pov_script') or '').strip().encode()).hexdigest()
+            # FIX-12: Structural hash — normalize whitespace, blank lines, and
+            # Python-style comments so that superficially different but
+            # structurally identical PoVs are detected as duplicates.
+            _raw = str(att.get('pov_script') or '').strip()
+            _lines = []
+            for _ln in _raw.splitlines():
+                _stripped = _ln.strip()
+                if not _stripped or _stripped.startswith('#'):
+                    continue  # skip blank lines and comments
+                _lines.append(re.sub(r'\s+', ' ', _stripped))
+            _normalized = '\n'.join(_lines)
+            h = hashlib.md5(_normalized.encode()).hexdigest()
             hashes.add(h)
         if len(hashes) == 1:  # all identical
             return CoordinatorDecision(

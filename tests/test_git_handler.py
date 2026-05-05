@@ -6,6 +6,9 @@ import pytest
 import os
 import tempfile
 from unittest.mock import patch, MagicMock
+
+pytest.importorskip('git', reason='GitPython not installed')
+
 from app.git_handler import GitHandler
 
 

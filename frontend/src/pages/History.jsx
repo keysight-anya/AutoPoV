@@ -14,13 +14,25 @@ export default function History() {
   const [scans,   setScans]   = useState([])
   const [loading, setLoading] = useState(true)
   const [error,   setError]   = useState(null)
+  const [page,    setPage]    = useState(0)
+  const [hasMore, setHasMore] = useState(true)
+  const PAGE_SIZE = 50
 
-  useEffect(() => {
-    getHistory(100, 0)
-      .then(res => setScans(res.data.history || []))
+  const loadHistory = (pageNum) => {
+    setLoading(true)
+    getHistory(PAGE_SIZE, pageNum * PAGE_SIZE)
+      .then(res => {
+        const history = res.data.history || []
+        setScans(history)
+        setHasMore(history.length === PAGE_SIZE)
+      })
       .catch(err => setError(err.message))
       .finally(() => setLoading(false))
-  }, [])
+  }
+
+  useEffect(() => {
+    loadHistory(page)
+  }, [page])
 
   const monoStyle = { fontFamily: '"JetBrains Mono", monospace' }
 
@@ -38,11 +50,19 @@ export default function History() {
     </div>
   )
 
+  const totalPages = page + (hasMore ? 1 : 0)
+  const showPagination = scans.length > 0
+
   return (
     <div style={{ padding: 24 }}>
       {/* Page label */}
-      <div style={{ ...monoStyle, fontSize: 9, letterSpacing: '.18em', color: 'var(--text3)', marginBottom: 20 }}>
-        [ SCAN HISTORY ]
+      <div style={{ ...monoStyle, fontSize: 9, letterSpacing: '.18em', color: 'var(--text3)', marginBottom: 20, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <span>[ SCAN HISTORY ]</span>
+        {showPagination && (
+          <span style={{ fontSize: 9, color: 'var(--text2)' }}>
+            Page {page + 1} {hasMore ? '(showing latest)' : '(no more scans)'}
+          </span>
+        )}
       </div>
 
       {scans.length === 0 ? (
@@ -97,6 +117,51 @@ export default function History() {
             ))}
           </tbody>
         </table>
+      )}
+
+      {/* Pagination controls */}
+      {showPagination && (
+        <div style={{ marginTop: 20, display: 'flex', justifyContent: 'center', gap: 8, alignItems: 'center' }}>
+          <button
+            onClick={() => setPage(p => Math.max(0, p - 1))}
+            disabled={page === 0}
+            style={{
+              padding: '6px 14px',
+              background: page === 0 ? 'var(--border1)' : 'var(--surface1)',
+              border: '1px solid var(--border2)',
+              color: page === 0 ? 'var(--text3)' : 'var(--text2)',
+              cursor: page === 0 ? 'not-allowed' : 'pointer',
+              fontFamily: '"JetBrains Mono", monospace',
+              fontSize: 10,
+              letterSpacing: '.1em',
+              transition: 'all .15s',
+            }}
+          >
+            ← PREV
+          </button>
+          
+          <span style={{ ...monoStyle, fontSize: 10, color: 'var(--text3)', padding: '0 12px' }}>
+            Page {page + 1}
+          </span>
+
+          <button
+            onClick={() => setPage(p => p + 1)}
+            disabled={!hasMore}
+            style={{
+              padding: '6px 14px',
+              background: !hasMore ? 'var(--border1)' : 'var(--surface1)',
+              border: '1px solid var(--border2)',
+              color: !hasMore ? 'var(--text3)' : 'var(--text2)',
+              cursor: !hasMore ? 'not-allowed' : 'pointer',
+              fontFamily: '"JetBrains Mono", monospace',
+              fontSize: 10,
+              letterSpacing: '.1em',
+              transition: 'all .15s',
+            }}
+          >
+            NEXT →
+          </button>
+        </div>
       )}
     </div>
   )

@@ -1,3 +1,0 @@
-"""
-AutoPoV Test Suite
-"""

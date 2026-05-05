@@ -150,8 +150,10 @@ def ensure_model_runtime_ready(model: str) -> None:
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Offline model runtime is unavailable: {exc}") from exc
 
-        installed = {m.get("name", "").split(":", 1)[0] for m in payload.get("models", [])}
-        if selected_model not in installed:
+        installed_full = {m.get("name", "") for m in payload.get("models", [])}
+        installed_base = {n.split(":", 1)[0] for n in installed_full}
+        selected_base = selected_model.split(":", 1)[0]
+        if selected_model not in installed_full and selected_base not in installed_base:
             raise HTTPException(status_code=400, detail=f"Offline model '{selected_model}' is not installed in Ollama.")
         return
 
@@ -910,12 +912,16 @@ async def get_scan_status(
         result = scan_manager.get_scan_result(scan_id)
         if result:
             result_dict = result.__dict__
+            findings_list = result.findings if hasattr(result, 'findings') else []
+            import logging
+            logging.getLogger(__name__).info(f"Returning {len(findings_list)} findings for scan {scan_id}")
             return ScanStatusResponse(
                 scan_id=scan_id,
                 status=result.status,
                 progress=100,
                 logs=result.logs if hasattr(result, 'logs') else [],
                 result=result_dict,
+                findings=findings_list,
                 **response_times(scan_info, result_dict)
             )
         fallback_result = scan_info.get("result")
@@ -1082,7 +1088,7 @@ async def stream_scan_logs(
 # History endpoint
 @app.get("/api/history")
 async def get_history(
-    limit: int = 100,
+    limit: int = 1000,
     offset: int = 0,
     auth: tuple = Depends(verify_api_key_or_system)
 ):

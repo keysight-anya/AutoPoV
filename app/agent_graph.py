@@ -8,7 +8,7 @@ import json
 import uuid
 import shutil
 from typing import Dict, Any, List, Optional, TypedDict, Annotated
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
@@ -31,6 +31,7 @@ from agents.oracle_policy import classify_signal_detailed
 from agents.probe_runner import run_probe, format_probe_context
 from agents.trace_agent import run_trace, format_trace_context
 from agents.pov_coordinator import decide as coordinator_decide, format_constraints_for_prompt
+from agents.recon_agent import run_recon, ReconReport
 
 
 class ScanStatus(str, Enum):
@@ -121,6 +122,95 @@ class ScanState(TypedDict):
     repo_surface_class: Optional[str]  # e.g. 'cli_tool_c', 'library_c', 'python_module', ...
     library_api_context: Optional[str]  # Extracted public API for library_c repos
     trace_result: Optional[Dict[str, Any]]  # Dynamic trace results (TraceResult.to_dict())
+    recon_report: Optional[Dict[str, Any]]  # Reconnaissance report (ReconReport.to_dict())
+    recon_high_value_files: Optional[List[Dict[str, Any]]]
+    recon_historical_vuln_types: Optional[List[str]]
+    recon_repo_activity: Optional[Dict[str, Any]]
+
+def _auto_populate_oracle_from_probe(contract: dict, probe_result: dict) -> None:
+    """Fill success_indicators from probe data when investigation didn't set them.
+
+    This prevents the contract gate from blocking findings that have probe-resolved
+    surface but no explicit success_indicators from the investigation LLM.
+    """
+    if contract.get('success_indicators') or contract.get('expected_outcome'):
+        return  # already populated by investigation
+    indicators = []
+    surface = str(probe_result.get('probe_surface_type') or '').lower()
+    family = str(contract.get('runtime_family') or contract.get('runtime_profile') or '').lower()
+
+    if family in ('c', 'cpp', 'native', 'binary'):
+        indicators.append('AddressSanitizer or UndefinedBehaviorSanitizer error output')
+        indicators.append('Non-zero exit code indicating crash (SIGSEGV, SIGABRT)')
+    elif family in ('python',):
+        indicators.append('Unhandled exception traceback demonstrating the vulnerability')
+        indicators.append('Non-zero exit code')
+    elif family in ('node', 'javascript'):
+        indicators.append('Unhandled exception or rejection demonstrating the vulnerability')
+        indicators.append('Process crash with non-zero exit code')
+    elif family in ('java',):
+        indicators.append('Java exception stack trace demonstrating the vulnerability')
+        indicators.append('JVM crash or non-zero exit code')
+
+    if surface == 'web_service':
+        indicators.append('HTTP response demonstrating unauthorized data access or server error')
+
+    if indicators:
+        contract['success_indicators'] = indicators
+
+
+# ── CVE finding injection helpers (used by _node_recon) ──────────────────────
+
+def _infer_cve_harness_type(proof_type: str, runtime: str) -> str:
+    """Select the correct harness type for a CVE based on proof type and runtime."""
+    if proof_type == 'crash_signal':
+        return 'subprocess_binary'
+    if proof_type == 'state_change':
+        return 'direct_import' if runtime in ('python', 'node', 'java') \
+               else 'subprocess_binary'
+    if proof_type == 'information_disclosure':
+        return 'http_request' if runtime in ('python', 'node', 'java') \
+               else 'direct_import'
+    if proof_type == 'observable_output':
+        return 'http_request' if runtime in ('python', 'node', 'java') \
+               else 'subprocess_binary'
+    if proof_type in ('behavioral_deviation', 'resource_exhaustion'):
+        return 'direct_import' if runtime in ('python', 'node', 'java') \
+               else 'subprocess_binary'
+    return 'subprocess_binary'
+
+
+def _infer_cve_execution_strategy(proof_type: str) -> str:
+    """Select execution strategy from proof type."""
+    return {
+        'crash_signal':           'single_call',
+        'state_change':           'single_call',
+        'information_disclosure': 'single_call',
+        'observable_output':      'single_call',
+        'behavioral_deviation':   'single_call',
+        'resource_exhaustion':    'repeated_execution',
+    }.get(proof_type, 'single_call')
+
+
+def _build_cve_observable_evidence(
+        proof_type: str, hint: str, desc: str) -> list:
+    """Build observable evidence list from proof type and hint."""
+    base = [hint] if hint else ([desc[:120]] if desc else [])
+    extras = {
+        'crash_signal':           ['AddressSanitizer', 'heap-buffer-overflow',
+                                   'SIGSEGV', 'exit code 134'],
+        'state_change':           ['/tmp/autopov_rce.txt exists',
+                                   'command output in stdout'],
+        'information_disclosure': ['sensitive data in response',
+                                   'internal path disclosed'],
+        'observable_output':      ['error message in response',
+                                   'injected content reflected'],
+        'resource_exhaustion':    ['memory usage increased', 'exit code 23',
+                                   'process killed OOM'],
+        'behavioral_deviation':   ['actual output differs from expected',
+                                   'Object.prototype mutated'],
+    }.get(proof_type, [])
+    return base + [e for e in extras if e not in base]
 
 
 class AgentGraph:
@@ -176,6 +266,7 @@ class AgentGraph:
         workflow.add_node("probe_target", self._node_probe_target)  # Preflight probe
         workflow.add_node("trace_target", self._node_trace_target)  # Dynamic trace (strace+valgrind)
         workflow.add_node("generate_pov", self._node_generate_pov)
+        workflow.add_node("proof_strategy", self._node_proof_strategy)  # v2: proof strategy phase
         workflow.add_node("validate_pov", self._node_validate_pov)
         workflow.add_node("refine_pov", self._node_refine_pov)  # Self-healing refiner
         workflow.add_node("run_in_docker", self._node_run_in_docker)
@@ -183,12 +274,16 @@ class AgentGraph:
         workflow.add_node("log_skip", self._node_log_skip)
         workflow.add_node("log_failure", self._node_log_failure)
         
-        # Define edges
+        # Define edges — recon runs BEFORE discovery so agentic_discovery
+        # can use ReconReport's build_system, runtime_family, and attack_surfaces.
         workflow.set_entry_point("ingest_code")
-        workflow.add_edge("ingest_code", "run_codeql")
         
+        # Add recon node (runs once, before discovery)
+        workflow.add_node("recon", self._node_recon)
         # Add a node to log the number of findings before investigation
         workflow.add_node("log_findings_count", self._node_log_findings_count)
+        workflow.add_edge("ingest_code", "recon")
+        workflow.add_edge("recon", "run_codeql")
         workflow.add_edge("run_codeql", "log_findings_count")
         workflow.add_edge("log_findings_count", "investigate")
         
@@ -202,7 +297,8 @@ class AgentGraph:
             }
         )
         workflow.add_edge("probe_target", "trace_target")  # trace runs after probe
-        workflow.add_edge("trace_target", "generate_pov")
+        workflow.add_edge("trace_target", "proof_strategy")  # proof strategy runs after trace
+        workflow.add_edge("proof_strategy", "generate_pov")
         workflow.add_edge("generate_pov", "validate_pov")
         
         # Conditional edges from validate_pov
@@ -335,6 +431,12 @@ class AgentGraph:
                 runtime_details["matched_markers"] = list(oracle.get("matched_markers") or [])
                 runtime_details["self_report_only"] = bool(oracle.get("self_report_only"))
 
+            # FIX-5: Include enriched signal_detail so the refinement prompt can
+            # give the LLM precise, actionable crash-type hints instead of raw stdout.
+            _sig_detail = runtime.get('signal_detail')
+            if _sig_detail and isinstance(_sig_detail, dict):
+                runtime_details['signal_detail'] = _sig_detail
+
         return payload
 
     def _attach_feedback_to_contract(
@@ -362,6 +464,21 @@ class AgentGraph:
     ) -> List[str]:
         issues = list((validation_result or {}).get("issues") or [])
         runtime = runtime_result or {}
+
+        # Detect identical refinement outputs — the LLM repeated the same buggy code
+        if finding:
+            _history = finding.get("refinement_history") or []
+            if _history:
+                _last_original = _history[-1].get("pov_script") or ""
+                _current = finding.get("pov_script") or ""
+                if _last_original and _current and _last_original.strip() == _current.strip():
+                    issues.append(
+                        "CRITICAL: Your previous fix attempt produced IDENTICAL code. "
+                        "You are repeating the same bug instead of fixing it. "
+                        "You MUST modify the script — do not copy-paste the failed version. "
+                        "Review the error message above and change the specific lines that cause the failure."
+                    )
+
         if issues:
             return issues
 
@@ -371,6 +488,15 @@ class AgentGraph:
         stderr_text = str(runtime.get("stderr") or "").strip()
         stdout_text = str(runtime.get("stdout") or "").strip()
         exit_code = int(runtime.get("exit_code") or -1)
+
+        # ─── Step -1: Detect container timeout (exit_code 124) ───
+        if exit_code == 124:
+            issues.append(
+                "Container timed out: the PoV script or build took too long and was killed. "
+                "Simplify the exploit: reduce payload size, avoid unnecessary compilation steps, "
+                "and ensure the binary invocation completes within the timeout window."
+            )
+            return issues
 
         # ─── Step 0: Inject verbatim Python traceback FIRST so the LLM sees the exact error ───
         # This must appear BEFORE heuristic hints so the model knows precisely what failed.
@@ -391,7 +517,7 @@ class AgentGraph:
             )
             return issues
 
-        # Wrong binary name — TARGET_SYMBOL doesn't match probe-discovered binary
+        # Wrong binary name — TARGET_BINARY doesn't match probe-discovered binary
         _probe_bin_name = str(((finding or {}).get('exploit_contract') or {}).get('probe_binary_name') or '').strip()
         if _probe_bin_name and ('[autopov] binary not found:' in _stderr_lower):
             # Extract what name was used
@@ -399,10 +525,10 @@ class AgentGraph:
             _wrong_name = _bn_match.group(1) if _bn_match else 'unknown'
             if _wrong_name != _probe_bin_name:
                 issues.append(
-                    f"CRITICAL: Wrong binary name in TARGET_SYMBOL. "
+                    f"CRITICAL: Wrong binary name. "
                     f"The script searched for '{_wrong_name}' but the probe discovered the actual binary is "
-                    f"'{_probe_bin_name}'. Change TARGET_SYMBOL = {_probe_bin_name!r}. "
-                    f"Also set: TARGET_BINARY = os.environ.get('TARGET_BINARY') or os.environ.get('TARGET_BIN') or {_probe_bin_name!r}"
+                    f"'{_probe_bin_name}'. Use os.environ.get('TARGET_BINARY') to get the correct path. "
+                    f"The harness sets TARGET_BINARY to '{_probe_bin_name}'."
                 )
                 return issues
 
@@ -436,10 +562,121 @@ class AgentGraph:
                     build_log = (runtime.get("build_log") or "").strip()
                     if build_log:
                         issues.append(f"Build log (last lines):\n{build_log[-800:]}")
+            # Store structured signal_detail on finding for injection into refinement prompt
+            if finding is not None and sig_detail.recovery_strategy != 'success':
+                finding['_signal_detail'] = {
+                    'crash_type': sig_detail.crash_type,
+                    'reason': sig_detail.reason,
+                    'actionable_hint': sig_detail.actionable_hint,
+                    'recovery_strategy': sig_detail.recovery_strategy,
+                }
         except Exception:
             pass
 
-        # ——— Detect key-file-not-found: binary ran but couldn’t open its key material ———
+        # ── Issue #13: Enrich refinement with actual output + actionable hints ──
+        # When there's a strong sanitizer crash but the path relevance check failed,
+        # extract the ASan crash details so the LLM knows WHAT crashed and can
+        # redirect to the correct binary.
+        if oracle_reason == 'strong_signal+path_not_relevant':
+            _asan_match = re.search(r'ERROR: AddressSanitizer[^\n]*\n[^\n]*\n[^\n]*', stderr_text)
+            if not _asan_match:
+                _asan_match = re.search(r'ERROR: AddressSanitizer[^\n]*\n[^\n]*\n[^\n]*', stdout_text)
+            _crash_summary = _asan_match.group(0).strip()[:400] if _asan_match else ''
+            _target_bin = str(((finding or {}).get('exploit_contract') or {}).get('probe_binary_name') or '').strip()
+            issues.append(
+                f"STRONG CRASH DETECTED but in a different binary/code path than the target. "
+                f"The exploit IS triggering a real vulnerability — just not in the target binary. "
+                f"You MUST redirect the exploit to target the correct binary. "
+                f"Use os.environ.get('TARGET_BINARY') for the correct path"
+                f"{f' (binary name: {_target_bin})' if _target_bin else ''}. "
+                f"Ensure you are running the TARGET BINARY, not a different executable."
+            )
+            if _crash_summary:
+                issues.append(f"ASan crash details:\n{_crash_summary}")
+            if stderr_text:
+                issues.append(f"Runtime stderr (last 400 chars): {self._summarize_output(stderr_text, limit=400)}")
+
+        # ── Issue #13: When ASan crash IS captured but oracle didn't confirm, show details ──
+        # Even when the oracle result is no_oracle_match, if ASan output exists, the LLM
+        # benefits from seeing the exact crash location so it can refine the payload.
+        elif oracle_reason == 'no_oracle_match' and 'AddressSanitizer' in stderr_text:
+            _asan_match2 = re.search(r'ERROR: AddressSanitizer[^\n]*\n[^\n]*\n[^\n]*', stderr_text)
+            if _asan_match2:
+                issues.append(f"ASan crash was captured but oracle didn't confirm the vulnerability. Details:\n{_asan_match2.group(0).strip()[:400]}")
+
+        # ——— New pattern detections: linker errors, harness not found, crash w/o ASan, tempfile misuse ———
+        if 'undefined reference' in stderr_text:
+            issues.append(
+                'Linker error: missing source files. Compile all relevant *.c/*.cpp files '
+                'using glob (e.g. glob.glob(\'/workspace/codebase/src/*.c\')). Or link against '
+                'the library with -l flags from AUTOPOV_LIB_NAMES.'
+            )
+        if 'No such file or directory' in stderr_text and 'harness' in stderr_text.lower():
+            issues.append(
+                'Harness file not found. Write harness source to /tmp/harness.c and compile '
+                'with full -I/-L flags from AUTOPOV_LIB_INCLUDE_DIRS and AUTOPOV_LIB_LINK_DIRS env vars.'
+            )
+        if exit_code in (134, 139) and 'AddressSanitizer' not in stderr_text and 'UndefinedBehaviorSanitizer' not in stderr_text:
+            issues.append(
+                'Crash detected (signal) but no ASan/UBSan output captured. Ensure the binary '
+                'was compiled with -fsanitize=address,undefined. Print stderr BEFORE any '
+                '"VULNERABILITY TRIGGERED" message.'
+            )
+        if 'tempfile.tempdir' in stderr_text:
+            issues.append(
+                'tempfile.tempdir() is not a function. Use tempfile.NamedTemporaryFile() '
+                'or tempfile.mkdtemp() to create temporary files/directories.'
+            )
+
+        # ——— Specific Python runtime error detections (highest priority for env failures) ———
+        # These give the LLM exact fixes instead of generic "environment failure" hints.
+        _stderr_lower = stderr_text.lower()
+
+        if "attributeerror: 'str' object has no attribute 'decode'" in _stderr_lower:
+            issues.append(
+                "CRITICAL BUG: You used subprocess.run(..., text=True) AND called .decode() on the result. "
+                "When text=True is set, result.stdout/result.stderr are already strings — .decode() crashes. "
+                "FIX: Remove ALL .decode() calls. Use: stdout = result.stdout or ''  (no .decode())."
+            )
+            return issues
+
+        if "nameerror: name" in _stderr_lower and "is not defined" in _stderr_lower:
+            _name_match = re.search(r"NameError: name '([a-zA-Z0-9_]+)' is not defined", stderr_text)
+            _bad_name = _name_match.group(1) if _name_match else 'a variable'
+            issues.append(
+                f"CRITICAL BUG: NameError — {_bad_name} is not defined. "
+                f"Make sure {_bad_name} is defined before use, or use the correct variable name. "
+                f"If you meant the target binary, use TARGET_BINARY (set at module level)."
+            )
+            return issues
+
+        if "modulenotfounderror: no module named 'requests'" in _stderr_lower:
+            issues.append(
+                "CRITICAL BUG: The 'requests' library is not installed in the proof container. "
+                "FIX: Use urllib.request from the Python standard library instead of 'requests'."
+            )
+            return issues
+
+        if "filenotfounderror: [errno 2] no such file or directory" in _stderr_lower:
+            _fnf_match = re.search(r"No such file or directory: '([^']+)'", stderr_text)
+            _missing_path = _fnf_match.group(1) if _fnf_match else 'the target file'
+            issues.append(
+                f"CRITICAL BUG: FileNotFoundError — {_missing_path} does not exist. "
+                f"If this is the target binary, use os.environ.get('TARGET_BINARY') instead of a hardcoded path. "
+                f"If this is a source file for compilation, the binary is ALREADY BUILT — do NOT recompile."
+            )
+            return issues
+
+        if "typeerror: a bytes-like object is required, not 'str'" in _stderr_lower:
+            issues.append(
+                "CRITICAL BUG: You passed bytes to subprocess.run() with text=True. "
+                "FIX: Either (a) remove text=True and keep bytes input, or "
+                "(b) decode the payload first: input=payload.decode('latin-1', errors='replace'). "
+                "Do NOT mix bytes payloads with text=True."
+            )
+            return issues
+
+        # ——— Detect key-file-not-found: binary ran but couldn't open its key material ———
         # Pattern: "failed to open key file" / path to .sec/.pub not found.
         # This means bootstrap (keygen) didn't run, or ran with the wrong HOME.
         # Must be checked BEFORE the generic binary_not_found block (which also
@@ -539,6 +776,33 @@ class AgentGraph:
 
         if failure_category:
             issues.append(f"Runtime failure category: {failure_category}")
+
+        # ——— Task 4b: binary_ignored_input — the binary ran but ignored the PoV input entirely ———
+        # This fires when the oracle detects stdout == preflight baseline (binary just printed help/usage).
+        # The model must switch to a completely different delivery strategy.
+        if oracle_reason == 'binary_ignored_input':
+            _probe_bin = str(((finding or {}).get('exploit_contract') or {}).get('probe_binary_name') or '').strip()
+            _known_subs = [
+                str(s).strip()
+                for s in ((finding or {}).get('exploit_contract') or {}).get('known_subcommands', [])
+                if str(s).strip()
+            ]
+            _subs_str = ', '.join(_known_subs) if _known_subs else 'unknown'
+            issues.append(
+                f"CRITICAL: The target binary '{_probe_bin or 'TARGET_BINARY'}' COMPLETELY IGNORED your input. "
+                f"Its stdout is identical to its baseline help output — your payload never reached "
+                f"the vulnerable code path. You MUST change your exploitation strategy:\n"
+                f"  1. If you passed input via stdin, try passing it as a FILE ARGUMENT instead.\n"
+                f"  2. If you used a bare invocation, add a SUBCOMMAND first: {_subs_str}.\n"
+                f"  3. If this binary is a TEST RUNNER (ignores external input), write a C harness "
+                f"that #includes the library headers and calls the vulnerable function directly "
+                f"with crafted data. Compile it with: gcc -fsanitize=address,undefined -g -O1 harness.c "
+                f"-I/workspace/codebase -L/workspace/codebase -o harness\n"
+                f"  4. Write the crafted input to a temporary file and pass its path as an argument."
+            )
+            if stderr_text:
+                issues.append(f"Runtime stderr: {self._summarize_output(stderr_text, limit=240)}")
+            return issues
 
         # ——— Actionable guidance for oracle_not_observed / non_evidence ———
         # The binary ran but produced no crash/sanitizer signal.
@@ -713,13 +977,24 @@ class AgentGraph:
             runtime_feedback=runtime_result or ((finding.get('exploit_contract') or {}).get('runtime_feedback') or {}),
             phase=phase,
         )
-        finding['exploit_contract'] = audit.get('normalized_contract') or (finding.get('exploit_contract') or {})
+        # Update exploit_contract with normalized version, but avoid recursive bloat
+        _normalized = audit.get('normalized_contract') or {}
+        # Strip any nested contract_audit or handoff_payload that may have accumulated
+        _normalized.pop('contract_audit', None)
+        _normalized.pop('handoff_payload', None)
+        finding['exploit_contract'] = _normalized or (finding.get('exploit_contract') or {})
+        # Store only a lightweight audit summary — full payload is redundant with exploit_contract
+        _payload = audit.get('handoff_payload') or {}
         finding['contract_audit'] = {
             'phase': audit.get('phase'),
             'is_ready': audit.get('is_ready'),
-            'issues': list(audit.get('issues') or []),
-            'warnings': list(audit.get('warnings') or []),
-            'handoff_payload': audit.get('handoff_payload') or {},
+            'issues': list(audit.get('issues') or [])[:10],
+            'warnings': list(audit.get('warnings') or [])[:5],
+            'handoff_summary': {
+                'keys': list(_payload.keys()) if isinstance(_payload, dict) else [],
+                'locator_keys': list(_payload.get('target_locator', {}).keys()) if isinstance(_payload, dict) else [],
+                'requirements_keys': list(_payload.get('execution_requirements', {}).keys()) if isinstance(_payload, dict) else [],
+            },
         }
         for warning in (audit.get('warnings') or [])[:2]:
             self._log(state, f"Contract audit warning: {warning}")
@@ -733,9 +1008,193 @@ class AgentGraph:
         if findings_count == 0:
             self._log(state, "No findings to investigate, scan will complete")
         return state
+
+    def _node_recon(self, state: ScanState) -> ScanState:
+        """Run LLM-driven reconnaissance on the codebase.
+
+        Produces a ReconReport that guides all downstream decisions:
+        proof strategy, Docker image selection, oracle evaluation, and PoV generation.
+        Runs ONCE per scan, before discovery begins.
+        """
+        if self._check_cancelled(state):
+            return state
+
+        # Skip recon when preloaded findings are provided (benchmark replay).
+        # Recon is unnecessary — the findings already contain all needed context.
+        if state.get('preloaded_findings'):
+            self._log(state, '[recon] Skipping — preloaded findings provided')
+            return state
+
+        self._log(state, "[recon] Running reconnaissance on codebase...")
+        self._update_scan_runtime(state, status=ScanStatus.INGESTING, progress=30)
+
+        # Authoritative repo surface classification — runs here (before discovery)
+        # so that all downstream nodes (discovery, investigation, probe, etc.) see it.
+        if not state.get('repo_surface_class'):
+            try:
+                repo_cls = self._classify_repo_surface(state['codebase_path'])
+                state['repo_surface_class'] = repo_cls
+                self._log(state, f"Repo surface class: {repo_cls}")
+            except Exception as cls_err:
+                state['repo_surface_class'] = 'unknown'
+                self._log(state, f"  Warning: repo surface classification failed (non-fatal): {cls_err}")
+
+        try:
+            model_name = state.get('model_name') or ''
+            api_key = state.get('openrouter_api_key') or None
+            report = run_recon(
+                codebase_path=state['codebase_path'],
+                model_name=model_name or None,
+                api_key_override=api_key,
+                repo_url=state.get('repo_url') or '',
+            )
+            state['recon_report'] = report.to_dict()
+
+            # Wire docker_extra_deps from recon into top-level state so it can
+            # be injected into every finding's exploit_contract later.
+            if report.docker_extra_deps:
+                state['recon_docker_extra_deps'] = report.docker_extra_deps
+            # Wire DB substitution env vars from recon
+            if report.db_substitution_env:
+                state['recon_db_substitution_env'] = report.db_substitution_env
+            if report.detected_databases:
+                state['recon_detected_databases'] = [d for d in report.detected_databases]
+
+            # Back-propagate enriched recon fields into top-level state
+            # so downstream nodes can access them without digging into the dict.
+            if report.entry_point_candidates and not state.get('entry_point_candidates'):
+                state['entry_point_candidates'] = report.entry_point_candidates
+            if report.input_format_hints and not state.get('input_format_hints'):
+                state['input_format_hints'] = report.input_format_hints
+            if report.sample_input_files and not state.get('sample_input_files'):
+                state['sample_input_files'] = report.sample_input_files
+            if report.has_web_surface:
+                state['repo_web_capable'] = True
+            if report.web_frameworks:
+                state['web_frameworks'] = report.web_frameworks
+            if report.repo_surface_class and report.repo_surface_class != 'unknown':
+                state['repo_surface_class'] = report.repo_surface_class
+
+            # Back-propagate git intelligence for use by discovery and investigation
+            if report.high_value_files:
+                state['recon_high_value_files'] = report.high_value_files
+                self._log(state,
+                    f"[recon] {len(report.high_value_files)} high-value files from git history: "
+                    + ', '.join(f['file'] for f in report.high_value_files[:5]))
+            if report.historical_vuln_types:
+                state['recon_historical_vuln_types'] = report.historical_vuln_types
+                self._log(state,
+                    f"[recon] Historical vulnerability types: "
+                    + ', '.join(report.historical_vuln_types))
+            if report.repo_activity:
+                state['recon_repo_activity'] = report.repo_activity
+                _activity = report.repo_activity
+                self._log(state,
+                    f"[recon] Repo activity: last_commit={_activity.get('last_commit_date')}, "
+                    f"active={_activity.get('is_active')}, "
+                    f"total_commits={_activity.get('total_commits')}")
+            if report.security_policy:
+                self._log(state, "[recon] SECURITY.md found and read")
+            if report.github_security_findings:
+                self._log(state,
+                    f"[recon] {len(report.github_security_findings)} findings from GitHub security APIs")
+
+            self._log(
+                state,
+                f"[recon] Complete: project_type={report.project_type}, "
+                f"runtime={report.runtime_family}, default_proof={report.default_proof_type}, "
+                f"surfaces={len(report.attack_surfaces)}, "
+                f"frameworks={report.framework_hints[:3]}"
+            )
+        except Exception as exc:
+            self._log(state, f"[recon] Failed ({exc}), using minimal defaults")
+            # Provide a minimal report so downstream doesn't crash
+            from agents.recon_agent import ReconReport as _RR
+            state['recon_report'] = _RR().to_dict()
+
+        # Inject known-CVE findings from dependency scanning (pre-confirmed)
+        _recon_dict = state.get('recon_report') or {}
+        _cve_findings = _recon_dict.get('known_cve_findings') or []
+        if _cve_findings:
+            self._log(state, f"[recon] Injecting {len(_cve_findings)} known CVE findings from dependency scan")
+            _surface = state.get('repo_surface_class', 'unknown')
+            _runtime = _recon_dict.get('runtime_family', 'native')
+            if 'findings' not in state or state['findings'] is None:
+                state['findings'] = []
+            for _cve in _cve_findings:
+                _cve_id = _cve.get('cve', '')
+                _pkg = _cve.get('package', '')
+                _desc = _cve.get('description', '')
+                _hint = _cve.get('proof_hint', '')
+                _cwe = _cve.get('cwe', 'CWE-1035')  # CWE-1035 = using known-vulnerable component
+                # Use proof_type and harness_type derived from OSV description
+                _proof_type = _cve.get('proof_type', 'observable_output')
+                _cvss = float(_cve.get('cvss') or 0)
+                _fix_ver = _cve.get('fix_version', '')
+                _harness = _infer_cve_harness_type(_proof_type, _runtime)
+                state['findings'].append({
+                    'cve_id': _cve_id,
+                    'filepath': f'dependency:{_pkg}',
+                    'line_number': 0,
+                    'cwe_type': _cwe,
+                    'code_chunk': f'{_pkg} {_cve.get("installed_version", "unknown")} ({_cve.get("vulnerable_versions", _cve.get("fix_version", ""))})',
+                    'llm_verdict': 'REAL',
+                    'llm_explanation': f'Known vulnerability {_cve_id} in {_pkg}: {_desc}',
+                    'confidence': 1.0,
+                    'pov_script': None,
+                    'pov_path': None,
+                    'pov_result': None,
+                    'retry_count': 0,
+                    'inference_time_s': 0,
+                    'cost_usd': 0,
+                    'final_status': None,
+                    'detected_language': _runtime,
+                    'source': 'dependency_cve',
+                    'model_used': '',
+                    'prompt_tokens': 0,
+                    'completion_tokens': 0,
+                    'total_tokens': 0,
+                    'sifter_model': None,
+                    'sifter_tokens': None,
+                    'architect_model': None,
+                    'architect_tokens': None,
+                    'validation_result': None,
+                    'execution_profile': None,
+                    'exploit_contract': {
+                        'target_entrypoint': _hint or _pkg,
+                        'runtime_profile': _runtime,
+                        'repo_surface_class': _surface,
+                        'docker_extra_deps': (_recon_dict.get('docker_extra_deps') or []),
+                        'db_substitution_env': (state.get('recon_db_substitution_env') or {}),
+                        'cve_fix_version': _fix_ver,
+                        'cve_cvss': _cvss,
+                        'cve_osv_id': _cve.get('osv_id', ''),
+                        'proof_strategy': {
+                            'proof_type': _proof_type,
+                            'observable_evidence': _build_cve_observable_evidence(
+                                _proof_type, _hint, _desc),
+                            'harness_type': _harness,
+                            'execution_strategy': _infer_cve_execution_strategy(_proof_type),
+                            'verification_method': f'Demonstrate {_hint}',
+                            'negative_control': f'Run with benign input, confirm no {_proof_type} evidence',
+                            'estimated_difficulty': 'low' if _cvss >= 9.0 else 'medium',
+                            'cve_proof_hint': _hint,
+                            'why_this_works': f'Known CVE {_cve_id} with published exploitation path',
+                        },
+                    },
+                    'refinement_history': [],
+                })
+            self._log(state, f"[recon] Total findings after CVE injection: {len(state['findings'])}")
+
+        return state
     
     def _node_ingest_code(self, state: ScanState) -> ScanState:
         """Ingest the codebase into the vector store and require it for downstream RAG."""
+        # Task 7: Record scan start timestamp for scan-level timeout enforcement
+        import time as _time_ingest
+        if '_scan_start_ts' not in state:
+            state['_scan_start_ts'] = _time_ingest.time()
+
         if settings.SKIP_CHROMADB and settings.RAG_REQUIRED:
             self._log(state, "RAG_REQUIRED=true overrides SKIP_CHROMADB; vector ingestion is mandatory for this scan")
 
@@ -786,19 +1245,21 @@ class AgentGraph:
                 state["repo_web_capable"] = False  # safe default
                 self._log(state, f"  Warning: web capability detection failed (non-fatal): {web_err}")
 
-            # Task 1: Classify the repo surface upfront so all downstream layers
-            # can route correctly without per-repo guessing.
-            try:
-                repo_cls = self._classify_repo_surface(state["codebase_path"])
-                state["repo_surface_class"] = repo_cls
-                self._log(state, f"Repo surface class: {repo_cls}")
-            except Exception as cls_err:
-                state["repo_surface_class"] = 'unknown'
-                self._log(state, f"  Warning: repo surface classification failed (non-fatal): {cls_err}")
+            # Classify the repo surface as a fallback — recon is the authoritative
+            # source after the graph reorder (recon runs before discovery).  This
+            # block only fires when recon hasn't populated it yet (e.g. replay).
+            if not state.get('repo_surface_class'):
+                try:
+                    repo_cls = self._classify_repo_surface(state["codebase_path"])
+                    state["repo_surface_class"] = repo_cls
+                    self._log(state, f"Repo surface class (ingest fallback): {repo_cls}")
+                except Exception as cls_err:
+                    state["repo_surface_class"] = 'unknown'
+                    self._log(state, f"  Warning: repo surface classification failed (non-fatal): {cls_err}")
 
             # Task 2A: For C library repos extract public API from headers so the
             # model can write function-harness PoVs rather than file-fuzzers.
-            if state.get("repo_surface_class") == 'library_c':
+            if state.get("repo_surface_class") in ('library_c', 'library_c_with_cli'):
                 try:
                     api_ctx = self._extract_c_library_api(state["codebase_path"])
                     if api_ctx:
@@ -819,99 +1280,12 @@ class AgentGraph:
     def _classify_repo_surface(self, codebase_path: str) -> str:
         """Classify the repo into a surface class for downstream routing.
 
-        Returns one of:
-          'cli_tool_c'        - C/C++ repo with a main() function (has a CLI binary)
-          'library_c'         - C/C++ repo without main() at top level (pure library)
-          'cli_tool_go'       - Go module repo
-          'python_module'     - Python package without web framework imports
-          'web_service_python'- Python package with flask/django/aiohttp/etc.
-          'node_module'       - Node.js package without HTTP framework dep
-          'web_service_node'  - Node.js package with express/fastify/koa/etc.
-          'unknown'           - could not determine
+        Delegates to the standalone function in recon_agent.py so that
+        other modules (probe_runner, docker_runner) can import it without
+        circular dependencies.
         """
-        import re as _re
-        import os as _os
-        from pathlib import Path as _Path
-
-        cb = _Path(codebase_path)
-        if not cb.is_dir():
-            return 'unknown'
-
-        # ── Go ───────────────────────────────────────────────────────────────
-        if (cb / 'go.mod').is_file():
-            return 'cli_tool_go'
-
-        # ── Node.js ──────────────────────────────────────────────────────────
-        pkg_json = cb / 'package.json'
-        if pkg_json.is_file():
-            try:
-                import json as _json
-                pkg = _json.loads(pkg_json.read_text(encoding='utf-8', errors='ignore'))
-                all_deps = set()
-                for section in ('dependencies', 'devDependencies', 'peerDependencies'):
-                    all_deps.update(pkg.get(section, {}).keys())
-                _HTTP_FRAMEWORKS = {
-                    'express', 'fastify', 'koa', '@hapi/hapi', 'hapi', 'restify',
-                    'nest', '@nestjs/core', 'sails', 'loopback', 'polka', 'micro',
-                    'connect',
-                }
-                if all_deps & _HTTP_FRAMEWORKS:
-                    return 'web_service_node'
-                return 'node_module'
-            except Exception:
-                return 'node_module'
-
-        # ── Python ───────────────────────────────────────────────────────────
-        _py_markers = ['setup.py', 'pyproject.toml', 'setup.cfg']
-        if any((cb / m).is_file() for m in _py_markers):
-            # Check for web framework imports in *.py files (shallow scan)
-            _WEB_IMPORTS = _re.compile(
-                r'(import|from)\s+(flask|django|aiohttp|tornado|bottle|cherrypy|fastapi|starlette)'
-            )
-            for _root, _dirs, _files in _os.walk(str(cb)):
-                _dirs[:] = [d for d in _dirs if d not in {'.git', '__pycache__', '.venv', 'venv', 'node_modules', 'dist', 'build'}]
-                for _fname in _files:
-                    if not _fname.endswith('.py'):
-                        continue
-                    try:
-                        _content = (_Path(_root) / _fname).read_text(encoding='utf-8', errors='ignore')[:4096]
-                        if _WEB_IMPORTS.search(_content):
-                            return 'web_service_python'
-                    except OSError:
-                        pass
-            return 'python_module'
-
-        # ── C/C++ ────────────────────────────────────────────────────────────
-        _C_BUILD_MARKERS = ['CMakeLists.txt', 'Makefile', 'makefile', 'configure.ac', 'configure.in', 'meson.build']
-        if any((cb / m).is_file() for m in _C_BUILD_MARKERS):
-            # Search for main() in .c/.cpp files at depth ≤ 2
-            # Match both modern (int main(...)) and K&R-style (main(...)) entry points.
-            # Also catches 'int main(' split across two lines via '\s+' or simply bare 'main('.
-            _MAIN_RE = _re.compile(r'\bint\s+main\s*\(|(?:^|\s)main\s*\(\s*int', _re.MULTILINE)
-            _found_main = False
-            for _root, _dirs, _files in _os.walk(str(cb)):
-                # Limit depth to ≤ 2 relative to codebase root
-                _rel = _os.path.relpath(_root, str(cb))
-                _depth = 0 if _rel == '.' else _rel.count(_os.sep) + 1
-                if _depth > 2:
-                    _dirs[:] = []
-                    continue
-                _dirs[:] = [d for d in _dirs if d not in {'.git', 'CMakeFiles', '_codeql_build_dir', '.autopov-cmake-build', '.autopov-probe-build', 'CompilerIdC', 'CompilerIdCXX'}]
-                for _fname in _files:
-                    if not (_fname.endswith('.c') or _fname.endswith('.cpp') or _fname.endswith('.cc') or _fname.endswith('.cxx')):
-                        continue
-                    try:
-                        _content = (_Path(_root) / _fname).read_text(encoding='utf-8', errors='ignore')[:8192]
-                        if _MAIN_RE.search(_content):
-                            _found_main = True
-                            break
-                    except OSError:
-                        pass
-                if _found_main:
-                    break
-            return 'cli_tool_c' if _found_main else 'library_c'
-
-        return 'unknown'
+        from agents.recon_agent import classify_repo_surface
+        return classify_repo_surface(codebase_path)
 
     def _extract_c_library_api(self, codebase_path: str, max_chars: int = 3000) -> str:
         """Extract public function signatures from the primary header of a C library.
@@ -927,12 +1301,12 @@ class AgentGraph:
         cb = _Path(codebase_path)
         repo_name = cb.name.lower()
 
-        # Collect .h files at depth ≤ 2
+        # Collect .h files at depth ≤ 3 (handles subdirectory repos like libexpat/expat/lib/)
         headers: list = []  # list of (priority, path)
         for _root, _dirs, _files in _os.walk(str(cb)):
             _rel = _os.path.relpath(_root, str(cb))
             _depth = 0 if _rel == '.' else _rel.count(_os.sep) + 1
-            if _depth > 2:
+            if _depth > 3:
                 _dirs[:] = []
                 continue
             _dirs[:] = [d for d in _dirs if d not in {'.git', 'CMakeFiles', '_codeql_build_dir', '.autopov-cmake-build', '.autopov-probe-build'}]
@@ -947,8 +1321,11 @@ class AgentGraph:
         headers.sort(key=lambda x: x[0])
 
         # Function signature regex for C declarations
+        # Matches standard C function declarations, including those with library-specific
+        # export macros like XMLPARSEAPI, CJSON_PUBLIC, etc.
         _SIG_RE = _re.compile(
-            r'^\s*(?:(?:extern|static|inline|const|unsigned|signed|void|int|char|long|short|float|double|size_t|uint\w*|int\w*|\w+_t)\s+)+'
+            r'^\s*(?:(?:extern|static|inline|const|unsigned|signed|void|int|char|long|short|float|double|'
+            r'size_t|uint\w*|int\w*|\w+_t|XMLPARSEAPI|CJSON_PUBLIC|XML_\w+)\s*[\(\)]*\s*)*'
             r'(?:\*+\s*)?(\w+)\s*\([^)]*\)\s*;',
             _re.MULTILINE,
         )
@@ -970,6 +1347,195 @@ class AgentGraph:
                 break
 
         return '\n'.join(sigs) if sigs else ''
+
+    def _second_chance_discovery(self, state: ScanState) -> list:
+        """Task 3: LLM-guided deep vulnerability discovery for library repos.
+
+        Called when ALL static analysis findings were dismissed as FALSE_POSITIVE.
+        Reads the core library source files and asks the LLM to identify real
+        exploitable code paths (buffer overflows, use-after-free, etc.).
+
+        Returns a list of new finding dicts ready for investigation.
+        """
+        import os as _os
+        from pathlib import Path as _Path
+
+        codebase_path = state.get('codebase_path', '')
+        if not codebase_path or not _os.path.isdir(codebase_path):
+            return []
+
+        self._log(state, "Running second-chance LLM-guided discovery on core library source...")
+
+        # Determine language-specific settings based on surface class
+        _surface = state.get('repo_surface_class', '')
+        _LANG_CONFIG = {
+            'library_c': {
+                'extensions': ('.c', '.cpp', '.cc', '.cxx'),
+                'lang_label': 'C/C++', 'detected_language': 'c',
+                'runtime_profile': 'c', 'execution_surface': 'c_library_harness',
+                'vuln_types': 'memory-safety vulnerabilities (buffer overflow, heap overflow, use-after-free, integer overflow leading to buffer overrun, etc.)',
+            },
+            'library_c_with_cli': {
+                'extensions': ('.c', '.cpp', '.cc', '.cxx'),
+                'lang_label': 'C/C++', 'detected_language': 'c',
+                'runtime_profile': 'c', 'execution_surface': 'c_library_harness',
+                'vuln_types': 'memory-safety vulnerabilities (buffer overflow, heap overflow, use-after-free, integer overflow leading to buffer overrun, etc.)',
+            },
+            'python_module': {
+                'extensions': ('.py',),
+                'lang_label': 'Python', 'detected_language': 'python',
+                'runtime_profile': 'python', 'execution_surface': 'python_module_harness',
+                'vuln_types': 'security vulnerabilities (code injection, deserialization flaws, path traversal, SSRF, command injection, unsafe eval/exec, etc.)',
+            },
+            'node_module': {
+                'extensions': ('.js', '.ts', '.mjs'),
+                'lang_label': 'JavaScript/TypeScript', 'detected_language': 'javascript',
+                'runtime_profile': 'node', 'execution_surface': 'node_module_harness',
+                'vuln_types': 'security vulnerabilities (prototype pollution, command injection, path traversal, ReDoS, deserialization flaws, etc.)',
+            },
+            'java_lib': {
+                'extensions': ('.java',),
+                'lang_label': 'Java', 'detected_language': 'java',
+                'runtime_profile': 'java', 'execution_surface': 'java_library_harness',
+                'vuln_types': 'security vulnerabilities (deserialization flaws, XML external entity injection, JNDI injection, path traversal, SQL injection, etc.)',
+            },
+        }
+        _lconf = _LANG_CONFIG.get(_surface, _LANG_CONFIG['library_c'])
+        # Find core source files (largest, excluding test/tool dirs)
+        _SKIP_DIRS = {'test', 'tests', 'xmlwf', 'examples', 'sample', 'samples',
+                      'bench', 'fuzz', 'tools', 'cmd', 'app', 'bin', 'demo',
+                      '.git', 'CMakeFiles', '_codeql_build_dir', '.autopov-cmake-build',
+                      'node_modules', '__pycache__', '.venv', 'venv', 'dist', 'build'}
+        _exts = _lconf['extensions']
+        _src_files: list = []  # (size, rel_path, full_path)
+        for _root, _dirs, _files in _os.walk(codebase_path):
+            _dirs[:] = [d for d in _dirs if d.lower() not in _SKIP_DIRS]
+            for _fname in _files:
+                if any(_fname.endswith(ext) for ext in _exts):
+                    _fpath = _os.path.join(_root, _fname)
+                    try:
+                        _sz = _os.path.getsize(_fpath)
+                        _rel = _os.path.relpath(_fpath, codebase_path)
+                        _src_files.append((_sz, _rel, _fpath))
+                    except OSError:
+                        pass
+
+        # Take the top 3 largest source files (most likely to contain parser/processing logic)
+        _src_files.sort(key=lambda x: x[0], reverse=True)
+        _top_files = _src_files[:3]
+        if not _top_files:
+            return []
+
+        # Read code chunks from top files (first 6000 chars each)
+        _code_chunks = []
+        for _sz, _rel, _fpath in _top_files:
+            try:
+                _content = _Path(_fpath).read_text(encoding='utf-8', errors='ignore')[:6000]
+                _code_chunks.append(f"--- {_rel} ({_sz} bytes) ---\n{_content}")
+            except OSError:
+                pass
+
+        if not _code_chunks:
+            return []
+
+        # Build the discovery prompt — language-aware
+        _lib_api = state.get('library_api_context', '')
+        _lang_label = _lconf['lang_label']
+        _vuln_types = _lconf['vuln_types']
+        _prompt = (
+            f"You are a security researcher. The following code is from a {_lang_label} library. "
+            f"Static analysis found NO exploitable vulnerabilities, but this library has known CVEs. "
+            f"Identify up to 3 REAL {_vuln_types} in this code.\n\n"
+            "For each vulnerability, respond with a JSON array of objects:\n"
+            '[{"filepath": "relative/path", "line_number": NNN, "cwe_type": "CWE-XXX", '
+            '"description": "brief explanation of the bug and how to trigger it", '
+            '"vulnerable_function": "function_name"}]\n\n'
+        )
+        if _lib_api:
+            _prompt += f"Library public API:\n{_lib_api[:1500]}\n\n"
+        _prompt += "\n\n".join(_code_chunks)
+
+        # Invoke the LLM
+        try:
+            from agents.investigator import get_investigator
+            investigator = get_investigator()
+            model_name = state.get('model_name') or ''
+            llm = investigator._get_llm(model_name=model_name or None)
+
+            from langchain_core.messages import HumanMessage
+            response = llm.invoke([HumanMessage(content=_prompt)])
+            raw_text = response.content if hasattr(response, 'content') else str(response)
+        except Exception as e:
+            self._log(state, f"  Second-chance LLM call failed: {e}")
+            return []
+
+        # Parse the response as JSON array
+        import json as _json
+        import re as _re
+        try:
+            # Extract JSON from response (may be wrapped in markdown code block)
+            _json_match = _re.search(r'\[\s*\{.*?\}\s*\]', raw_text, _re.DOTALL)
+            if not _json_match:
+                self._log(state, "  Second-chance: no JSON array found in LLM response")
+                return []
+            findings_data = _json.loads(_json_match.group(0))
+        except (_json.JSONDecodeError, ValueError) as e:
+            self._log(state, f"  Second-chance: JSON parse error: {e}")
+            return []
+
+        # Convert to finding dicts
+        new_findings = []
+        for item in findings_data[:3]:  # Cap at 3
+            filepath = item.get('filepath', '')
+            line_number = int(item.get('line_number', 0) or 0)
+            cwe_type = item.get('cwe_type', 'CWE-787')
+            description = item.get('description', '')
+            vuln_func = item.get('vulnerable_function', '')
+
+            # Read the actual code chunk around the line
+            code_chunk = ''
+            if filepath and line_number:
+                try:
+                    _full_path = _os.path.join(codebase_path, filepath)
+                    _lines = _Path(_full_path).read_text(encoding='utf-8', errors='ignore').splitlines()
+                    _start = max(0, line_number - 5)
+                    _end = min(len(_lines), line_number + 10)
+                    code_chunk = '\n'.join(_lines[_start:_end])
+                except (OSError, IndexError):
+                    pass
+
+            new_findings.append({
+                'cve_id': None,
+                'filepath': filepath,
+                'line_number': line_number,
+                'cwe_type': cwe_type,
+                'code_chunk': code_chunk or description,
+                'llm_verdict': 'REAL',  # Force as REAL — this is the second chance
+                'llm_explanation': f'Second-chance discovery: {description}',
+                'confidence': 0.75,  # High enough to trigger PoV generation
+                'pov_script': None,
+                'pov_path': None,
+                'pov_result': None,
+                'retry_count': 0,
+                'inference_time_s': 0,
+                'cost_usd': 0,
+                'final_status': None,
+                'detected_language': _lconf['detected_language'],
+                'source': 'llm_second_chance',
+                'model_used': state.get('model_name', ''),
+                'exploit_contract': {
+                    'target_entrypoint': vuln_func or 'main',
+                    'runtime_profile': _lconf['runtime_profile'],
+                    'repo_surface_class': state.get('repo_surface_class', ''),
+                    'library_api_context': state.get('library_api_context', ''),
+                    'execution_surface': _lconf['execution_surface'],
+                },
+                'refinement_history': [],
+            })
+
+        self._log(state, f"  Second-chance produced {len(new_findings)} findings: "
+                  + ', '.join(f.get('filepath', '?') for f in new_findings))
+        return new_findings
 
     def _collect_repo_input_hints(self, codebase_path: str) -> dict:
         """Scan the cloned repo for test fixtures and expected input format hints.
@@ -1188,8 +1754,16 @@ class AgentGraph:
             for result in discovery_results:
                 if result.success:
                     self._log(state, f"{result.strategy.value}: Found {len(result.findings)} findings")
+                    # FIX-11: Extract build_profile from discovery metadata so it
+                    # can be seeded into each finding's exploit_contract later.
+                    _disc_build_profile = (result.metadata or {}).get('build_profile')
                     for finding_data in result.findings:
                         # Convert to VulnerabilityState
+                        # FIX-11: Seed exploit_contract with build_profile from
+                        # discovery so docker_runner can skip wrong strategies.
+                        _seed_ec = None
+                        if _disc_build_profile:
+                            _seed_ec = {'build_profile': _disc_build_profile}
                         finding = VulnerabilityState(
                             cve_id=None,
                             filepath=finding_data.get("filepath", ""),
@@ -1218,7 +1792,7 @@ class AgentGraph:
                             architect_tokens=None,
                             validation_result=None,
                             refinement_history=[],
-                            exploit_contract=None,
+                            exploit_contract=_seed_ec,
                             execution_profile=None
                         )
                         all_findings.append(finding)
@@ -1233,6 +1807,16 @@ class AgentGraph:
             filtered_count = len(deduped) - len(security_findings)
             if filtered_count > 0:
                 self._log(state, f"Filtered out {filtered_count} non-security findings (code quality/style issues)")
+
+            # Task 6: Warn when discovery returns 0 findings for Go/JS languages
+            # where CodeQL autobuild may have silently failed
+            if len(security_findings) == 0:
+                _detected_lang = str(state.get('detected_language') or '').lower()
+                if _detected_lang in {'go', 'golang'}:
+                    self._log(state, "WARNING: 0 findings for Go target — CodeQL autobuild may have failed. "
+                              "Ensure GOFLAGS='' and go.sum exists in the repository.")
+                elif _detected_lang in {'javascript', 'typescript'}:
+                    self._log(state, "WARNING: 0 findings for JS/TS target — Semgrep rules may have been over-filtered.")
             
             # Task 7: Downgrade confidence for findings in fuzzer/harness scaffolding files.
             # CodeQL sometimes reports CWE-120 on fread() inside *_fuzzer.c or fuzz_*.c
@@ -1248,6 +1832,41 @@ class AgentGraph:
                     _ec = dict(_f.get('exploit_contract') or {})
                     _ec['likely_fuzzer_scaffolding'] = True
                     _f['exploit_contract'] = _ec
+
+            # Task 10: CWE-79 noise reduction for non-web languages.
+            # XSS findings in C/C++/Go/Rust are almost always false positives.
+            _NON_WEB_LANGS = {'c', 'cpp', 'c++', 'go', 'rust'}
+            _xss_filtered = 0
+            for _f in security_findings:
+                _cwe = str(_f.get('cwe_type') or '').upper()
+                _lang = str(_f.get('detected_language') or '').lower()
+                if _cwe in ('CWE-79', 'CWE-079') and _lang in _NON_WEB_LANGS and _f.get('confidence', 0.7) < 0.6:
+                    _f['confidence'] = min(_f.get('confidence', 0.7), 0.15)
+                    _f['llm_verdict'] = 'FALSE_POSITIVE'
+                    _f['llm_explanation'] = 'XSS (CWE-79) is irrelevant for non-web language: ' + _lang
+                    _xss_filtered += 1
+            if _xss_filtered:
+                self._log(state, f"Task 10: Downgraded {_xss_filtered} CWE-79 findings for non-web languages")
+
+            # ── Recon priority boost: findings in high-value files get +0.15 confidence ──
+            _hv_files = state.get('recon_high_value_files') or []
+            _hv_hist_types = set(state.get('recon_historical_vuln_types') or [])
+            if _hv_files or _hv_hist_types:
+                _hv_paths = {str(f.get('file', '')) for f in _hv_files if f.get('file')}
+                _boosted = 0
+                for _f in security_findings:
+                    _fp = str(_f.get('filepath', ''))
+                    _cwe = str(_f.get('cwe_type', '')).upper()
+                    boost = 0.0
+                    if _fp in _hv_paths:
+                        boost += 0.10
+                    if _cwe in _hv_hist_types:
+                        boost += 0.05
+                    if boost > 0:
+                        _f['confidence'] = min(1.0, _f.get('confidence', 0.5) + boost)
+                        _boosted += 1
+                if _boosted:
+                    self._log(state, f'Recon priority boost: boosted {_boosted} findings in high-value files / historical vuln types')
 
             # Sort by confidence descending
             security_findings.sort(key=lambda item: item.get("confidence", 0.0), reverse=True)
@@ -1384,7 +2003,15 @@ class AgentGraph:
             self._log(state, "Scan cancelled by user")
             state["status"] = ScanStatus.CANCELLED
             return state
-        
+
+        # Stage-skip: CVE dependency findings are pre-confirmed and need no investigation
+        idx = state.get("current_finding_idx", 0)
+        if idx < len(state.get("findings", [])):
+            _f = state["findings"][idx]
+            if _f.get('source') == 'dependency_cve' and _f.get('llm_verdict') == 'REAL':
+                self._log(state, f"Skipping investigation for pre-confirmed CVE finding {idx}: {_f.get('cve_id', '')}")
+                return state
+
         # Use parallel processing if enabled and this is the first finding
         # But only if there are pending findings that haven't been investigated yet
         if settings.PARALLEL_PROCESSING_ENABLED and state.get("current_finding_idx", 0) == 0:
@@ -1423,7 +2050,8 @@ class AgentGraph:
                 alert_message=finding.get("alert_message", ""),
                 model_name=model_to_use,
                 api_key_override=state.get("openrouter_api_key"),
-                repo_web_capable=state.get("repo_web_capable", False)
+                repo_web_capable=state.get("repo_web_capable", False),
+                recon_report=state.get('recon_report'),
             )
             self._log(state, f"Investigation completed with verdict: {result.get('verdict', 'UNKNOWN')}")
         except Exception as e:
@@ -1444,11 +2072,72 @@ class AgentGraph:
         finding["confidence"] = result.get("confidence", 0.0)
         finding["inference_time_s"] = result.get("inference_time_s", 0.0)
         finding["code_chunk"] = result.get("vulnerable_code", "") or finding.get("code_chunk", "")
-        finding["cwe_type"] = result.get("cwe_type") or finding.get("cwe_type") or "UNCLASSIFIED"
+
+        # Task 1: CWE data flow — preserve tool-provided CWE classifications.
+        # Only allow the investigator to *refine* (e.g. CWE-120 → CWE-787) when
+        # the original was from CodeQL/Semgrep.  Never overwrite a tool CWE with
+        # a completely different one unless the investigator is highly confident.
+        _original_cwe = finding.get("cwe_type") or "UNCLASSIFIED"
+        _original_source = finding.get("cwe_source", "pending")
+        _inv_cwe = str(result.get("cwe_type") or "").strip()
+        _inv_confidence = float(result.get("confidence", 0) or 0)
+
+        if _original_source == 'tool' and _original_cwe != 'UNCLASSIFIED':
+            # Tool already classified — only accept investigator refinement if
+            # it's a genuine refinement (same family) or high-confidence override
+            if _inv_cwe and _inv_cwe != 'UNCLASSIFIED' and _inv_cwe != _original_cwe:
+                # Check if it's a CWE family refinement (same first 2 digits)
+                import re as _re_cwe_check
+                _orig_num = _re_cwe_check.search(r'(\d+)', _original_cwe)
+                _inv_num = _re_cwe_check.search(r'(\d+)', _inv_cwe)
+                _is_refinement = (
+                    _orig_num and _inv_num
+                    and str(_orig_num.group(1))[:2] == str(_inv_num.group(1))[:2]
+                )
+                if _is_refinement or _inv_confidence >= 0.9:
+                    finding["cwe_type"] = _inv_cwe
+                    finding["cwe_source"] = "tool_refined"
+                else:
+                    # Keep the tool's classification — investigator disagrees but
+                    # isn't confident enough to override
+                    finding["cwe_type"] = _original_cwe
+            else:
+                # Investigator agrees or returned UNCLASSIFIED — keep tool CWE
+                finding["cwe_type"] = _original_cwe
+        else:
+            # No tool classification — use investigator's result
+            finding["cwe_type"] = _inv_cwe or _original_cwe or "UNCLASSIFIED"
+            if finding["cwe_type"] == "UNCLASSIFIED":
+                finding["cwe_type"] = self._infer_cwe_from_text(finding) or "UNCLASSIFIED"
+            if finding["cwe_type"] != "UNCLASSIFIED":
+                finding["cwe_source"] = "llm_inferred"
+
         finding["cve_id"] = result.get("cve_id")
         # 2c: carry joern taint context forward to PoV generation
         if result.get("joern_context"):
             finding["joern_context"] = result["joern_context"]
+
+        # Task 8: Forward-pass investigation intel for downstream prompts.
+        # root_cause and impact are surfaced in PRIORITY 1 of the restructured prompt.
+        _inv_root_cause = str(result.get('root_cause') or '').strip()
+        if _inv_root_cause:
+            finding['root_cause'] = _inv_root_cause
+            # Also inject into exploit_contract so prompts can access it
+            _ec_fwd = dict(finding.get('exploit_contract') or {})
+            _ec_fwd['root_cause'] = _inv_root_cause
+            finding['exploit_contract'] = _ec_fwd
+        _inv_impact = str(result.get('impact') or '').strip()
+        if _inv_impact:
+            finding['impact'] = _inv_impact
+            _ec_fwd = dict(finding.get('exploit_contract') or {})
+            _ec_fwd['impact'] = _inv_impact
+            finding['exploit_contract'] = _ec_fwd
+        # Forward taxonomy_refs (tool-identified references) into contract
+        _tax_refs = finding.get('taxonomy_refs') or []
+        if _tax_refs:
+            _ec_fwd = dict(finding.get('exploit_contract') or {})
+            _ec_fwd['taxonomy_refs'] = _tax_refs
+            finding['exploit_contract'] = _ec_fwd
         # Task 4: tag joern_reachable on the finding for use by the contract gate
         _jc = result.get('joern_context', '')
         finding['joern_reachable'] = (
@@ -1484,6 +2173,40 @@ class AgentGraph:
             if _inferred:
                 _contract_after["runtime_profile"] = _inferred
                 finding["exploit_contract"] = _contract_after
+        # T4 — execution_surface consistency: if runtime_profile is Python/Java/JS but
+        # execution_surface='native' (LLM mistake), correct it so docker_runner routes correctly.
+        _contract_after2 = dict(finding.get("exploit_contract") or {})
+        _rt_profile2 = str(_contract_after2.get('runtime_profile') or '').strip().lower()
+        _exec_surf2 = str(_contract_after2.get('execution_surface') or '').strip().lower()
+        _NON_NATIVE2 = {'python', 'java', 'javascript', 'node', 'typescript'}
+        if _rt_profile2 in _NON_NATIVE2 and _exec_surf2 == 'native':
+            _surf_fix = {
+                'java': 'function_call',
+                'python': 'repo_script',
+                'javascript': 'function_call',
+                'node': 'function_call',
+                'typescript': 'function_call',
+            }.get(_rt_profile2, 'repo_script')
+            _contract_after2['execution_surface'] = _surf_fix
+            finding['exploit_contract'] = _contract_after2
+
+        # ── Seed PoC: fetch existing exploit from CVE references (cached) ──
+        _cve_for_poc = str(
+            finding.get('cve_id')
+            or (finding.get('exploit_contract') or {}).get('cve_id')
+            or ''
+        ).strip()
+        if _cve_for_poc and _cve_for_poc.startswith('CVE-'):
+            try:
+                from agents.cve_enricher import fetch_existing_poc
+                _seed = fetch_existing_poc(_cve_for_poc)
+                if _seed:
+                    _ec_seed = dict(finding.get('exploit_contract') or {})
+                    _ec_seed['seed_poc'] = _seed
+                    finding['exploit_contract'] = _ec_seed
+                    self._log(state, f'[investigate] Fetched seed PoC for {_cve_for_poc} ({len(_seed)} chars)')
+            except Exception as _e_poc:
+                logger.debug('seed_poc fetch failed: %s', _e_poc)
         token_usage = result.get("token_usage", {})
         model_used = result.get("model_used", model_to_use)
         
@@ -1548,7 +2271,8 @@ class AgentGraph:
                     alert_message=finding.get("alert_message", ""),
                     model_name=model_name,
                     api_key_override=state.get("openrouter_api_key"),
-                    repo_web_capable=state.get("repo_web_capable", False)
+                    repo_web_capable=state.get("repo_web_capable", False),
+                    recon_report=state.get('recon_report'),
                 )
                 
                 finding["llm_verdict"] = result.get("verdict", "UNKNOWN")
@@ -1557,6 +2281,8 @@ class AgentGraph:
                 finding["inference_time_s"] = result.get("inference_time_s", 0.0)
                 finding["code_chunk"] = result.get("vulnerable_code", "") or finding.get("code_chunk", "")
                 finding["cwe_type"] = result.get("cwe_type") or finding.get("cwe_type") or "UNCLASSIFIED"
+                if finding["cwe_type"] == "UNCLASSIFIED":
+                    finding["cwe_type"] = self._infer_cwe_from_text(finding) or "UNCLASSIFIED"
                 finding["cve_id"] = result.get("cve_id")
                 # 2c: carry joern taint context forward to PoV generation
                 if result.get("joern_context"):
@@ -1592,6 +2318,17 @@ class AgentGraph:
                     if _inferred2:
                         _pbatch_contract["runtime_profile"] = _inferred2
                         finding["exploit_contract"] = _pbatch_contract
+                # T4 — execution_surface consistency (batch path)
+                _pbatch_contract3 = dict(finding.get('exploit_contract') or {})
+                _rt_p3 = str(_pbatch_contract3.get('runtime_profile') or '').strip().lower()
+                _ex_s3 = str(_pbatch_contract3.get('execution_surface') or '').strip().lower()
+                _NON_NATIVE3 = {'python', 'java', 'javascript', 'node', 'typescript'}
+                if _rt_p3 in _NON_NATIVE3 and _ex_s3 == 'native':
+                    _s3 = {'java': 'function_call', 'python': 'repo_script',
+                           'javascript': 'function_call', 'node': 'function_call',
+                           'typescript': 'function_call'}.get(_rt_p3, 'repo_script')
+                    _pbatch_contract3['execution_surface'] = _s3
+                    finding['exploit_contract'] = _pbatch_contract3
                 token_usage = result.get("token_usage", {})
                 model_used = result.get("model_used", model_name)
                 finding["model_used"] = model_used
@@ -1714,6 +2451,19 @@ class AgentGraph:
         return code_context[start:end]
 
 
+    def _infer_cwe_from_text(self, finding: dict) -> str:
+        """Attempt to extract a CWE ID from finding text fields when investigator
+        returned UNCLASSIFIED.  Scans alert_message, llm_explanation, and code_chunk
+        for patterns like CWE-416, CWE-120, etc."""
+        import re as _re_cwe
+        for field in ('alert_message', 'llm_explanation', 'code_chunk'):
+            text = str(finding.get(field) or '')
+            m = _re_cwe.search(r'CWE-?(\d+)', text, _re_cwe.IGNORECASE)
+            if m:
+                return f'CWE-{m.group(1)}'
+        return ''
+
+
     def _infer_runtime_profile(self, finding: Dict[str, Any], state: ScanState) -> str:
         """Infer the best runtime harness from the exploit contract, file path, and detected language."""
         exploit_contract = finding.get('exploit_contract') or {}
@@ -1738,6 +2488,9 @@ class AgentGraph:
             return 'node'
         if ext == '.py':
             return 'python'
+        # HTML files with embedded JS are treated as JavaScript runtime
+        if ext in {'.html', '.htm'}:
+            return 'javascript'
 
         detected = str(finding.get('detected_language') or state.get('detected_language') or '').strip().lower()
         _lang_map = {
@@ -1766,6 +2519,19 @@ class AgentGraph:
         if state.get('probe_result') is not None:
             return state
 
+        # Stage-skip: CVE dependency findings already have full exploit_contract
+        # from the advisory database — running a build probe is wasted time.
+        # EXCEPTION: native CVE findings still need probe to discover binary paths.
+        idx = state.get('current_finding_idx', 0)
+        _findings = state.get('findings', [])
+        if idx < len(_findings) and _findings[idx].get('source') == 'dependency_cve':
+            _cve_runtime = (_findings[idx].get('exploit_contract') or {}).get('runtime_profile', '')
+            if _cve_runtime != 'native':
+                self._log(state, f'Probe: skipping for non-native CVE dependency finding {idx} (runtime={_cve_runtime})')
+                return state
+            else:
+                self._log(state, f'Probe: running for native CVE finding {idx} (binary path discovery needed)')
+
         codebase_path = state.get('codebase_path', '')
         scan_id = state.get('scan_id', 'unknown')
         self._log(state, f'Probe: running preflight probe against {codebase_path}')
@@ -1789,6 +2555,42 @@ class AgentGraph:
         )
         probe_dict = probe.to_dict()
         state['probe_result'] = probe_dict
+
+        # Synthesize repo intelligence profile from recon + probe data
+        try:
+            from agents.repo_intelligence import synthesize_repo_profile, inject_protocol_into_contract
+            _repo_profile = synthesize_repo_profile(
+                recon_report=state.get('recon_report'),
+                probe_result=probe_dict,
+                findings=state.get('findings'),
+                codebase_path=codebase_path,
+            )
+            state['repo_profile'] = _repo_profile.to_dict()
+            self._log(state, f'RepoProfile: type={_repo_profile.project_type}, '
+                             f'format={_repo_profile.input_format}, '
+                             f'protocol={" → ".join(_repo_profile.multi_step_protocol) or "none"}')
+            # Persist repo profile to memory for future scans
+            try:
+                from agents.repo_memory import get_repo_memory
+                _mem = get_repo_memory()
+                _mem.store_repo_profile(_repo_profile.repo_name, _repo_profile.to_dict(), scan_id=scan_id)
+                # Recall previous winning strategies
+                _prev_winners = _mem.get_winning_strategies(_repo_profile.repo_name)
+                if _prev_winners:
+                    state['repo_profile']['previous_winning_strategies'] = _prev_winners
+                    self._log(state, f'RepoMemory: recalled {len(_prev_winners)} winning strategies from previous scans')
+                    # Inject winning strategies into every finding's exploit_contract
+                    # so PoV generation and refinement prompts can use them.
+                    for _f_ws in state.get('findings', []):
+                        _ec_ws = dict(_f_ws.get('exploit_contract') or {})
+                        if not _ec_ws.get('previous_winning_strategies'):
+                            _ec_ws['previous_winning_strategies'] = _prev_winners
+                        _f_ws['exploit_contract'] = _ec_ws
+            except Exception as _mem_err:
+                logger.debug('RepoMemory persistence failed (non-fatal): %s', _mem_err)
+        except Exception as _rp_err:
+            logger.warning('RepoProfile synthesis failed: %s', _rp_err)
+            state['repo_profile'] = {}
 
         if probe.probe_skipped:
             self._log(state, f'Probe skipped: {probe.probe_skip_reason}')
@@ -1823,7 +2625,10 @@ class AgentGraph:
                 # could not resolve the binary name or input surface.
                 _weak = {'', 'unknown', 'none', 'n/a'}
                 if probe.probe_binary_path and str(ec.get('target_binary') or '').strip().lower() in _weak:
-                    ec['target_binary'] = probe.probe_binary_path
+                    # Use basename only — full paths like /workspace/codebase/enchive
+                    # confuse downstream contract matching and PoV generation.
+                    import os as _os
+                    ec['target_binary'] = _os.path.basename(probe.probe_binary_path)
                 if _probe_input_surface != 'unknown':
                     _input_mode_map = {
                         'file_argument': 'file',
@@ -1853,6 +2658,26 @@ class AgentGraph:
                     ec['probe_entry_command'] = probe.probe_entry_command
                 if probe.probe_base_url and not ec.get('probe_base_url'):
                     ec['probe_base_url'] = probe.probe_base_url
+                # T3: propagate format hint so _build_binary_surface_block() in prompts.py
+                # can inject the correct format guidance into the PoV generation prompt.
+                if probe_dict.get('probe_format_hint') and not ec.get('probe_format_hint'):
+                    ec['probe_format_hint'] = probe_dict['probe_format_hint']
+                # Adaptive intelligence: forward probe-derived subcommands, extensions,
+                # rejection patterns, and bootstrap subcommand so downstream consumers
+                # (docker_runner, pov_tester, prompts) use runtime-discovered data
+                # instead of hardcoded maps.
+                if probe.probe_discovered_subcommands and not ec.get('probe_discovered_subcommands'):
+                    ec['probe_discovered_subcommands'] = probe.probe_discovered_subcommands
+                if probe.probe_inferred_extensions and not ec.get('probe_inferred_extensions'):
+                    ec['probe_inferred_extensions'] = probe.probe_inferred_extensions
+                if probe.probe_rejection_patterns and not ec.get('probe_rejection_patterns'):
+                    ec['probe_rejection_patterns'] = probe.probe_rejection_patterns
+                if probe.probe_bootstrap_subcommand and not ec.get('probe_bootstrap_subcommand'):
+                    ec['probe_bootstrap_subcommand'] = probe.probe_bootstrap_subcommand
+                # Task 3: propagate probe_binary_is_test flag so env_kind routing
+                # can switch to c_library_harness when only a test binary was found.
+                if probe.probe_binary_is_test:
+                    ec['probe_binary_is_test'] = '1'
                 # Task 1/2A: Propagate repo_surface_class and library_api_context so
                 # PoV generation and guardrails can route without re-reading state.
                 _repo_cls = state.get('repo_surface_class') or ''
@@ -1861,6 +2686,32 @@ class AgentGraph:
                 _lib_api = state.get('library_api_context') or ''
                 if _lib_api and not ec.get('library_api_context'):
                     ec['library_api_context'] = _lib_api
+                # Fix: Force c_library_harness for library_c_with_cli when binary
+                # is in a wrapper/example directory (not a primary CLI tool).
+                if _repo_cls == 'library_c_with_cli' and probe.probe_binary_path:
+                    import re as _re_wrapper
+                    _WRAPPER_PATH_RE = _re_wrapper.compile(
+                        r'[\/](examples?|samples?|demos?|tools?|wf|xmlwf|cmd|cli|bin|contrib|tests?|bench|fuzz|readme)[\/]',
+                        _re_wrapper.IGNORECASE
+                    )
+                    _WRAPPER_NAME_RE = _re_wrapper.compile(
+                        r'^(?:readme[_-]?|example[_-]?|sample[_-]?|demo[_-]?|test[_-]?|bench[_-]?)',
+                        _re_wrapper.IGNORECASE
+                    )
+                    _bin_basename = _os.path.basename(probe.probe_binary_path)
+                    if _WRAPPER_PATH_RE.search(probe.probe_binary_path) or _WRAPPER_NAME_RE.match(_bin_basename):
+                        ec['probe_binary_is_test'] = '1'
+                # Clear conflicting binary fields when routing to c_library_harness
+                # so the model doesn't get confused by having both a target_binary
+                # AND c_library_harness instructions.
+                if ec.get('probe_binary_is_test') == '1' and _repo_cls in ('library_c_with_cli', 'library_c'):
+                    ec.pop('target_binary', None)
+                    ec.pop('probe_binary_name', None)
+                    ec.pop('probe_binary_path', None)  # prevent native prelude from finding wrapper binary
+                    ec['probe_binary_is_example'] = '1'
+                    # Explicitly set execution_surface so docker_runner routes
+                    # to c_library_harness and prompts inject harness template
+                    ec['execution_surface'] = 'c_library_harness'
                 # Task 5: if probe input surface was detected as test_harness_output,
                 # clear the probe binary path (it's a test runner) and set surface type.
                 if _probe_input_surface == 'test_harness_output':
@@ -1874,9 +2725,197 @@ class AgentGraph:
                         obs = ec.setdefault('observed_surface', {})
                         if not obs.get('library_api'):
                             obs['library_api'] = _lib_api
+                # Library harness quality boost: inject the vulnerable function's
+                # actual source code into the contract so the LLM can write a
+                # harness that calls the real API with correct argument types.
+                if _repo_cls in ('library_c', 'library_c_with_cli') and not ec.get('vulnerable_function_source'):
+                    _vuln_src = self._extract_vulnerable_function_source(
+                        state.get('codebase_path', ''),
+                        finding.get('filepath', ''),
+                        finding.get('line_number', 0),
+                        finding.get('exploit_contract', {}).get('target_entrypoint', ''),
+                    )
+                    if _vuln_src:
+                        ec['vulnerable_function_source'] = _vuln_src
+                # Auto-populate success_indicators from probe when investigation didn't set them
+                _auto_populate_oracle_from_probe(ec, state.get('probe_result') or {})
+
+                # Inject repo protocol intelligence from RepoProfile
+                _rp = state.get('repo_profile')
+                if _rp:
+                    try:
+                        from agents.repo_intelligence import inject_protocol_into_contract, RepoProfile
+                        _rp_obj = RepoProfile(**{k: v for k, v in _rp.items() if hasattr(RepoProfile, k)})
+                        ec = inject_protocol_into_contract(_rp_obj, ec)
+                    except Exception:
+                        pass  # non-fatal
+                    # Wire repo profile fields into contract for docker_runner routing
+                    if not ec.get('repo_runtime_family'):
+                        ec['repo_runtime_family'] = _rp.get('runtime_family', '')
+                    if not ec.get('repo_build_system'):
+                        ec['repo_build_system'] = _rp.get('build_system', '')
+                    if not ec.get('repo_default_proof_type'):
+                        ec['repo_default_proof_type'] = _rp.get('default_proof_type', '')
                 finding['exploit_contract'] = ec
 
+            # ── Inject recon intelligence into every finding's exploit_contract ──
+            # Recon data was previously only stored in state['recon_report'] and
+            # never reached the exploit_contract — the vehicle that carries data
+            # to PoV generation.  Now we inject key recon fields so downstream
+            # consumers (proof strategy, PoV gen, investigation) see them.
+            _recon_data = state.get('recon_report') or {}
+            if _recon_data:
+                for finding in state.get('findings', []):
+                    ec = dict(finding.get('exploit_contract') or {})
+                    if not ec.get('recon_attack_surfaces'):
+                        ec['recon_attack_surfaces'] = _recon_data.get('attack_surfaces', [])
+                    if not ec.get('recon_proof_strategies'):
+                        ec['recon_proof_strategies'] = _recon_data.get('proof_strategies', {})
+                    if not ec.get('recon_entry_points'):
+                        ec['recon_entry_points'] = _recon_data.get('entrypoints', [])
+                    # Extract subcommand names from recon entrypoints
+                    if not ec.get('recon_subcommands'):
+                        _r_subs = [ep.get('name', '') for ep in _recon_data.get('entrypoints', []) if ep.get('name')]
+                        if _r_subs:
+                            ec['recon_subcommands'] = _r_subs
+                    if not ec.get('recon_input_format_hints'):
+                        ec['recon_input_format_hints'] = _recon_data.get('input_format_hints', [])
+                    if not ec.get('recon_sample_inputs'):
+                        ec['recon_sample_inputs'] = _recon_data.get('sample_input_files', [])
+                    if not ec.get('recon_default_proof_type'):
+                        ec['recon_default_proof_type'] = _recon_data.get('default_proof_type', '')
+                    if not ec.get('recon_default_harness_type'):
+                        ec['recon_default_harness_type'] = _recon_data.get('default_harness_type', '')
+                    # Merge recon subcommands into known_subcommands if probe didn't find any
+                    _existing_subs = ec.get('known_subcommands') or []
+                    _recon_subs = ec.get('recon_subcommands') or []
+                    if _recon_subs and not _existing_subs:
+                        ec['known_subcommands'] = _recon_subs
+                    elif _recon_subs and _existing_subs:
+                        # Merge, deduplicate, preserve order
+                        _merged = list(_existing_subs)
+                        for s in _recon_subs:
+                            if s not in _merged:
+                                _merged.append(s)
+                        ec['known_subcommands'] = _merged
+                    finding['exploit_contract'] = ec
+                self._log(state, f'[probe] Injected recon intelligence into {len(state.get("findings", []))} findings\' exploit_contracts')
+
+            # Task 9: Detect library-only repos (no CLI binary, no web server)
+            # and set execution_surface to function_call so PoV gen uses import+call.
+            if not probe.probe_binary_path and not probe.probe_surface_type:
+                _det_lang = str(state.get('detected_language') or '').lower()
+                if _det_lang in {'javascript', 'typescript'}:
+                    self._log(state, 'Probe: No binary or server found for JS/TS repo — routing as library (function_call)')
+                    for finding in state.get('findings', []):
+                        ec = dict(finding.get('exploit_contract') or {})
+                        if not ec.get('execution_surface'):
+                            ec['execution_surface'] = 'function_call'
+                            ec['runtime_profile'] = 'node'
+                        finding['exploit_contract'] = ec
+                elif _det_lang == 'python':
+                    self._log(state, 'Probe: No binary or server found for Python repo — routing as library (function_call)')
+                    for finding in state.get('findings', []):
+                        ec = dict(finding.get('exploit_contract') or {})
+                        if not ec.get('execution_surface'):
+                            ec['execution_surface'] = 'function_call'
+                            ec['runtime_profile'] = 'python'
+                        finding['exploit_contract'] = ec
+
         return state
+
+    def _extract_vulnerable_function_source(
+        self, codebase_path: str, filepath: str, line_number: int, entrypoint: str,
+    ) -> str:
+        """Extract the full C/C++ function body surrounding a vulnerability.
+
+        Reads the source file and finds the function containing `line_number`,
+        or the function named `entrypoint`. Returns up to 120 lines of the
+        function body so the LLM can write an accurate harness.
+        """
+        import os as _os
+        import re as _re
+        from pathlib import Path as _Path
+
+        if not codebase_path or not filepath:
+            return ''
+
+        # Resolve the file path relative to codebase
+        src_path = _Path(codebase_path) / filepath
+        if not src_path.is_file():
+            # Try without leading directory components (scanner paths may differ)
+            for root, _dirs, files in _os.walk(codebase_path):
+                for f in files:
+                    if f == _Path(filepath).name:
+                        src_path = _Path(root) / f
+                        break
+                if src_path.is_file():
+                    break
+        if not src_path.is_file():
+            return ''
+
+        try:
+            lines = src_path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        except OSError:
+            return ''
+
+        if not lines:
+            return ''
+
+        # Strategy 1: Find the function containing the vulnerable line
+        target_line = max(0, (line_number or 1) - 1)  # 0-indexed
+
+        # Walk backwards from target_line to find function start
+        func_start = None
+        # C function declaration pattern: return_type [*] func_name(...) {
+        _FUNC_DECL = _re.compile(
+            r'^\s*(?:static\s+|inline\s+|extern\s+|const\s+|unsigned\s+|void\s+|'
+            r'\w+\s+)*(?:\*\s*)*\w+\s*\([^;]*\)\s*\{?\s*$'
+        )
+        for i in range(min(target_line, len(lines) - 1), max(target_line - 80, -1), -1):
+            if i < 0:
+                break
+            if _FUNC_DECL.match(lines[i]):
+                func_start = i
+                break
+
+        if func_start is None and entrypoint and entrypoint.lower() not in {'', 'unknown', 'none', 'main'}:
+            # Strategy 2: Search for the named entrypoint function
+            _ep_re = _re.compile(r'\b' + _re.escape(entrypoint) + r'\s*\(')
+            for i, line in enumerate(lines):
+                if _ep_re.search(line) and '{' in line or (i + 1 < len(lines) and '{' in lines[i + 1]):
+                    func_start = i
+                    break
+
+        if func_start is None:
+            # Fallback: return context around the vulnerable line (40 lines)
+            start = max(0, target_line - 10)
+            end = min(len(lines), target_line + 30)
+            return '\n'.join(lines[start:end])
+
+        # Find function end by matching braces
+        brace_depth = 0
+        func_end = func_start
+        found_open = False
+        for i in range(func_start, min(len(lines), func_start + 200)):
+            for ch in lines[i]:
+                if ch == '{':
+                    brace_depth += 1
+                    found_open = True
+                elif ch == '}':
+                    brace_depth -= 1
+            if found_open and brace_depth <= 0:
+                func_end = i
+                break
+        else:
+            func_end = min(len(lines) - 1, func_start + 120)
+
+        # Also include any preceding function signature / comment (up to 5 lines)
+        sig_start = max(0, func_start - 5)
+        # Cap at 120 lines total
+        end = min(func_end + 1, sig_start + 120)
+
+        return '\n'.join(lines[sig_start:end])
 
     def _node_trace_target(self, state: ScanState) -> ScanState:
         """Dynamic trace node: runs strace + valgrind after the probe and before PoV generation.
@@ -1888,6 +2927,19 @@ class AgentGraph:
         # Skip if already traced this scan
         if state.get('trace_result') is not None:
             return state
+
+        # Stage-skip: CVE dependency findings already have the exploit path from
+        # the advisory DB — strace/valgrind trace discovers nothing useful.
+        # EXCEPTION: native CVE findings benefit from strace/valgrind for surface confirmation.
+        idx = state.get('current_finding_idx', 0)
+        _findings = state.get('findings', [])
+        if idx < len(_findings) and _findings[idx].get('source') == 'dependency_cve':
+            _cve_runtime = (_findings[idx].get('exploit_contract') or {}).get('runtime_profile', '')
+            if _cve_runtime != 'native':
+                self._log(state, f'Trace: skipping for non-native CVE dependency finding {idx} (runtime={_cve_runtime})')
+                return state
+            else:
+                self._log(state, f'Trace: running for native CVE finding {idx} (surface confirmation needed)')
 
         codebase_path = state.get('codebase_path', '')
         scan_id = state.get('scan_id', 'unknown')
@@ -1923,11 +2975,16 @@ class AgentGraph:
 
             # Inject trace_context into every finding's exploit_contract
             trace_ctx_str = format_trace_context(trace)
+            # FIX-14: Also store structured JSON trace for the coordinator so it
+            # can parse fields programmatically instead of regex-scraping text.
+            _trace_json_str = trace.to_json() if hasattr(trace, 'to_json') else ''
             if trace_ctx_str:
                 for finding in state.get('findings', []):
                     ec = dict(finding.get('exploit_contract') or {})
                     if not ec.get('trace_context'):
                         ec['trace_context'] = trace_ctx_str
+                    if _trace_json_str and not ec.get('trace_json'):
+                        ec['trace_json'] = _trace_json_str
                     # Also propagate detected input surface if stronger than probe's
                     if trace.trace_input_surface and trace.trace_input_surface != 'unknown':
                         if not ec.get('trace_input_surface'):
@@ -1936,6 +2993,207 @@ class AgentGraph:
         except Exception as exc:
             self._log(state, f'Trace node error (non-fatal): {exc}')
             state['trace_result'] = {'trace_skipped': True, 'trace_skip_reason': f'exception:{exc}'}
+
+        return state
+
+    def _get_recon_default_proof_strategy(self, state: ScanState) -> Dict[str, Any]:
+        """Get the default proof strategy from the recon report.
+
+        Instead of always defaulting to crash_signal, this uses the
+        reconnaissance report to pick the right proof type for the project.
+        """
+        recon_data = state.get('recon_report') or {}
+        if recon_data:
+            recon = ReconReport.from_dict(recon_data)
+            return recon.get_default_proof_strategy()
+        # Ultimate fallback if no recon report exists
+        return {'proof_type': 'crash_signal', 'observable_evidence': [], 'harness_type': 'subprocess_binary'}
+
+    def _node_proof_strategy(self, state: ScanState) -> ScanState:
+        """Determine proof strategy for each confirmed finding before PoV generation.
+
+        This v2 phase asks the LLM what kind of runtime evidence proves the vulnerability
+        is real, and what harness approach is needed. The result is stored in
+        finding['exploit_contract']['proof_strategy'] for downstream use by the
+        PoV generator, oracle, and coordinator.
+        """
+        if self._check_cancelled(state):
+            return state
+
+        from prompts import format_proof_strategy_prompt
+
+        idx = state.get('current_finding_idx', 0)
+        if idx >= len(state['findings']):
+            return state
+
+        finding = state['findings'][idx]
+        verdict = finding.get('llm_verdict', '')
+        if verdict != 'REAL':
+            return state
+
+        ec = finding.get('exploit_contract') or {}
+        # Skip if proof_strategy already set
+        if ec.get('proof_strategy'):
+            return state
+
+        self._log(state, f"[proof_strategy] Determining proof strategy for finding {idx}")
+
+        # ── Infer proof_category dynamically (CWE-agnostic) ──────────────
+        try:
+            from agents.finding_context import _infer_proof_category, FindingContext as _FC
+            _inv = finding.get('investigation') or {}
+            _mini_ctx = _FC(
+                root_cause=str(_inv.get('explanation') or finding.get('llm_explanation') or ''),
+                impact=str(ec.get('impact') or ''),
+                vulnerable_code=str(_inv.get('vulnerable_code') or finding.get('code_chunk') or ''),
+                code_context=str(_inv.get('code_context') or ''),
+                trigger_steps=list(ec.get('trigger_steps') or []),
+                runtime_family=str(ec.get('runtime_family') or state.get('target_language') or 'native'),
+            )
+            _proof_category = _infer_proof_category(_mini_ctx)
+        except Exception:
+            _proof_category = 'crash'
+        ec['proof_category'] = _proof_category
+        self._log(state, f"[proof_strategy] inferred proof_category={_proof_category}")
+
+        try:
+            investigation = finding.get('investigation') or {}
+            prompt = format_proof_strategy_prompt(
+                cwe_type=investigation.get('cwe_type', finding.get('cwe_type', '')),
+                filepath=investigation.get('filepath', finding.get('filepath', '')),
+                target_language=ec.get('runtime_family', state.get('target_language', '')),
+                explanation=investigation.get('explanation', finding.get('llm_explanation', '')),
+                vulnerable_code=investigation.get('vulnerable_code', finding.get('code_chunk', '')),
+                exploit_contract=ec,
+                recon_report=state.get('recon_report'),
+                probe_result=state.get('probe_result'),
+                proof_category=_proof_category,
+            )
+
+            # Use the same LLM as investigation
+            from agents.investigator import get_investigator
+            _investigator = get_investigator()
+            model_name = state.get('model_name') or ''
+            llm = _investigator._get_llm(model_name=model_name or None)
+            import json as _json
+            from langchain_core.messages import HumanMessage
+            response = llm.invoke([HumanMessage(content=prompt)])
+            content = response.content if hasattr(response, 'content') else str(response)
+
+            # Parse JSON from response
+            _clean = content.strip()
+            if '```' in _clean:
+                _clean = _clean.split('```json')[-1].split('```')[0].strip() if '```json' in _clean else _clean.split('```')[1].split('```')[0].strip()
+            proof_strategy = _json.loads(_clean)
+
+            # Validate required fields
+            _required = ('proof_type', 'observable_evidence', 'harness_type')
+            if all(k in proof_strategy for k in _required):
+                # ── Override: if proof_category=behavioral but LLM chose crash_signal, force behavioral_deviation
+                # EXCEPTION: for native C/C++ targets with crash-prone CWEs, the LLM's crash_signal
+                # choice is authoritative — ASan will catch buffer overflows, use-after-free, etc.
+                # even when the abstract vulnerability class is "behavioral" (path traversal, info leak).
+                # Overriding crash_signal to behavioral_deviation on these targets causes the oracle
+                # to look for observable_evidence markers instead of sanitizer/crash signals, which
+                # almost never matches and produces 0 confirmations.
+                _runtime_family = str(ec.get('runtime_family') or state.get('target_language') or '').lower()
+                _is_native = _runtime_family in ('c', 'cpp', 'native', 'binary') or str(ec.get('runtime_profile') or '').lower() in ('c', 'cpp', 'native', 'binary')
+                _crash_cwes = {'CWE-120', 'CWE-125', 'CWE-121', 'CWE-122', 'CWE-124', 'CWE-126',
+                               'CWE-127', 'CWE-787', 'CWE-788', 'CWE-415', 'CWE-416',
+                               'CWE-190', 'CWE-191', 'CWE-476', 'CWE-680',
+                               'CWE-022', 'CWE-073', 'CWE-078', 'CWE-077'}
+                _cwe_id = str(finding.get('cwe_type') or '').strip().upper()
+                _is_crash_cwe = _cwe_id in _crash_cwes
+                if _proof_category == 'behavioral' and proof_strategy.get('proof_type') == 'crash_signal':
+                    if _is_native and _is_crash_cwe:
+                        self._log(state, f"[proof_strategy] NATIVE CRASH CWE OVERRIDE: keeping crash_signal for {_cwe_id} on native target "
+                                  f"(proof_category was {_proof_category} but ASan will catch this)")
+                    else:
+                        self._log(state, f"[proof_strategy] OVERRIDE: proof_category=behavioral but LLM chose crash_signal → forcing behavioral_deviation")
+                        proof_strategy['proof_type'] = 'behavioral_deviation'
+                # ── Reverse override: for native crash-prone CWEs, force crash_signal even when
+                # LLM chose behavioral_deviation.  The behavioral oracle almost never confirms
+                # native C targets — it looks for observable_evidence markers in output instead
+                # of sanitizer/crash signals.  For buffer overflows, path traversal, command
+                # injection etc. in native code, ASan/SIGSEGV is the correct proof path.
+                if _is_native and _is_crash_cwe and proof_strategy.get('proof_type') != 'crash_signal':
+                    self._log(state, f"[proof_strategy] NATIVE CRASH CWE FORCE: overriding proof_type={proof_strategy.get('proof_type')} "
+                              f"→ crash_signal for {_cwe_id} on native target")
+                    proof_strategy['proof_type'] = 'crash_signal'
+                    # Also add crash-relevant observable evidence so the oracle can match
+                    _obs = proof_strategy.get('observable_evidence') or []
+                    _crash_markers = ['AddressSanitizer', 'heap-buffer-overflow', 'stack-buffer-overflow',
+                                      'use-after-free', 'double-free', 'SEGV', 'SIGABRT']
+                    for _cm in _crash_markers:
+                        if _cm not in _obs:
+                            _obs.append(_cm)
+                    proof_strategy['observable_evidence'] = _obs
+                # ── Sanitize observable_evidence: ensure behavioral findings have behavioral markers
+                if _proof_category == 'behavioral':
+                    _obs = proof_strategy.get('observable_evidence', [])
+                    _crash_kw = ('asan', 'sigsegv', 'sigabrt', 'addresssanitizer', 'segmentation',
+                                 'core dump', 'crash', 'heap-buffer', 'stack-buffer',
+                                 'use-after-free', 'double-free', 'signal 11', 'signal 6')
+                    _has_behavioral = any(
+                        m for m in _obs
+                        if not any(ck in m.lower() for ck in _crash_kw)
+                    )
+                    if not _has_behavioral:
+                        # Task 6: Derive evidence dynamically from exploitation approach
+                        try:
+                            from agents.finding_context import _derive_observable_evidence_from_approach, _infer_exploitation_approach
+                            _approach_text = _infer_exploitation_approach(_mini_ctx)
+                            _cwe_for_derive = str(finding.get('cwe_type') or '').strip()
+                            _derived = _derive_observable_evidence_from_approach(_approach_text, cwe=_cwe_for_derive)
+                            if _derived:
+                                proof_strategy['observable_evidence'] = _derived
+                                self._log(state, f'[proof_strategy] Derived observable_evidence from approach: {_derived}')
+                            else:
+                                _behavioral_defaults = ['FILE_CREATED_OUTSIDE_ALLOWED_DIR', 'INSECURE_PERMISSION', 'SENSITIVE_DATA_LEAKED']
+                                proof_strategy['observable_evidence'] = _behavioral_defaults
+                                self._log(state, f'[proof_strategy] Replaced crash-only evidence with behavioral defaults')
+                        except Exception:
+                            _behavioral_defaults = ['FILE_CREATED_OUTSIDE_ALLOWED_DIR', 'INSECURE_PERMISSION', 'SENSITIVE_DATA_LEAKED']
+                            proof_strategy['observable_evidence'] = _behavioral_defaults
+                            self._log(state, f'[proof_strategy] Replaced crash-only evidence with behavioral defaults (fallback)')
+
+                # Task 6: Use OSV proof_type/hint as ground truth signal
+                _osv_findings = (state.get('recon_report') or {}).get('osv_findings') or []
+                if _osv_findings:
+                    for _osv_f in _osv_findings:
+                        _osv_pt = str(_osv_f.get('proof_type') or '').strip().lower()
+                        _osv_hint = str(_osv_f.get('proof_hint') or '').strip()
+                        if _osv_pt and _osv_pt != 'crash_signal' and proof_strategy.get('proof_type') == 'crash_signal':
+                            self._log(state, f'[proof_strategy] OSV override: proof_type={_osv_pt} (was crash_signal)')
+                            proof_strategy['proof_type'] = _osv_pt
+                        if _osv_hint and not proof_strategy.get('exploitation_approach'):
+                            proof_strategy['exploitation_approach'] = _osv_hint
+                ec['proof_strategy'] = proof_strategy
+                finding['exploit_contract'] = ec
+                self._log(state, f"[proof_strategy] proof_type={proof_strategy.get('proof_type')}, "
+                          f"harness_type={proof_strategy.get('harness_type')}")
+            else:
+                self._log(state, '[proof_strategy] Response missing required fields, using recon default')
+                ec['proof_strategy'] = self._get_recon_default_proof_strategy(state)
+                finding['exploit_contract'] = ec
+
+        except Exception as exc:
+            self._log(state, f'[proof_strategy] LLM call failed ({exc}), using recon default')
+            ec['proof_strategy'] = self._get_recon_default_proof_strategy(state)
+            finding['exploit_contract'] = ec
+
+        # Inject recon-derived docker_extra_deps into exploit_contract
+        # so docker_runner can install them before build/PoV execution.
+        _recon_deps = state.get('recon_docker_extra_deps') or []
+        if _recon_deps and not ec.get('docker_extra_deps'):
+            ec['docker_extra_deps'] = _recon_deps
+            finding['exploit_contract'] = ec
+
+        # Inject DB substitution env vars for web service targets
+        _db_env = state.get('recon_db_substitution_env') or {}
+        if _db_env and not ec.get('db_substitution_env'):
+            ec['db_substitution_env'] = _db_env
+            finding['exploit_contract'] = ec
 
         return state
 
@@ -1969,13 +3227,120 @@ class AgentGraph:
         
         self._log(state, f"Generating PoV for {finding['cwe_type']}...")
 
+        # Fast-fail for native targets when the build failed and no binary exists.
+        # This avoids wasting LLM tokens + docker cycles on findings that can never
+        # be confirmed because there is no ASan binary to drive.
+        _ec_gen = finding.get('exploit_contract') or {}
+        _runtime_gen = str(_ec_gen.get('runtime_profile') or self._infer_runtime_profile(finding, state) or '').lower()
+        if _runtime_gen in ('c', 'cpp', 'native', 'binary'):
+            _has_binary = bool(
+                str(_ec_gen.get('probe_binary_path') or '').strip()
+                or str(_ec_gen.get('target_binary') or '').strip()
+            )
+            _exec_surface = str(_ec_gen.get('execution_surface') or '').lower()
+            _is_library = _exec_surface == 'c_library_harness' or str(_ec_gen.get('repo_surface_class') or '').lower() in ('library_c', 'library_c_with_cli')
+            # Check if the Docker container's build prelude could still succeed
+            # (the probe might have failed for transient reasons like missing deps
+            # that the PoV script or the container's build commands can install).
+            _codebase_exists = bool(state.get('codebase_path') and os.path.isdir(state['codebase_path']))
+            _has_makefile = False
+            _has_cmake = False
+            if _codebase_exists:
+                _cb = state['codebase_path']
+                _has_makefile = any(os.path.isfile(os.path.join(_cb, mf)) for mf in ('Makefile', 'makefile', 'GNUmakefile'))
+                _has_cmake = os.path.isfile(os.path.join(_cb, 'CMakeLists.txt'))
+            # Task 3: Only fast-fail when there is truly no binary AND no library path.
+            # If a binary was found (probe_binary_path), proceed even with unknown entrypoint —
+            # the PoV can still exercise the binary with crafted input and the oracle
+            # can confirm via crash/ASan/behavioral evidence or contract-driven markers.
+            if not _has_binary and not _is_library:
+                if _codebase_exists and (_has_makefile or _has_cmake):
+                    # The codebase has a build system — the Docker container's build
+                    # prelude may succeed where the probe failed.  Allow PoV generation
+                    # to proceed; if the Docker build also fails, the finding will fail
+                    # at runtime (same outcome as not trying).
+                    self._log(state, f"  Warning: no binary found but build system detected — "
+                                     f"allowing PoV generation (Docker build may succeed)")
+                    finding.setdefault('failure_log', []).append({
+                        'stage': 'generation',
+                        'reason': 'No binary from probe but build system exists in codebase — '
+                                  'proceeding with PoV generation for Docker build attempt.',
+                    })
+                else:
+                    self._log(state, f"  Fast-fail: native target but no binary found (build failed). Skipping PoV generation.")
+                    finding['final_status'] = 'failed'
+                    finding['failure_reason'] = 'build_failed'
+                    finding.setdefault('failure_log', []).append({
+                        'stage': 'generation',
+                        'reason': 'Native target build failed — no binary available for PoV execution. '
+                                  'TARGET_BINARY would be empty, so all PoV attempts would fail.',
+                    })
+                    state['findings'][idx] = finding
+                    self._sync_findings_runtime(state, include_status=True)
+                    return state
+
+        # ── Issue 7: Clean skip for browser/DOM findings in non-web library repos ──
+        # Findings that require a browser or DOM environment (e.g. XSS in KaTeX,
+        # prototype pollution in a utility library) cannot be confirmed when the
+        # repo is a library with no running web server.  Skip them early with a
+        # descriptive status instead of letting them burn LLM tokens and fail.
+        _exec_surface_dom = str(_ec_gen.get('execution_surface') or '').lower()
+        _runtime_dom = _runtime_gen  # already lowered above
+        _repo_class = str(_ec_gen.get('repo_surface_class') or '').lower()
+        _cwe_id_dom = str(finding.get('cwe_id') or '')
+        _is_dom_surface = any(kw in _exec_surface_dom for kw in ('browser', 'dom', 'client_side', 'html'))
+        _is_xss_like = _cwe_id_dom in ('CWE-79', 'CWE-80', 'CWE-116')
+        _is_library_repo = 'library' in _repo_class or _repo_class in ('npm_package', 'pypi_package', 'crate')
+        _has_live_url = bool(str(_ec_gen.get('target_url') or '').strip())
+        if (_is_dom_surface or (_is_xss_like and _runtime_dom in ('javascript', 'node', 'typescript'))) \
+                and _is_library_repo and not _has_live_url:
+            # For XSS/prototype-pollution in library repos, the vulnerability is in the
+            # library code itself and can be triggered by importing the module and calling
+            # the vulnerable function directly.  Downgrade the surface to repo_script
+            # instead of blocking completely.
+            _cwe_num = _cwe_id_dom.replace('CWE-', '') if _cwe_id_dom.startswith('CWE-') else _cwe_id_dom
+            _is_exercisable_as_module = _cwe_num in ('79', '80', '116', '020', '1321', '400')
+            if _is_exercisable_as_module:
+                self._log(state, f"  Downgrade: browser/DOM finding in library repo — "
+                                 f"downgrading surface={_exec_surface_dom} to repo_script (cwe={_cwe_id_dom})")
+                # Downgrade the surface so PoV can use module-level execution
+                _ec_gen['execution_surface'] = 'repo_script'
+                _ec_gen.setdefault('proof_plan', {})['execution_surface'] = 'repo_script'
+                finding['exploit_contract'] = _ec_gen
+            else:
+                self._log(state, f"  Skip: browser/DOM finding in library repo with no live server. "
+                                 f"surface={_exec_surface_dom} cwe={_cwe_id_dom}")
+                finding['final_status'] = 'not_applicable'
+                finding['failure_reason'] = 'browser_dom_no_server'
+                finding.setdefault('failure_log', []).append({
+                    'stage': 'generation',
+                    'reason': 'Finding requires a browser/DOM environment but the repo is a '
+                              'library with no running web server. PoV cannot be confirmed.',
+                })
+                state['findings'][idx] = finding
+                self._sync_findings_runtime(state, include_status=True)
+                return state
+
         model_to_use = self._get_selected_model(state)
         self._log(state, f"Using selected model for PoV: {model_to_use}")
         
         verifier = get_verifier()
         audit = self._audit_finding_handoff(state, finding, phase='generation')
         if not audit.get('is_ready'):
-            self._log(state, f"Skipping PoV generation because contract gate failed: {(audit.get('issues') or [])[:2]}")
+            _finding_id = finding.get('id', 'unknown')
+            _finding_cwe = finding.get('cwe_id', 'unknown')
+            import logging as _gate_logger
+            _gate_logger.getLogger('autopov.gate').warning(
+                f"[GATE_BLOCK] scan={state.get('scan_id')} finding={_finding_id} "
+                f"cwe={_finding_cwe} issues={audit.get('issues')}"
+            )
+            self._log(state, f"[GATE_BLOCK] finding={_finding_id} cwe={_finding_cwe} "
+                      f"blocked: {(audit.get('issues') or [])[:3]}")
+            finding.setdefault('failure_log', []).append({
+                'stage': 'contract_gate',
+                'reason': list(audit.get('issues') or []),
+                'warnings': list(audit.get('warnings') or []),
+            })
             finding['validation_result'] = {
                 'is_valid': False,
                 'issues': list(audit.get('issues') or []),
@@ -1986,6 +3351,8 @@ class AgentGraph:
                 'unit_test_result': None,
             }
             finding['final_status'] = 'unproven_contract_gate'
+            finding['failure_reason'] = 'contract_gate'
+            finding['contract_gate_reasons'] = list(audit.get('issues') or [])
             state['findings'][idx] = finding
             self._sync_findings_runtime(state, include_status=True)
             return state
@@ -2084,7 +3451,7 @@ class AgentGraph:
             if not _obs_gen.get('setup_requirements'):
                 _obs_gen['setup_requirements'] = _contract_setup_reqs
         # Inject entrypoint_candidates so the generation prompt lists all known anchors.
-        # This helps the model pick the right TARGET_SYMBOL from the first attempt.
+        # This helps the model pick the right TARGET_BINARY from the first attempt.
         _ec_for_gen = finding.get('exploit_contract') or {}
         _ep_candidates = [str(c).strip() for c in (_ec_for_gen.get('entrypoint_candidates') or []) if str(c).strip()]
         if _ep_candidates:
@@ -2111,6 +3478,7 @@ class AgentGraph:
             probe_context=probe_context_str,
             repo_input_hints=state.get("repo_input_hints") or {},
             joern_context=finding.get("joern_context") or '',
+            recon_report=state.get('recon_report'),
         )
         
         # Log model and token info
@@ -2154,7 +3522,16 @@ class AgentGraph:
         if generation_succeeded:
             finding["pov_script"] = generated_script
             finding["execution_profile"] = ((result.get("exploit_contract") or {}).get("runtime_profile") or finding.get("execution_profile"))
+            # Store the PoV language selected by _select_pov_language() so the
+            # execution node can pass it to run_pov() and _detect_script_runtime()
+            # uses it as an authoritative hint (separate from the target language).
+            if result.get("pov_language"):
+                finding["pov_language"] = result["pov_language"]
+            # Preserve proof_strategy from v2 pipeline before overwriting contract
+            _prev_proof_strategy = (finding.get("exploit_contract") or {}).get("proof_strategy")
             finding["exploit_contract"] = result.get("exploit_contract")
+            if _prev_proof_strategy and isinstance(finding.get("exploit_contract"), dict):
+                finding["exploit_contract"]["proof_strategy"] = _prev_proof_strategy
             finding["pov_model_used"] = model_used
             finding["pov_model_mode"] = result.get("model_mode") or "unknown"
             finding["pov_context_window_chars"] = len(code_context)
@@ -2284,6 +3661,11 @@ class AgentGraph:
         else:
             issues = result.get("issues", [])
             self._log(state, f"  PoV validation failed: {issues[:2]}")  # Log first 2 issues
+            finding.setdefault('failure_log', []).append({
+                'stage': 'static_validation',
+                'reason': issues[:5],
+                'attempt': finding.get('retry_count', 0),
+            })
             finding["retry_count"] += 1
         
         # Store validation result in finding and carry it forward as structured proof feedback
@@ -2326,7 +3708,7 @@ class AgentGraph:
         _oracle_result = (runtime_result or {}).get('oracle_result') or {}
         _oracle_reason = str(_oracle_result.get('reason') or '').strip()
         _retry_count = int(finding.get('retry_count') or 0)
-        if _retry_count > 0 and _oracle_reason in {'no_oracle_match', 'path_not_relevant', 'ambiguous_signal'}:
+        if _retry_count > 0 and _oracle_reason in {'no_oracle_match', 'path_not_relevant', 'ambiguous_signal', 'strong_signal+path_not_relevant'}:
             _ec = dict(finding.get('exploit_contract') or {})
             _candidates = [str(c).strip() for c in (_ec.get('entrypoint_candidates') or []) if str(c).strip()]
             _current_ep = str(_ec.get('target_entrypoint') or '').strip()
@@ -2344,7 +3726,7 @@ class AgentGraph:
                     _ep_hint = (
                         f"ENTRYPOINT PROMOTION: previous target_entrypoint '{_current_ep}' produced no "
                         f"oracle match. Switching to next candidate: '{_next_ep}'. "
-                        f"Update TARGET_SYMBOL = {_next_ep!r} in your script. "
+                        f"The harness now sets TARGET_BINARY to the path of '{_next_ep}'. "
                         f"All candidates (ranked): {_candidates}."
                     )
                     if not any('entrypoint promotion' in e.lower() for e in validation_errors):
@@ -2373,30 +3755,118 @@ class AgentGraph:
             return state
 
         # ── Diversity forcing: detect repeated identical PoV output ────────────
-        # If the current PoV script is byte-for-byte identical to any previous
-        # attempt, the model is stuck in a loop. Inject a diversification hint
-        # so the next attempt uses a completely different approach.
+        # Uses a STRUCTURAL hash that extracts only exploit-significant patterns
+        # (subprocess calls, payloads, target binary refs, compile commands, imports)
+        # so that two scripts using the same broken approach but with different
+        # comments or variable names are correctly detected as duplicates.
         import hashlib as _hashlib
-        _current_pov_hash = _hashlib.md5(
-            str(finding.get('pov_script') or '').strip().encode()
-        ).hexdigest()
+        import re as _struct_re
+
+        def _structural_hash(script: str) -> str:
+            """Hash only exploit-significant patterns from a PoV script."""
+            if not script:
+                return _hashlib.md5(b'').hexdigest()
+            # Extract exploit-significant lines/patterns
+            _patterns = []
+            for line in script.splitlines():
+                stripped = line.strip()
+                # Skip empty lines and comments
+                if not stripped or stripped.startswith('#'):
+                    continue
+                # subprocess.run / Popen calls and arguments
+                if _struct_re.search(r'subprocess\.(run|Popen|call|check_output|check_call)', stripped):
+                    _patterns.append(stripped)
+                # payload / buffer assignments
+                elif _struct_re.search(r'(payload|buffer|exploit|shellcode|PAYLOAD|BUFFER)\s*=', stripped):
+                    _patterns.append(stripped)
+                # TARGET_BINARY / TARGET_BIN references
+                elif _struct_re.search(r'TARGET_(BINARY|BIN|PROGRAM|EXE)', stripped):
+                    _patterns.append(stripped)
+                # compile commands (gcc, clang, cc invocations)
+                elif _struct_re.search(r'\b(gcc|g\+\+|clang|clang\+\+|cc)\b.*-o\b', stripped):
+                    _patterns.append(stripped)
+                # import statements
+                elif stripped.startswith('import ') or stripped.startswith('from '):
+                    _patterns.append(stripped)
+                # os.system / os.popen calls
+                elif _struct_re.search(r'os\.(system|popen|exec)', stripped):
+                    _patterns.append(stripped)
+            # Normalise whitespace and hash the structural skeleton
+            skeleton = '\n'.join(_patterns)
+            return _hashlib.md5(skeleton.encode()).hexdigest()
+
+        _current_pov_hash = _structural_hash(str(finding.get('pov_script') or ''))
         _prior_hashes = set()
+        # Issue #14: Also track payload hashes to detect same-approach-with-different-variable-names
+        _current_payload_hash = _hashlib.md5(
+            ''.join(
+                _struct_re.findall(r'(?:payload|buffer|exploit|data|content|input)\s*=\s*["\'](.{8,}?)["\']',
+                                   str(finding.get('pov_script') or ''), _struct_re.IGNORECASE)
+            ).encode()
+        ).hexdigest() if finding.get('pov_script') else ''
+        _prior_payload_hashes = set()
         for _hist_entry in (finding.get('refinement_history') or []):
-            _hist_pov = str(_hist_entry.get('pov_script') or '').strip()
+            _hist_pov = str(_hist_entry.get('pov_script') or '')
             if _hist_pov:
-                _prior_hashes.add(_hashlib.md5(_hist_pov.encode()).hexdigest())
-        if _current_pov_hash in _prior_hashes:
+                _prior_hashes.add(_structural_hash(_hist_pov))
+                # Issue #14: Also hash the payloads from the history
+                _hist_payload_hash = _hashlib.md5(
+                    ''.join(
+                        _struct_re.findall(r'(?:payload|buffer|exploit|data|content|input)\s*=\s*["\'](.{8,}?)["\']',
+                                           _hist_pov, _struct_re.IGNORECASE)
+                    ).encode()
+                ).hexdigest() if _hist_pov else ''
+                if _hist_payload_hash:
+                    _prior_payload_hashes.add(_hist_payload_hash)
+
+        # Check structural hash duplication
+        _is_duplicate = _current_pov_hash in _prior_hashes
+        # Issue #14: Also check payload hash duplication (same exploit data, different wrapper)
+        _is_same_payload = _current_payload_hash and _current_payload_hash in _prior_payload_hashes
+
+        if _is_duplicate or _is_same_payload:
             _subcmds_str = ', '.join(_known_subs) if _known_subs else 'the available subcommands'
             _diversity_hint = (
-                "CRITICAL: Your last attempt produced identical output to a previous attempt. "
+                "CRITICAL: Your last attempt produced structurally identical output to a previous attempt"
+                + (" (same exploit payload)" if _is_same_payload else "") + ". "
                 "You MUST use a completely different exploitation approach. "
                 "If the previous approach used argv/CLI flags, try stdin or file input instead. "
                 f"If the previous approach used one subcommand, try a different one from: {_subcmds_str}. "
-                "Change the payload type, input format, or entire exploit strategy."
+                "Change the payload type, input format, or entire exploit strategy. "
+                "Specific suggestions: (1) use a different input method (stdin vs file vs env var), "
+                "(2) try a different subcommand or command path, "
+                "(3) change the payload structure (e.g. longer/shorter data, different file format), "
+                "(4) if the binary reads config files, try poisoning a config file instead of direct input."
             )
             if not any('identical' in e.lower() or 'different approach' in e.lower() for e in validation_errors):
                 validation_errors = [_diversity_hint] + list(validation_errors)
             self._log(state, "  Identical PoV detected — injecting diversity hint")
+
+        # Issue #14: Force strategy change when the same oracle_reason repeats 3+ times
+        # This catches cases where the script changes slightly each time but hits the
+        # same failure mode (e.g. binary_ignored_input 3 times in a row).
+        _oracle_reasons_history = [
+            str((_h.get('oracle_reason') or '')).strip()
+            for _h in (finding.get('refinement_history') or [])
+        ]
+        if runtime_result:
+            _oracle_reasons_history.append(str((runtime_result.get('oracle_result') or {}).get('reason') or ''))
+        _recent_reasons = [r for r in _oracle_reasons_history[-4:] if r]
+        if len(_recent_reasons) >= 3:
+            _most_common = max(set(_recent_reasons), key=_recent_reasons.count)
+            if _recent_reasons.count(_most_common) >= 3:
+                _strategy_hint = (
+                    f"CRITICAL: The same failure reason '{_most_common}' has occurred 3+ times. "
+                    f"Your current approach is fundamentally flawed. You MUST change strategy entirely: "
+                    f"(1) if you've been using CLI arguments, switch to file-based input, "
+                    f"(2) if you've been using file input, try stdin, "
+                    f"(3) if the binary ignores your input, try a different subcommand, "
+                    f"(4) if you're targeting a library function, write a C harness that calls it directly, "
+                    f"(5) if you're getting format rejection, try a completely different payload format."
+                )
+                if not any('3+' in e or 'fundamentally flawed' in e.lower() for e in validation_errors):
+                    validation_errors = [_strategy_hint] + list(validation_errors)
+                self._log(state, f"  Repeated oracle reason '{_most_common}' 3+ times — forcing strategy change")
         # ─────────────────────────────────────────────────────────────────────
 
         # ── PoV Coordinator: stateful attempt-log analysis ───────────────────────────
@@ -2417,13 +3887,47 @@ class AgentGraph:
                 'pov_script': finding.get('pov_script') or '',
                 'oracle_reason': str((runtime_result.get('oracle_result') or {}).get('reason') or ''),
                 'exit_code': int(runtime_result.get('exit_code') or -1),
-                'stdout': str(runtime_result.get('stdout') or '')[:600],
-                'stderr': str(runtime_result.get('stderr') or '')[:600],
+                'stdout': str(runtime_result.get('stdout') or '')[:1200],
+                'stderr': str(runtime_result.get('stderr') or '')[:1200],
             })
 
         _coord_trace_ctx = str((finding.get('exploit_contract') or {}).get('trace_context') or '')
         _coord_contract = finding.get('exploit_contract') or {}
         model_to_use = self._get_selected_model(state)
+
+        # ── Strategy pivot: force different approach when stuck on same failure ───
+        # If the current attempt AND any previous attempt have the same oracle_reason,
+        # the model is repeating the same broken approach. Inject a strong pivot directive.
+        # Trigger earlier (after 1st repeat) to leave more retries for the new strategy.
+        _current_reason = str((runtime_result.get('oracle_result') or {}).get('reason') or '') if runtime_result else ''
+        if _current_reason and finding.get('retry_count', 0) >= 1:
+            _prev_reasons = [a.get('oracle_reason', '') for a in _coord_attempt_log[:-1]] if len(_coord_attempt_log) > 1 else []
+            if _current_reason in _prev_reasons:
+                _stuck_reason = _current_reason
+                _repeat_count = _prev_reasons.count(_stuck_reason) + 1
+                _pivot_hint = (
+                    f"CRITICAL: The last {_repeat_count} attempt(s) all failed with "
+                    f"'{_stuck_reason}'. You MUST use a completely different attack approach. "
+                    f"Change the execution surface, input method, or trigger mechanism entirely. "
+                    f"Do NOT make minor variations on the same strategy."
+                )
+                if not any('completely different attack' in e for e in validation_errors):
+                    validation_errors.insert(0, _pivot_hint)
+                self._log(state, f'  Strategy pivot triggered: stuck on {_stuck_reason} ({_repeat_count}x)')
+            # Also check the original condition (2+ in coord_attempt_log) for backward compat
+            elif len(_coord_attempt_log) >= 2:
+                _recent_reasons = [a.get('oracle_reason', '') for a in _coord_attempt_log[-2:]]
+                if _recent_reasons[0] and len(set(_recent_reasons)) == 1:
+                    _stuck_reason = _recent_reasons[0]
+                    _pivot_hint = (
+                        f"CRITICAL: The last {len(_recent_reasons)} attempts all failed with "
+                        f"'{_stuck_reason}'. You MUST use a completely different attack approach. "
+                        f"Change the execution surface, input method, or trigger mechanism entirely. "
+                        f"Do NOT make minor variations on the same strategy."
+                    )
+                    if not any('completely different attack' in e for e in validation_errors):
+                        validation_errors.insert(0, _pivot_hint)
+                    self._log(state, f'  Strategy pivot triggered: stuck on {_stuck_reason}')
 
         try:
             _coord_llm = get_verifier()._get_llm(model_to_use, purpose="general")
@@ -2453,6 +3957,7 @@ class AgentGraph:
                 finding['pov_result']['failure_category'] = 'coordinator_abandoned'
                 finding['pov_result']['oracle_reason'] = 'coordinator_abandoned'
                 # Clear pov_script so _should_run_pov routes to log_failure
+                finding['last_pov_script'] = finding.get('pov_script') or ''
                 finding['pov_script'] = ''
                 # Set retry_count to max so validate_pov also routes to log_failure
                 finding['retry_count'] = self._get_model_max_retries(state)
@@ -2558,6 +4063,7 @@ class AgentGraph:
             exploit_contract=finding.get("exploit_contract") or {},
             runtime_feedback=_refine_feedback,
             probe_context=probe_context_str,
+            recon_report=state.get('recon_report'),
         )
 
         # Track refinement in history with tokens
@@ -2613,7 +4119,14 @@ class AgentGraph:
         if result.get("success"):
             finding["pov_script"] = sanitize_pov_script(result["pov_script"])
             finding["execution_profile"] = ((result.get("exploit_contract") or {}).get("runtime_profile") or finding.get("execution_profile"))
+            # Carry forward pov_language from refinement result (if present) or keep existing
+            if result.get("pov_language"):
+                finding["pov_language"] = result["pov_language"]
+            # Preserve proof_strategy from v2 pipeline before overwriting contract
+            _prev_ps = (finding.get("exploit_contract") or {}).get("proof_strategy")
             finding["exploit_contract"] = result.get("exploit_contract") or finding.get("exploit_contract")
+            if _prev_ps and isinstance(finding.get("exploit_contract"), dict):
+                finding["exploit_contract"]["proof_strategy"] = _prev_ps
             finding["refinement_model_mode"] = result.get("model_mode", "unknown")
             finding["retry_count"] += 1
             self._log(state, f"  PoV refined successfully (attempt {finding['retry_count']})")
@@ -2622,7 +4135,25 @@ class AgentGraph:
         else:
             error_text = result.get('error') or 'Model did not return executable PoV code'
             self._log(state, f"  PoV refinement failed: {error_text}")
-            finding["retry_count"] += 1
+            _tb_text = result.get('traceback') or ''
+            if _tb_text:
+                self._log(state, f"  Traceback: {_tb_text[:500]}")
+            # Issue #15: Don't increment retry_count for infrastructure errors.
+            # Timeouts, Docker failures, and build failures are not the PoV script's
+            # fault — retrying the same (or slightly modified) script may succeed
+            # when the infrastructure issue is transient (e.g. container start race).
+            _prev_runtime = finding.get('pov_result') or {}
+            _is_infra_error = (
+                bool(_prev_runtime.get('proof_infrastructure_error'))
+                or str(_prev_runtime.get('failure_reason') or '').strip() in {
+                    'timeout', 'infrastructure_failure', 'docker-unavailable',
+                    'docker-image-prep-failed', 'archive-upload-failed', 'build_failed',
+                }
+            )
+            if _is_infra_error:
+                self._log(state, "  Infrastructure error detected — not incrementing retry_count")
+            else:
+                finding["retry_count"] += 1
         
         state["findings"][idx] = finding
         self._sync_findings_runtime(state, include_status=True)
@@ -2756,7 +4287,7 @@ class AgentGraph:
                 "stderr": "No PoV script generated",
                 "exit_code": -1,
                 "execution_time_s": 0,
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }
             state["findings"][idx] = finding
             self._sync_findings_runtime(state, include_status=True)
@@ -2780,6 +4311,13 @@ class AgentGraph:
             if not _ec.get("repo_name"):
                 _repo_url = state.get("repo_url") or ""
                 _ec["repo_name"] = _repo_url.rstrip("/").split("/")[-1].lower()
+            # Inject recon-derived Docker/runtime hints so docker_runner can make
+            # intelligent decisions without hardcoding
+            _recon = state.get('recon_report') or {}
+            if _recon and not _ec.get('recon_docker_image'):
+                _ec['recon_docker_image'] = _recon.get('docker_image', '')
+                _ec['recon_runtime_family'] = _recon.get('runtime_family', '')
+                _ec['recon_build_commands'] = _recon.get('build_commands', [])
             result = runner.run_pov(
                 pov_script=finding["pov_script"],
                 scan_id=state["scan_id"],
@@ -2788,6 +4326,7 @@ class AgentGraph:
                 target_language=target_language,
                 exploit_contract=_ec,
                 codebase_path=state.get("codebase_path"),
+                pov_language=finding.get("pov_language"),
             )
             finding["pov_result"] = result
 
@@ -2914,10 +4453,36 @@ class AgentGraph:
         idx = state.get("current_finding_idx", 0)
         if idx < len(state["findings"]):
             state["findings"][idx]["final_status"] = "confirmed"
+            state["findings"][idx]["confirmed"] = True
+            # Clear contradictory failure metadata from pov_result
+            _pr = state["findings"][idx].get("pov_result")
+            if isinstance(_pr, dict) and _pr.get("vulnerability_triggered"):
+                _pr.pop("failure_reason", None)
+                _pr.pop("failure_category", None)
+                _pr["proof_verdict"] = "proven"
+            state["findings"][idx].pop("failure_reason", None)
+            # ── Generate post-confirmation proof narrative ──
+            # Uses the LLM to write a dense, evidence-based paragraph describing
+            # what was identified, how it was exploited, and the observed outcome.
+            try:
+                from agents.investigator import get_investigator
+                _inv = get_investigator()
+                _narrative = _inv.generate_proof_narrative(
+                    finding=state["findings"][idx],
+                    model_name=self._get_selected_model(state),
+                    api_key_override=state.get("openrouter_api_key"),
+                )
+                if _narrative:
+                    state["findings"][idx]["proof_narrative"] = _narrative
+                    self._log(state, f"Generated proof narrative for finding {idx} ({len(_narrative)} chars)")
+            except Exception as _narr_err:
+                self._log(state, f"Proof narrative generation failed (non-critical): {_narr_err}")
             self._sync_findings_runtime(state, include_status=True)
             # Track confirmed count for early termination
             state["confirmed_count"] = state.get("confirmed_count", 0) + 1
             self._log(state, f"Confirmed vulnerability #{state['confirmed_count']}: {state['findings'][idx].get('cwe_type', 'UNCLASSIFIED')}")
+            # ── Record strategy outcome to learning stores ──
+            self._record_outcome_to_stores(state, state["findings"][idx], success=True)
         
         # Move to next finding
         state["current_finding_idx"] = idx + 1
@@ -2928,7 +4493,7 @@ class AgentGraph:
             pass
         else:
             state["status"] = ScanStatus.COMPLETED
-            state["end_time"] = datetime.utcnow().isoformat()
+            state["end_time"] = datetime.now(timezone.utc).isoformat()
         
         return state
     
@@ -2947,7 +4512,7 @@ class AgentGraph:
             pass
         else:
             state["status"] = ScanStatus.COMPLETED
-            state["end_time"] = datetime.utcnow().isoformat()
+            state["end_time"] = datetime.now(timezone.utc).isoformat()
         
         return state
     
@@ -2956,7 +4521,18 @@ class AgentGraph:
         idx = state.get("current_finding_idx", 0)
         if idx < len(state["findings"]):
             finding = state["findings"][idx]
-            finding["final_status"] = "failed"
+            # Distinguish validation-blocked from execution-failed
+            pov_result = finding.get("pov_result") or {}
+            had_pov = bool((finding.get("pov_script") or "").strip() or finding.get("last_pov_script"))
+            reached_docker = bool(pov_result.get("execution_time_s") or pov_result.get("exit_code") is not None)
+            if finding.get("final_status") in ("unproven", "unproven_timeout"):
+                pass  # already set by coordinator/timeout
+            elif not had_pov:
+                finding["final_status"] = "failed_no_pov"
+            elif not reached_docker:
+                finding["final_status"] = "failed_validation"
+            else:
+                finding["final_status"] = "failed"
             # Stamp a human-readable failure_reason so analysis scripts and the
             # frontend can surface why every failed finding didn't get proved.
             if not finding.get("failure_reason"):
@@ -2980,9 +4556,35 @@ class AgentGraph:
                 elif stdout:
                     finding["failure_reason"] = f"runtime_stdout_only: {stdout[:200]}"
                 else:
-                    finding["failure_reason"] = "pov_ran_no_crash_detected"
+                    # PoV ran but produced no observable crash output.
+                    # Distinguish sub-cases to give better feedback and help
+                    # the refinement loop understand what went wrong.
+                    _exit_code = pov_result.get('exit_code')
+                    _exec_time = pov_result.get('execution_time_s') or 0
+                    _env_kind = (pov_result.get('metadata') or {}).get('environment_kind') or (pov_result.get('oracle_result') or {}).get('environment_kind') or ''
+                    if _exit_code is not None and _exit_code == 0 and _exec_time < 2:
+                        # Script exited cleanly almost instantly — likely a guard/bail
+                        # (e.g. "binary not found") or the exploit logic was a no-op.
+                        finding["failure_reason"] = "pov_exited_cleanly_no_output"
+                    elif _exit_code is not None and _exit_code not in (0, -1, 124):
+                        # Non-zero exit but no captured output — Docker may have lost
+                        # the stderr (known issue with container.logs() on crash).
+                        finding["failure_reason"] = f"pov_crash_no_output(exit={_exit_code})"
+                    elif _exit_code == 124 or (_exec_time and _exec_time > 55):
+                        # Timeout — script ran for the full container timeout without
+                        # producing observable output. Common with server-type PoVs.
+                        finding["failure_reason"] = "pov_timeout_no_output"
+                    elif _env_kind in ('node', 'python') and _exit_code == 0:
+                        # Non-native target: PoV ran the HTTP/module logic but the
+                        # oracle didn't observe behavioral evidence. This is different
+                        # from a native crash — the PoV needs a better observable.
+                        finding["failure_reason"] = f"pov_no_observable_evidence(env={_env_kind})"
+                    else:
+                        finding["failure_reason"] = "pov_ran_no_crash_detected"
             state["findings"][idx] = finding
             self._sync_findings_runtime(state, include_status=True)
+            # ── Record failure outcome to learning stores ──
+            self._record_outcome_to_stores(state, finding, success=False)
         
         # Move to next finding
         state["current_finding_idx"] = idx + 1
@@ -2991,10 +4593,64 @@ class AgentGraph:
             pass
         else:
             state["status"] = ScanStatus.COMPLETED
-            state["end_time"] = datetime.utcnow().isoformat()
+            state["end_time"] = datetime.now(timezone.utc).isoformat()
         
         return state
     
+    # ------------------------------------------------------------------
+    # Outcome recording — closes the learning feedback loop
+    # ------------------------------------------------------------------
+    def _record_outcome_to_stores(self, state: ScanState, finding: dict, success: bool) -> None:
+        """Record exploit outcome to RepoMemory and LearningStore (non-fatal)."""
+        try:
+            _ec = finding.get('exploit_contract') or {}
+            _cwe = finding.get('cwe_type', 'UNCLASSIFIED')
+            _model = finding.get('pov_model') or state.get('model_name', '')
+            _scan_id = state.get('scan_id', '')
+            _cost = 0.0
+            for u in (state.get('scan_openrouter_usage') or []):
+                _cost += float(u.get('cost', 0) or 0)
+            # LearningStore — track PoV outcome per model/CWE
+            try:
+                from app.learning_store import LearningStore
+                _ls = LearningStore()
+                _validation_method = _ec.get('proof_strategy', {}).get('proof_type', 'crash_signal') if isinstance(_ec.get('proof_strategy'), dict) else str(_ec.get('proof_strategy', 'crash_signal'))
+                _ls.record_pov(
+                    scan_id=_scan_id,
+                    cwe=_cwe,
+                    model=_model,
+                    cost_usd=_cost,
+                    success=success,
+                    validation_method=_validation_method,
+                )
+            except Exception as _ls_err:
+                logger.debug('LearningStore.record_pov failed (non-fatal): %s', _ls_err)
+            # RepoMemory — record strategy outcome for cross-scan learning
+            try:
+                from agents.repo_memory import get_repo_memory
+                _mem = get_repo_memory()
+                _repo_name = (state.get('repo_profile') or {}).get('repo_name', '')
+                if not _repo_name:
+                    _repo_name = state.get('repo_name', '') or state.get('scan_id', '')
+                _strategy_name = ''
+                _ps = _ec.get('proof_strategy') or {}
+                if isinstance(_ps, dict):
+                    _strategy_name = f"{_ps.get('proof_type', 'crash_signal')}|{_ps.get('harness_type', 'subprocess_binary')}"
+                else:
+                    _strategy_name = str(_ps)
+                _mem.record_strategy_outcome(
+                    repo_name=_repo_name,
+                    strategy_name=_strategy_name,
+                    outcome='success' if success else 'failure',
+                    finding_cwe=_cwe,
+                    details=finding.get('failure_reason', '') if not success else 'confirmed',
+                    scan_id=_scan_id,
+                )
+            except Exception as _mem_err:
+                logger.debug('RepoMemory.record_strategy_outcome failed (non-fatal): %s', _mem_err)
+        except Exception as _outer_err:
+            logger.debug('_record_outcome_to_stores failed (non-fatal): %s', _outer_err)
+
     def _should_generate_pov(self, state: ScanState) -> str:
         """Determine if we should generate PoV for current finding"""
         idx = state.get("current_finding_idx", 0)
@@ -3010,7 +4666,7 @@ class AgentGraph:
             for i in range(idx, len(state["findings"])):
                 state["findings"][i]["final_status"] = "skipped_early_stop"
             state["status"] = ScanStatus.COMPLETED
-            state["end_time"] = datetime.utcnow().isoformat()
+            state["end_time"] = datetime.now(timezone.utc).isoformat()
             self._update_scan_runtime(state,
                 status=ScanStatus.COMPLETED,
                 end_time=state["end_time"],
@@ -3043,8 +4699,8 @@ class AgentGraph:
         # Trust high-confidence findings from static analyzers (CodeQL, Semgrep)
         # Skip re-investigation if confidence >= 0.8 and source is a trusted static analyzer
         trusted_sources = {"codeql", "semgrep"}
-        if source in trusted_sources and confidence >= 0.8 and verdict in ["UNKNOWN", ""]:
-            self._log(state, f"Finding {idx} from {source} has high confidence ({confidence:.2f}), trusting static analysis result")
+        if source in trusted_sources and confidence >= 0.8 and verdict in ["UNKNOWN", "", "FALSE_POSITIVE"]:
+            self._log(state, f"Finding {idx} from {source} has high confidence ({confidence:.2f}), overriding verdict={verdict} → REAL")
             # Mark as REAL to proceed to PoV generation
             finding["llm_verdict"] = "REAL"
             finding["llm_explanation"] = f"Trusted finding from {source} static analysis with {confidence:.0%} confidence"
@@ -3062,6 +4718,12 @@ class AgentGraph:
                 self._log(state, f"Proof budget reached ({settings.PROOF_MAX_FINDINGS}); recording finding without runtime proof")
                 return "log_skip"
             state["proofs_attempted"] = state.get("proofs_attempted", 0) + 1
+            # T6: Record per-finding start timestamp on first attempt so the
+            # per-finding timeout can be enforced across all retries.
+            import time as _time_t6
+            if not finding.get('_finding_start_ts'):
+                finding['_finding_start_ts'] = _time_t6.time()
+                state['findings'][idx] = finding
             self._log(state, f"Finding {idx} is REAL and above proof threshold ({confidence:.2f} >= {proof_threshold:.2f}); generating PoV")
             self._update_scan_runtime(state, status=ScanStatus.GENERATING_POV, progress=min(92, 50 + idx * 3))
             return "generate_pov"
@@ -3088,6 +4750,20 @@ class AgentGraph:
         if not pov_script:
             self._log(state, "No PoV script available after generation/validation; marking finding as failed")
             return "log_failure"
+
+        # T6 — Per-finding timeout: if elapsed time across all retries exceeds
+        # FINDING_TIMEOUT_MINUTES, abandon this finding and move to the next one.
+        import time as _time_pov
+        _finding_timeout_m = int(settings.FINDING_TIMEOUT_MINUTES or 0)
+        if _finding_timeout_m > 0:
+            _fstart = finding.get('_finding_start_ts')
+            if _fstart and (_time_pov.time() - float(_fstart)) > _finding_timeout_m * 60:
+                _elapsed_m = (_time_pov.time() - float(_fstart)) / 60
+                self._log(state, f"Finding {idx} exceeded per-finding timeout ({_elapsed_m:.1f}/{_finding_timeout_m} min); marking unproven_timeout")
+                finding['final_status'] = 'unproven_timeout'
+                state['findings'][idx] = finding
+                self._sync_findings_runtime(state, include_status=True)
+                return 'log_failure'
         
         # Check if validation passed
         if validation_result.get("is_valid"):
@@ -3112,11 +4788,78 @@ class AgentGraph:
             return "log_confirmed"
         failure_category = str((pov_result or {}).get("failure_category") or "")
         oracle_reason = str((pov_result or {}).get("oracle_reason") or "")
-        retryable_failures = {"guardrail_rejected", "path_exercised_no_oracle", "oracle_not_observed", "execution_error"}
-        # Also retry 'exploit' failures when the oracle saw nothing (no_oracle_match / self_report_only):
-        # the script likely failed due to wrong invocation (e.g. --help rejected), and
-        # a refinement pass now has known_subcommands in the contract so can do better.
-        if failure_category == "exploit" and oracle_reason in {"no_oracle_match", "self_report_only"}:
+        # Record oracle/runtime failure in unified failure_log
+        finding.setdefault('failure_log', []).append({
+            'stage': 'oracle',
+            'failure_category': failure_category,
+            'oracle_reason': oracle_reason,
+            'exit_code': (pov_result or {}).get('exit_code'),
+            'attempt': finding.get('retry_count', 0),
+        })
+        state['findings'][idx] = finding
+        retryable_failures = {
+            "guardrail_rejected", "path_exercised_no_oracle", "oracle_not_observed",
+            "execution_error", "environment_failure",
+        }
+        # Guard: if the oracle explicitly says path_relevant=False, the executed binary
+        # does not contain the vulnerable code. Refinement will never fix this — skip retry.
+        # EXCEPTION (Issue #5): when the signal is strong (real ASan crash) but the path
+        # anchor didn't match, the crash IS real — just hitting a different code path.
+        # Allow retry in this case so the PoV can be refined to target the correct binary.
+        _oracle_result_dict = (pov_result or {}).get('oracle_result') or {}
+        _oracle_reason_str = str(_oracle_result_dict.get('reason') or '')
+        if _oracle_result_dict.get('path_relevant') is False:
+            if _oracle_reason_str == 'strong_signal+path_not_relevant':
+                # Strong crash detected but wrong binary/path — allow retry with
+                # entrypoint promotion so the refiner can target the right binary.
+                self._log(state, f"Runtime proof path_relevant=False but strong sanitizer crash — allowing retry for binary redirection.")
+            elif _oracle_result_dict.get('signal_class') == 'strong':
+                # Strong crash evidence (sanitizer/crash signals in output) but no path anchor.
+                # This commonly happens with stripped binaries where the crash output doesn't
+                # contain source file paths.  Allow a "probable confirmation" with a caveat.
+                # The guard no longer requires matched_evidence_markers because stripped
+                # binaries and monolithic builds often don't produce extractable markers
+                # even when ASan/UBSan reports a genuine crash.
+                _has_crash_output = bool(
+                    _oracle_result_dict.get('matched_evidence_markers')
+                    or 'addresssanitizer' in str((pov_result or {}).get('stderr', '')).lower()
+                    or 'undefinedbehaviorsanitizer' in str((pov_result or {}).get('stderr', '')).lower()
+                    or 'segmentation fault' in str((pov_result or {}).get('stderr', '')).lower()
+                    or 'runtime error:' in str((pov_result or {}).get('stderr', '')).lower()
+                    or 'error: addresssanitizer' in str((pov_result or {}).get('stdout', '')).lower()
+                )
+                if _has_crash_output:
+                    self._log(state, f"Runtime proof path_relevant=False but strong crash evidence — probable confirmation (stripped binary?)")
+                    finding['final_status'] = 'confirmed_path_unknown'
+                    finding['pov_result'] = dict(finding.get('pov_result') or {})
+                    finding['pov_result']['vulnerability_triggered'] = True
+                    finding['pov_result']['oracle_reason'] = 'strong_evidence_no_path_anchor'
+                    finding['pov_result']['path_relevant'] = False
+                    state['findings'][idx] = finding
+                    self._sync_findings_runtime(state, include_status=True)
+                    return "log_confirmed"
+                else:
+                    # Strong signal_class but no actual crash output captured —
+                    # the signal may have been misclassified. Allow retry.
+                    self._log(state, f"Runtime proof path_relevant=False, signal_class=strong but no crash output captured — allowing retry.")
+            else:
+                self._log(state, f"Runtime proof path_relevant=False — target binary does not contain vulnerable code. Skipping retry.")
+                finding['failure_reason'] = 'Target binary does not contain the vulnerable code path (path_relevant=False)'
+                state['findings'][idx] = finding
+                return "log_failure"
+        # Also retry 'exploit' failures when the oracle saw nothing or produced a
+        # retryable reason.  After expanding _normalize_oracle_reason (Task 1),
+        # these specific reasons flow through instead of being collapsed to
+        # no_oracle_match, so each must be listed explicitly.
+        if failure_category == "exploit" and oracle_reason in {
+            "no_oracle_match", "self_report_only",
+            "path_not_relevant", "strong_signal_no_target",
+            "strong_signal+path_not_relevant",  # Issue #5: real crash, wrong binary — retry with different binary
+            "binary_ignored_input", "setup_stage_only",
+            "no_behavioral_evidence",  # behavioral findings should get refinement
+            "self_reported_marker_without_crash_evidence",  # PoV was close — ran binary, checked for crash, but binary exited cleanly
+            "contract_matched+no_anchor",  # contract markers found but binary name not in output — refinement can add it
+        }:
             retryable_failures = retryable_failures | {"exploit"}
         # Also retry 'exploit' failures when oracle_reason='non_evidence' — this happens when the
         # PoV ran the wrong executable (e.g. 'make' instead of the target binary) and stdout was
@@ -3129,7 +4872,31 @@ class AgentGraph:
         # the correct format hint (XML for xmlwf, JSON for cjson, etc.) may trigger the vuln.
         if failure_category == "exploit" and oracle_reason == "ambiguous_signal":
             retryable_failures = retryable_failures | {"exploit"}
+        # T2 — Retry when PoV self-compiled the binary: the refinement will get an explicit
+        # hint to use TARGET_BINARY directly instead of rebuilding.
+        _oracle_result_dict = (pov_result or {}).get('oracle_result') or {}
+        if _oracle_result_dict.get('reason') == 'self_compile_blocked' or oracle_reason == 'self_compile_blocked':
+            retryable_failures = retryable_failures | {"exploit"}
+        # T3 — Retry when the PoV exited cleanly with no output or produced no
+        # observable evidence for non-native targets.  The refinement loop can
+        # add explicit print/assert statements or better oracle observables.
+        _failure_reason = str(finding.get('failure_reason') or '')
+        if _failure_reason in ('pov_exited_cleanly_no_output', 'pov_timeout_no_output') \
+                or _failure_reason.startswith('pov_no_observable_evidence'):
+            retryable_failures = retryable_failures | {"exploit"}
         if failure_category in retryable_failures and finding.get("retry_count", 0) < self._get_model_max_retries(state):
+            # T6 — Per-finding timeout check before scheduling another retry
+            import time as _time_refine
+            _ft_m = int(settings.FINDING_TIMEOUT_MINUTES or 0)
+            if _ft_m > 0:
+                _fst = finding.get('_finding_start_ts')
+                if _fst and (_time_refine.time() - float(_fst)) > _ft_m * 60:
+                    _el = (_time_refine.time() - float(_fst)) / 60
+                    self._log(state, f"Finding {idx} per-finding timeout ({_el:.1f}/{_ft_m} min) before retry; marking unproven_timeout")
+                    finding['final_status'] = 'unproven_timeout'
+                    state['findings'][idx] = finding
+                    self._sync_findings_runtime(state, include_status=True)
+                    return 'log_failure'
             self._log(state, f"Runtime proof failed with {failure_category}; attempting refinement ({finding.get('retry_count', 0) + 1}/{self._get_model_max_retries(state)})")
             return "refine_pov"
         self._log(state, "Runtime proof did not trigger the vulnerability")
@@ -3141,13 +4908,66 @@ class AgentGraph:
         total = len(state["findings"])
         
         self._log(state, f"Checking for more findings: current={idx}, total={total}")
+
+        # Task 7: Scan-level timeout check
+        import time as _time_scan
+        _scan_timeout_s = int(settings.SCAN_TIMEOUT_S or 0)
+        _scan_start = state.get('_scan_start_ts')
+        if _scan_timeout_s > 0 and _scan_start:
+            _elapsed = _time_scan.time() - float(_scan_start)
+            if _elapsed > _scan_timeout_s:
+                _processed = sum(1 for f in state.get('findings', []) if f.get('final_status'))
+                self._log(state, f"SCAN TIMEOUT: {_elapsed:.0f}s > {_scan_timeout_s}s limit. "
+                          f"Processed {_processed}/{total} findings. Completing scan gracefully.")
+                state['timeout_note'] = f'Scan timed out after {_elapsed:.0f}s with {_processed}/{total} findings processed'
+                return "end"
         
         # Safety check: prevent infinite loop if idx is not advancing
         if idx >= total:
+            # ── Task 3: Second-chance LLM-guided discovery ──────────────────────
+            # When ALL findings were dismissed OR all attempted findings failed
+            # (none confirmed) AND this is a library repo, run a targeted LLM
+            # query to find real vulnerabilities in the core library code.
+            _any_confirmed = any(
+                f.get('final_status') == 'confirmed'
+                for f in state.get('findings', [])
+            )
+            _any_attempted_not_failed = any(
+                f.get('pov_script') and f.get('final_status') not in (
+                    'failed', 'non_evidence', 'contract_gate_failed',
+                    'unproven_contract_gate', 'unproven_low_confidence',
+                )
+                for f in state.get('findings', [])
+            )
+            _surface = state.get('repo_surface_class', '')
+            _already_ran_second_chance = state.get('_second_chance_ran', False)
+            if (not _any_confirmed
+                    and not _any_attempted_not_failed
+                    and _surface in ('library_c', 'library_c_with_cli', 'python_module', 'node_module', 'java_lib')
+                    and not _already_ran_second_chance
+                    and state.get('codebase_path')):
+                state['_second_chance_ran'] = True
+                new_findings = self._second_chance_discovery(state)
+                if new_findings:
+                    self._log(state, f"Second-chance discovery found {len(new_findings)} additional findings")
+                    state['findings'].extend(new_findings)
+                    # Don't advance idx — let the loop process these new findings
+                    return "investigate"
+            # ── End Task 3 ─────────────────────────────────────────────────────
+
             # All findings processed, mark as completed
             self._log(state, f"All {total} findings processed, completing scan")
+            # FIX-4: Clean up shared build volume created by probe
+            _scan_id = state.get('scan_id', '')
+            if _scan_id:
+                try:
+                    import docker as _docker_cleanup
+                    _dc = _docker_cleanup.from_env(timeout=10)
+                    _dc.volumes.get(f'autopov_build_{_scan_id}').remove(force=True)
+                except Exception:
+                    pass
             state["status"] = ScanStatus.COMPLETED
-            state["end_time"] = datetime.utcnow().isoformat()
+            state["end_time"] = datetime.now(timezone.utc).isoformat()
             self._update_scan_runtime(state,
                 status=ScanStatus.COMPLETED,
                 end_time=state["end_time"],
@@ -3298,8 +5118,8 @@ class AgentGraph:
             "observed_surface": observed_surface,
             "preflight": pov_result.get("preflight") or {},
             "baseline_result": pov_result.get("baseline_result") or {},
-            "stderr_excerpt": str(pov_result.get("stderr") or "")[:1200],
-            "stdout_excerpt": str(pov_result.get("stdout") or "")[:1200],
+            "stderr_excerpt": str(pov_result.get("stderr") or "")[:3000],
+            "stdout_excerpt": str(pov_result.get("stdout") or "")[:3000],
             "proof_summary": pov_result.get("proof_summary") or ((pov_result.get("evidence") or {}).get("summary")),
         }
         # Task 6: Expose oracle_reason, retry_count, preflight_subcommands as top-level keys
@@ -3308,12 +5128,49 @@ class AgentGraph:
             ((pov_result.get("oracle_result") or {}).get("reason"))
         feedback["retry_count"] = finding.get("retry_count", 0)
         feedback["preflight_subcommands"] = pov_result.get("preflight_subcommands") or []
+        # Inject structured signal_detail (crash_type, actionable_hint, recovery_strategy)
+        _sig_detail = finding.get('_signal_detail')
+        if not _sig_detail:
+            # Fallback: compute signal_detail from pov_result if available
+            _rr = pov_result or {}
+            _stderr_fb = str(_rr.get('stderr') or '')
+            _stdout_fb = str(_rr.get('stdout') or '')
+            _ec_fb = int(_rr.get('exit_code') or -1)
+            if _stderr_fb or _stdout_fb:
+                try:
+                    from agents.oracle_policy import classify_signal_detailed
+                    _sd_fb = classify_signal_detailed(_stdout_fb, _stderr_fb, _ec_fb)
+                    if _sd_fb.recovery_strategy != 'success':
+                        _sig_detail = {
+                            'crash_type': _sd_fb.crash_type,
+                            'reason': _sd_fb.reason,
+                            'actionable_hint': _sd_fb.actionable_hint,
+                            'recovery_strategy': _sd_fb.recovery_strategy,
+                        }
+                except Exception:
+                    pass
+        if _sig_detail and isinstance(_sig_detail, dict):
+            feedback["signal_detail"] = _sig_detail
         issues = list((validation_result.get("issues") or []))
         if feedback.get("failure_category"):
             issues.append(f"Runtime failure category: {feedback['failure_category']}")
         oracle_reason = feedback.get("oracle_reason")
         if oracle_reason and oracle_reason != 'oracle_matched':
             issues.append(f"Runtime oracle result: {oracle_reason}")
+        # Task 5: Strategy recommendation based on oracle_reason
+        if oracle_reason == 'binary_ignored_input':
+            _retry = feedback.get('retry_count', 0)
+            if _retry >= 2:
+                issues.append(
+                    "STRATEGY: After multiple failed attempts, this binary is likely a TEST RUNNER "
+                    "that ignores external input. Switch to writing a C harness that directly calls "
+                    "the vulnerable function from the library headers. Compile with ASan flags."
+                )
+            else:
+                issues.append(
+                    "STRATEGY: The binary ignored your input entirely. Try a different subcommand "
+                    "or pass input as a file argument instead of stdin."
+                )
         stderr_excerpt = feedback.get("stderr_excerpt")
         if stderr_excerpt:
             issues.append(f"Runtime stderr excerpt: {stderr_excerpt[:240]}")
@@ -3322,7 +5179,7 @@ class AgentGraph:
 
     def _log(self, state: Optional[ScanState], message: str):
         """Add log message to state and stream to scan manager in real-time"""
-        timestamp = datetime.utcnow().isoformat()
+        timestamp = datetime.now(timezone.utc).isoformat()
         log_entry = f"[{timestamp}] {message}"
         
         # Only append to state if state is not None
@@ -3448,7 +5305,7 @@ class AgentGraph:
             repo_url=repo_url,
             target_metadata=target_metadata,
             current_finding_idx=0,
-            start_time=datetime.utcnow().isoformat(),
+            start_time=datetime.now(timezone.utc).isoformat(),
             end_time=None,
             total_cost_usd=0.0,
             total_tokens=0,
@@ -3463,6 +5320,9 @@ class AgentGraph:
             scan_openrouter_usage=[],
             probe_result=None,
             trace_result=None,
+            recon_high_value_files=None,
+            recon_historical_vuln_types=None,
+            recon_repo_activity=None,
         )
         
         # Run the graph with recursion limit

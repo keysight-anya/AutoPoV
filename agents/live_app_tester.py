@@ -6,10 +6,12 @@ Tests PoV scripts against running web applications
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import requests
+
+from agents.oracle_policy import evaluate_live_proof_outcome
 
 
 @dataclass
@@ -164,63 +166,60 @@ class LiveAppTester:
             return {"success": False, "error": str(e), "status_code": 0, "response": ""}
 
     def _analyze_response(self, result: Dict[str, Any], cwe_type: str, exploit_contract: Dict[str, Any]) -> Dict[str, Any]:
+        """Delegate response analysis to the centralized oracle_policy engine."""
         response = result.get("response", "")
         status_code = result.get("status_code", 0)
         response_lower = response.lower()
-        evidence: List[str] = []
-        triggered = False
-        confidence = "low"
+
+        # Build evidence markers from contract indicators + response content
+        evidence_markers: List[str] = []
         for indicator in exploit_contract.get("success_indicators", []) or []:
             if str(indicator).strip() and str(indicator).lower() in response_lower:
-                evidence.append(f"Success indicator observed: {indicator}")
-                triggered = True
-                confidence = "high"
+                evidence_markers.append(f"Success indicator observed: {indicator}")
         for effect in exploit_contract.get("side_effects", []) or []:
             if str(effect).strip() and str(effect).lower() in response_lower:
-                evidence.append(f"Expected side effect observed: {effect}")
-                triggered = True
-                confidence = "high"
-        if cwe_type == "CWE-79" and ("<script>" in response or "alert(" in response or "onerror=" in response_lower):
-            evidence.append("XSS payload reflected in response without encoding")
-            triggered = True
-            confidence = "medium" if confidence == "low" else confidence
-        elif cwe_type == "CWE-89":
-            for error in ["sql syntax", "mysql_fetch", "pg_query", "sqlite3", "ora-", "odbc driver", "jdbc"]:
-                if error in response_lower:
-                    evidence.append(f"SQL error message detected: {error}")
-                    triggered = True
-                    confidence = "high"
-                    break
-        elif cwe_type == "CWE-22":
-            for indicator in ["root:x:", "etc/passwd", "boot.ini", "[boot loader]"]:
-                if indicator in response_lower:
-                    evidence.append(f"File content detected: {indicator}")
-                    triggered = True
-                    confidence = "high"
-                    break
-        elif cwe_type == "CWE-78":
-            for indicator in ["uid=", "gid=", "root:", "bin/bash", "windows"]:
-                if indicator in response_lower:
-                    evidence.append(f"Command output detected: {indicator}")
-                    triggered = True
-                    confidence = "high"
-                    break
+                evidence_markers.append(f"Expected side effect observed: {effect}")
+        # Server error is always evidence
         if status_code >= 500:
-            evidence.append(f"Server error (status {status_code}) - possible crash")
-            triggered = True
-            if confidence == "low":
-                confidence = "medium"
-        return {"triggered": triggered, "evidence": evidence, "confidence": confidence}
+            evidence_markers.append(f"Server error (status {status_code}) - possible crash")
+
+        # Delegate to centralized oracle for consistent evaluation
+        oracle_result = evaluate_live_proof_outcome(
+            evidence_markers=evidence_markers,
+            target_route=exploit_contract.get("target_route", ""),
+            target_dom_selector=exploit_contract.get("target_dom_selector", ""),
+            target_url=exploit_contract.get("target_url", ""),
+            response_preview=response[:2000],
+            pov_script=exploit_contract.get("_pov_script", ""),
+            stage="trigger",
+            runtime_family="http",
+        )
+
+        triggered = oracle_result.get("triggered", False)
+        # Map oracle confidence to our confidence levels
+        if triggered:
+            confidence = "high" if not oracle_result.get("self_report_only") else "low"
+        elif evidence_markers:
+            confidence = "medium"
+        else:
+            confidence = "low"
+
+        return {
+            "triggered": triggered,
+            "evidence": oracle_result.get("matched_evidence_markers", evidence_markers),
+            "confidence": confidence,
+            "oracle_result": oracle_result,
+        }
 
     def test_against_live_app(self, pov_script: str, cwe_type: str, target_config: Dict[str, Any], scan_id: str, exploit_contract: Optional[Dict[str, Any]] = None) -> LiveTestResult:
-        start_time = datetime.utcnow()
+        start_time = datetime.now(timezone.utc)
         try:
             exploit_config = self._build_request_config(pov_script, target_config, exploit_contract or {})
             if not exploit_config.get("url"):
                 return LiveTestResult(False, False, target_config.get("url", ""), 0, 0, "", [], "low", "Could not derive live exploit request target")
             result = self._send_exploit_request(exploit_config)
             analysis = self._analyze_response(result, cwe_type, exploit_contract or {})
-            end_time = datetime.utcnow()
+            end_time = datetime.now(timezone.utc)
             test_result = LiveTestResult(
                 success=result.get("success", False),
                 vulnerability_triggered=analysis["triggered"],

@@ -10,7 +10,7 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Dict, Optional, Any
-from datetime import datetime
+from datetime import datetime, timezone
 import requests
 
 try:
@@ -47,7 +47,7 @@ class ApplicationRunner:
             "url": url,
             "port": port,
             "app_path": app_path,
-            "started_at": datetime.utcnow().isoformat(),
+            "started_at": datetime.now(timezone.utc).isoformat(),
             "type": app_type,
         }
         self.running_apps[scan_id] = app_info
@@ -402,6 +402,15 @@ class ApplicationRunner:
                     score += 5
                 if '/build/' in lower_path or '/src/' in lower_path or '/bin/' in lower_path:
                     score += 2
+                # Task 4: Deprioritize test/example/demo binaries — they rarely exercise
+                # vulnerable code paths in library repos. When the vulnerable file is
+                # a library source (e.g. cJSON.c), these should not be the primary target.
+                _TEST_BINARY_NAMES = ('_test', 'test_', 'readme_', 'example_', 'sample_', 'demo_', 'bench_', 'fuzz_', '_demo', '_example', '_sample', '_bench')
+                _TEST_PATH_TOKENS = ('/tests/', '/test/', '/examples/', '/example/', '/samples/', '/fuzz/', '/bench/', '/demos/')
+                if any(t in lower_name for t in _TEST_BINARY_NAMES):
+                    score -= 8
+                if any(t in lower_path for t in _TEST_PATH_TOKENS):
+                    score -= 5
                 score += int(st.st_mtime)
                 candidates.append((score, full))
         candidates.sort(reverse=True)

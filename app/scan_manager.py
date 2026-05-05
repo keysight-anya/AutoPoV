@@ -11,7 +11,7 @@ import threading
 import shutil
 from typing import Dict, Any, List, Optional, Callable, Tuple
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, asdict, fields
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -54,6 +54,7 @@ class ScanResult:
     scan_openrouter_usage: Optional[List[Dict[str, Any]]] = None
     models_used: Optional[List[Dict[str, Any]]] = None
     probe_result: Optional[Dict[str, Any]] = None  # Scan-level preflight probe result
+    recon_report: Optional[Dict[str, Any]] = None  # Scan-level reconnaissance report
     
     def __post_init__(self):
         if self.logs is None:
@@ -134,7 +135,7 @@ class ScanManager:
             "cwes": cwes,
             "triggered_by": triggered_by,
             "lite": lite,
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
             "logs": [],
             "progress": 0,
             "result": None,
@@ -235,7 +236,7 @@ class ScanManager:
                 if status in {'running', 'checking', 'cloning', 'created', 'ingesting', 'investigating', 'generating_pov', 'validating_pov', 'running_pov'}:
                     data['status'] = 'interrupted'
                     logs = data.setdefault('logs', [])
-                    logs.append(f"[{datetime.utcnow().isoformat()}] Backend restart detected while scan was in progress. Scan state restored as interrupted.")
+                    logs.append(f"[{datetime.now(timezone.utc).isoformat()}] Backend restart detected while scan was in progress. Scan state restored as interrupted.")
                 self._active_scans[scan_id] = data
                 self._scan_locks[scan_id] = threading.Lock()
             except Exception as e:
@@ -311,9 +312,9 @@ class ScanManager:
         scan_info = self._active_scans[scan_id]
 
         try:
-            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Starting replay scan...")
-            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Model: {scan_info['model_name']}")
-            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Replay findings: {len(findings)}")
+            scan_info["logs"].append(f"[{datetime.now(timezone.utc).isoformat()}] Starting replay scan...")
+            scan_info["logs"].append(f"[{datetime.now(timezone.utc).isoformat()}] Model: {scan_info['model_name']}")
+            scan_info["logs"].append(f"[{datetime.now(timezone.utc).isoformat()}] Replay findings: {len(findings)}")
 
             agent = get_agent_graph()
             final_state = agent.run_scan(
@@ -336,15 +337,16 @@ class ScanManager:
                     if log not in existing_logs:
                         scan_info["logs"].append(log)
 
-            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Replay completed with status: {final_state['status']}")
+            scan_info["logs"].append(f"[{datetime.now(timezone.utc).isoformat()}] Replay completed with status: {final_state['status']}")
 
+            _FAILED_STATUSES = {"failed", "failed_validation", "contract_gate_failed", "unproven_contract_gate"}
             confirmed = sum(1 for f in final_state["findings"] if f["final_status"] == "confirmed")
             skipped = sum(1 for f in final_state["findings"] if f.get("llm_verdict") == "FALSE_POSITIVE")
-            failed = sum(1 for f in final_state["findings"] if f["final_status"] == "failed")
-            unproven = sum(1 for f in final_state["findings"] if f["final_status"] not in {"confirmed", "failed"})
+            failed = sum(1 for f in final_state["findings"] if f["final_status"] in _FAILED_STATUSES)
+            unproven = sum(1 for f in final_state["findings"] if f["final_status"] not in {"confirmed"} | _FAILED_STATUSES)
 
             start = datetime.fromisoformat(final_state["start_time"])
-            end = datetime.fromisoformat(final_state["end_time"]) if final_state["end_time"] else datetime.utcnow()
+            end = datetime.fromisoformat(final_state["end_time"]) if final_state["end_time"] else datetime.now(timezone.utc)
             duration = (end - start).total_seconds()
 
             benchmark_score = get_benchmark_registry().score_findings(scan_info.get("benchmark_metadata"), [dict(f) for f in final_state["findings"]])
@@ -376,6 +378,7 @@ class ScanManager:
                 scan_openrouter_usage=[dict(u) for u in final_state.get("scan_openrouter_usage", []) if isinstance(u, dict)],
                 models_used=self._build_models_used_summary(final_state.get("findings", [])),
                 probe_result=final_state.get("probe_result"),
+                recon_report=final_state.get("recon_report"),
             )
 
             self._save_result(result)
@@ -403,12 +406,13 @@ class ScanManager:
 
             # Preserve any findings that completed before the exception
             findings = [dict(f) for f in (scan_info.get("findings") or [])]
+            _FAILED_STATUSES = {"failed", "failed_validation", "contract_gate_failed", "unproven_contract_gate"}
             confirmed = sum(1 for f in findings if f.get("final_status") == "confirmed")
             skipped = sum(1 for f in findings if f.get("llm_verdict") == "FALSE_POSITIVE")
-            failed_count = sum(1 for f in findings if f.get("final_status") == "failed")
-            unproven = sum(1 for f in findings if f.get("final_status") not in {"confirmed", "failed"})
+            failed_count = sum(1 for f in findings if f.get("final_status") in _FAILED_STATUSES)
+            unproven = sum(1 for f in findings if f.get("final_status") not in {"confirmed"} | _FAILED_STATUSES)
             start_time = scan_info.get("start_time") or scan_info.get("created_at")
-            end_time = datetime.utcnow().isoformat()
+            end_time = datetime.now(timezone.utc).isoformat()
             duration_s = 0.0
             try:
                 if start_time:
@@ -489,9 +493,9 @@ class ScanManager:
         scan_info = self._active_scans[scan_id]
         
         try:
-            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Starting vulnerability scan...")
-            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Model: {scan_info['model_name']}")
-            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Discovery mode: open-ended vulnerability discovery")
+            scan_info["logs"].append(f"[{datetime.now(timezone.utc).isoformat()}] Starting vulnerability scan...")
+            scan_info["logs"].append(f"[{datetime.now(timezone.utc).isoformat()}] Model: {scan_info['model_name']}")
+            scan_info["logs"].append(f"[{datetime.now(timezone.utc).isoformat()}] Discovery mode: open-ended vulnerability discovery")
             
             # Get agent graph
             agent = get_agent_graph()
@@ -506,13 +510,13 @@ class ScanManager:
             
             total_loc = self._count_source_loc(scan_info["codebase_path"])
 
-            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Detected primary language: {detected_language}")
-            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] All languages found: {', '.join(lang_profile.all_languages)}")
-            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Total source files: {lang_profile.total_files}")
-            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Total LOC: {total_loc}")
+            scan_info["logs"].append(f"[{datetime.now(timezone.utc).isoformat()}] Detected primary language: {detected_language}")
+            scan_info["logs"].append(f"[{datetime.now(timezone.utc).isoformat()}] All languages found: {', '.join(lang_profile.all_languages)}")
+            scan_info["logs"].append(f"[{datetime.now(timezone.utc).isoformat()}] Total source files: {lang_profile.total_files}")
+            scan_info["logs"].append(f"[{datetime.now(timezone.utc).isoformat()}] Total LOC: {total_loc}")
             for lang, count in sorted(lang_profile.language_stats.items(), key=lambda x: x[1], reverse=True):
                 pct = (count / lang_profile.total_files) * 100 if lang_profile.total_files > 0 else 0
-                scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}]   - {lang}: {count} files ({pct:.1f}%)")
+                scan_info["logs"].append(f"[{datetime.now(timezone.utc).isoformat()}]   - {lang}: {count} files ({pct:.1f}%)")
             
             # Store language info in scan state
             scan_info["detected_language"] = detected_language
@@ -528,7 +532,7 @@ class ScanManager:
             
             # Check for cancellation before starting scan
             if scan_info.get("status") == "cancelled":
-                scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Scan cancelled before execution")
+                scan_info["logs"].append(f"[{datetime.now(timezone.utc).isoformat()}] Scan cancelled before execution")
                 raise InterruptedError("Scan cancelled by user")
             
             # Run the scan with detected language and optional API key override
@@ -569,7 +573,7 @@ class ScanManager:
                     if log not in existing_logs:
                         scan_info["logs"].append(log)
             
-            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Scan completed with status: {final_state['status']}")
+            scan_info["logs"].append(f"[{datetime.now(timezone.utc).isoformat()}] Scan completed with status: {final_state['status']}")
             
             # Process results
             exact_scan_usage = [dict(u) for u in final_state.get("scan_openrouter_usage", []) if isinstance(u, dict)]
@@ -596,14 +600,15 @@ class ScanManager:
                 if per_finding_cost > 0:
                     exact_total_cost = per_finding_cost
 
+            _FAILED_STATUSES = {"failed", "failed_validation", "contract_gate_failed", "unproven_contract_gate"}
             confirmed = sum(1 for f in final_state["findings"] if f["final_status"] == "confirmed")
             skipped = sum(1 for f in final_state["findings"] if f.get("llm_verdict") == "FALSE_POSITIVE")
-            failed = sum(1 for f in final_state["findings"] if f["final_status"] == "failed")
-            unproven = sum(1 for f in final_state["findings"] if f["final_status"] not in {"confirmed", "failed"})
-            
+            failed = sum(1 for f in final_state["findings"] if f["final_status"] in _FAILED_STATUSES)
+            unproven = sum(1 for f in final_state["findings"] if f["final_status"] not in {"confirmed"} | _FAILED_STATUSES)
+
             # Calculate duration
             start = datetime.fromisoformat(final_state["start_time"])
-            _end_time = final_state["end_time"] or datetime.utcnow().isoformat()
+            _end_time = final_state["end_time"] or datetime.now(timezone.utc).isoformat()
             end = datetime.fromisoformat(_end_time)
             final_state["end_time"] = _end_time  # ensure non-null for ScanResult
             duration = (end - start).total_seconds()
@@ -637,6 +642,7 @@ class ScanManager:
                 scan_openrouter_usage=exact_scan_usage,
                 models_used=self._build_models_used_summary(final_state.get("findings", [])),
                 probe_result=final_state.get("probe_result"),
+                recon_report=final_state.get("recon_report"),
             )
             
             # Save result
@@ -667,12 +673,13 @@ class ScanManager:
             print(f"Scan {scan_id} failed: {error_msg}")
 
             findings = [dict(f) for f in (scan_info.get("findings") or [])]
+            _FAILED_STATUSES = {"failed", "failed_validation", "contract_gate_failed", "unproven_contract_gate"}
             confirmed = sum(1 for f in findings if f.get("final_status") == "confirmed")
             skipped = sum(1 for f in findings if f.get("llm_verdict") == "FALSE_POSITIVE")
-            failed = sum(1 for f in findings if f.get("final_status") == "failed")
-            unproven = sum(1 for f in findings if f.get("final_status") not in {"confirmed", "failed"})
+            failed = sum(1 for f in findings if f.get("final_status") in _FAILED_STATUSES)
+            unproven = sum(1 for f in findings if f.get("final_status") not in {"confirmed"} | _FAILED_STATUSES)
             start_time = scan_info.get("start_time") or scan_info.get("created_at")
-            end_time = datetime.utcnow().isoformat()
+            end_time = datetime.now(timezone.utc).isoformat()
             duration_s = 0.0
             try:
                 if start_time:
@@ -746,7 +753,7 @@ class ScanManager:
         for idx, finding in enumerate(result.findings or []):
             final_status = str(finding.get('final_status') or '')
             should_export = bool(
-                final_status in {'confirmed', 'failed'}
+                final_status in {'confirmed', 'failed', 'failed_validation', 'contract_gate_failed'}
                 or finding.get('pov_script')
                 or finding.get('pov_result')
                 or finding.get('validation_result')
@@ -836,7 +843,7 @@ class ScanManager:
 
         self._write_json_file(os.path.join(base_dir, 'index.json'), {
             'scan_id': result.scan_id,
-            'generated_at': datetime.utcnow().isoformat(),
+            'generated_at': datetime.now(timezone.utc).isoformat(),
             'artifacts': index_rows,
         })
         # Write scan-level probe result at top level for quick access
@@ -1059,7 +1066,7 @@ class ScanManager:
 
     def get_scan_history(
         self,
-        limit: int = 100,
+        limit: int = 1000,
         offset: int = 0
     ) -> List[Dict[str, Any]]:
         """Get scan history"""
@@ -1128,7 +1135,7 @@ class ScanManager:
             scan_info = self._active_scans[scan_id]
             if scan_info["status"] in {"running", "checking", "cloning", "created", "interrupted", "ingesting", "investigating", "generating_pov", "validating_pov", "running_pov", "running_codeql"}:
                 scan_info["status"] = "cancelled"
-                scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Scan cancelled by user request")
+                scan_info["logs"].append(f"[{datetime.now(timezone.utc).isoformat()}] Scan cancelled by user request")
                 self._persist_active_scan(scan_id)
                 return True, f"Scan {scan_id} cancelled"
             else:
@@ -1141,7 +1148,7 @@ class ScanManager:
             if result.status in {"running", "investigating", "generating_pov", "validating_pov", "running_pov", "checking", "cloning", "created", "ingesting", "running_codeql"}:
                 # Update the result to cancelled
                 result.status = "cancelled"
-                result.logs.append(f"[{datetime.utcnow().isoformat()}] Scan cancelled by user request")
+                result.logs.append(f"[{datetime.now(timezone.utc).isoformat()}] Scan cancelled by user request")
                 self._save_result(result)
                 return True, f"Stuck scan {scan_id} marked as cancelled"
             else:
@@ -1169,8 +1176,8 @@ class ScanManager:
             # Force stop the scan - mark as failed with stopped status
             scan_info["status"] = "failed"
             scan_info["error"] = "Scan force-stopped by user"
-            scan_info["logs"].append(f"[{datetime.utcnow().isoformat()}] Scan force-stopped by user")
-            scan_info["end_time"] = datetime.utcnow().isoformat()
+            scan_info["logs"].append(f"[{datetime.now(timezone.utc).isoformat()}] Scan force-stopped by user")
+            scan_info["end_time"] = datetime.now(timezone.utc).isoformat()
             self._persist_active_scan(scan_id)
             
             # Create a failed result
@@ -1186,8 +1193,8 @@ class ScanManager:
                 failed=0,
                 total_cost_usd=scan_info.get("total_cost_usd", 0.0),
                 duration_s=0.0,
-                start_time=scan_info.get("created_at", datetime.utcnow().isoformat()),
-                end_time=datetime.utcnow().isoformat(),
+                start_time=scan_info.get("created_at", datetime.now(timezone.utc).isoformat()),
+                end_time=datetime.now(timezone.utc).isoformat(),
                 findings=scan_info.get("findings", []),
                 scan_openrouter_usage=scan_info.get("scan_openrouter_usage", []),
                 detected_language=scan_info.get("detected_language"),
@@ -1212,7 +1219,7 @@ class ScanManager:
                 # Update the result to failed
                 result.status = "failed"
                 result.error = "Scan force-stopped by user"
-                result.logs.append(f"[{datetime.utcnow().isoformat()}] Scan force-stopped by user")
+                result.logs.append(f"[{datetime.now(timezone.utc).isoformat()}] Scan force-stopped by user")
                 self._save_result(result)
                 return True, f"Stuck scan {scan_id} marked as failed"
             else:
@@ -1435,7 +1442,7 @@ class ScanManager:
         # Sort newest-first
         json_files.sort(key=lambda x: x[0], reverse=True)
 
-        cutoff = datetime.utcnow() - timedelta(days=max_age_days)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
         files_removed = 0
         bytes_freed = 0
 

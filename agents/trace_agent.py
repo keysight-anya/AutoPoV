@@ -83,6 +83,15 @@ class TraceResult:
             'trace_error': self.trace_error,
         }
 
+    def to_json(self) -> str:
+        """FIX-14: Serialise TraceResult to a compact JSON string.
+
+        Used by the coordinator and runtime feedback pipeline to pass
+        structured trace data rather than free-form text.
+        """
+        import json as _json
+        return _json.dumps(self.to_dict(), default=str)
+
 
 # ---------------------------------------------------------------------------
 # Embedded trace shell script
@@ -137,9 +146,12 @@ if command -v strace >/dev/null 2>&1; then
     TRACE_INPUT_SURFACE="file_argument"
   fi
 
-  # Extract file extensions from open calls to understand expected format
+  # Extract file extensions from open calls to understand expected format.
+  # Filter out system/runtime extensions that are not user-data formats.
+  _SYS_EXTS="so|cache|conf|lock|py|pyc|pyo|rb|sh|pm|pl|h|c|o|a|la|pc|m4|log|pid|tmp"
   TRACE_FILE_EXTS=$(echo "$STRACE_OUT" \
     | grep -oE '"[^"]+\.[a-z]{2,5}"' \
+    | grep -vE "\.($_SYS_EXTS)\"" \
     | grep -oE '\.[a-z]{2,5}' \
     | sort -u | head -8 | tr '\n' ',' | sed 's/,$//')
 
@@ -391,7 +403,7 @@ def run_trace(
 
     # Only trace native C/C++ repos
     _cls = str(repo_surface_class or '').strip().lower()
-    if _cls not in ('cli_tool_c', 'library_c', 'unknown', ''):
+    if _cls not in ('cli_tool_c', 'library_c', 'library_c_with_cli', 'unknown', ''):
         result.trace_skipped = True
         result.trace_skip_reason = f'non_native_surface:{_cls}'
         return result
@@ -445,8 +457,14 @@ def format_trace_context(trace: TraceResult) -> str:
             lines.append('  -> Binary does not open files or read stdin. Payload goes in argv.')
 
     if trace.trace_file_extensions:
-        lines.append(f'FILE EXTENSIONS OBSERVED: {", ".join(trace.trace_file_extensions)}')
-        lines.append('  -> Use one of these extensions when creating the temp payload file.')
+        # Filter out system/runtime extensions that are not meaningful user-data formats
+        _SYS_EXTS = {'.so', '.cache', '.conf', '.lock', '.py', '.pyc', '.pyo', '.rb',
+                     '.sh', '.pm', '.pl', '.h', '.c', '.o', '.a', '.la', '.pc',
+                     '.m4', '.log', '.pid', '.tmp'}
+        _filtered = [e for e in trace.trace_file_extensions if e not in _SYS_EXTS]
+        if _filtered:
+            lines.append(f'FILE EXTENSIONS OBSERVED: {", ".join(_filtered)}')
+            lines.append('  -> Use one of these extensions when creating the temp payload file.')
 
     if trace.trace_interesting_syscalls:
         lines.append(f'INTERESTING SYSCALLS: {", ".join(trace.trace_interesting_syscalls)}')

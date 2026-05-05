@@ -7,7 +7,7 @@ import hmac
 import hashlib
 import json
 from typing import Optional, Dict, Any, Callable
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.config import settings
 
@@ -93,7 +93,7 @@ class WebhookHandler:
         result = {
             "provider": "github",
             "event_type": event_type,
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }
         
         if event_type == "push":
@@ -155,7 +155,7 @@ class WebhookHandler:
         result = {
             "provider": "gitlab",
             "event_type": object_kind,
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }
         
         if object_kind == "push":
@@ -346,7 +346,7 @@ class WebhookHandler:
         return {
             "scan_id": scan_id,
             "status": status,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "findings_count": len(findings),
             "findings": findings,
             "metrics": metrics
