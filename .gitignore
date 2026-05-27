@@ -1,0 +1,98 @@
+# Secrets and local environment
+.env
+*.env
+!.env.example
+!frontend/.env.example
+frontend/.env
+venv/
+env/
+ENV/
+
+# Python build and cache
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Frontend build and deps
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# Runtime outputs
+results/*
+!results/.gitkeep
+!results/runs/
+results/runs/*
+!results/runs/.gitkeep
+!results/povs/
+results/povs/*
+!results/povs/.gitkeep
+!results/proof_artifacts/
+results/proof_artifacts/*
+!results/proof_artifacts/.gitkeep
+results/snapshots/
+
+# Data and local state
+data/api_keys.json
+data/cache/*.json
+data/chroma/
+data/*.db
+data/*.sqlite3
+*.db
+*.sqlite3
+.docker/
+.cache_bust
+
+# Generated reports and exported docs
+*_report.json
+*_report.pdf
+DOCS_APPLICATION_FLOW.pdf
+DOCS_APPLICATION_FLOW.docx
+/package-lock.json
+!frontend/package-lock.json
+
+# Local tooling output
+.qoder/
+.playwright-mcp/
+.superpowers/
+.claude/
+_demo_smoke/
+
+# Diagnostic and one-off dev scripts (root-level _*.py / _*.sh / _*.ps1)
+_*.py
+_*.sh
+_*.ps1
+
+# Temporary scan/batch state and result files
+batch_*.json
+*_state.json
+/*.json
+!data/benchmarks/manifest.example.json
+!frontend/package.json
+!codeql_queries/**/*.json
+!test-db/**/*.json
+
+# Embedded benchmark repos (use submodules instead)
+data/benchmarks/sources/juliet-dynamic/
+data/benchmarks/sources/owasp-benchmark-python/
+
+# Scratch / leftover files
+.codex_patch_*
+=
+{line}*
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*.tmp
+*.log
+stats_out/

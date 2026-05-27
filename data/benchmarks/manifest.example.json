@@ -1,0 +1,31 @@
+
+{
+  "benchmark_family": "juliet",
+  "benchmark_id": "juliet-cwe121-sample",
+  "benchmark_name": "Juliet CWE-121 Sample",
+  "language": "c",
+  "source_root": "/absolute/path/to/Juliet_Test_Suite_v1.3_for_C_Cpp",
+  "cases": [
+    {
+      "case_id": "CWE121_bad_01",
+      "source_path": "testcases/CWE121_Stack_Based_Buffer_Overflow/s01/CWE121_Stack_Based_Buffer_Overflow__CWE806_char_declare_memcpy_01.c",
+      "expected_vulnerable": true,
+      "cwes": ["CWE-121"],
+      "entrypoint_hint": "main",
+      "oracle_hint": "stack-based overflow should be reachable through the bad path",
+      "build": {
+        "command": "make CWE121_bad_01"
+      },
+      "run": {
+        "command": "./CWE121_bad_01"
+      }
+    },
+    {
+      "case_id": "CWE121_good_01",
+      "source_path": "testcases/CWE121_Stack_Based_Buffer_Overflow/s01/CWE121_Stack_Based_Buffer_Overflow__CWE806_char_declare_memcpy_01.c",
+      "expected_vulnerable": false,
+      "cwes": ["CWE-121"],
+      "entrypoint_hint": "main"
+    }
+  ]
+}
