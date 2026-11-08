@@ -4,10 +4,6 @@ AutoPoV is a FastAPI and React application for autonomous codebase security scan
 
 The system is discovery-first and CWE-agnostic. Scans do not require a CWE list. A single selected model is used consistently for all LLM steps — investigation, PoV generation, refinement, and coordination — routed through a unified LLM dispatcher.
 
-## Reproducing the Paper's Results
-
-All results reported in the accompanying paper were produced entirely offline, using self-hosted open-weight models served locally through Ollama (`qwen3`, `glm-4.7-flash`, `llama4`). No repository source was sent to any external model provider for any reported figure. The online OpenRouter path documented below is an optional capability of the tool and was not used in the evaluation. To reproduce the reported scans, run in offline mode as shown in the Tests section; set `MODEL_MODE=offline` and select one of the three Ollama models.
-
 ## Current Architecture
 
 The backend is a LangGraph stateful workflow with these stages:
@@ -71,15 +67,15 @@ Important backend modules:
 
 ## Supported Models
 
-The backend configuration exposes these curated model choices. The paper's evaluation used only the offline, self-hosted models; the online models are an optional capability and were not used for any reported result.
+The backend configuration exposes these curated model choices:
 
-- Offline, self-hosted (requires local Ollama) — used for all reported results:
+- Online (requires OpenRouter API key):
+  - `openai/gpt-5.2`
+  - `anthropic/claude-opus-4.6`
+- Offline (requires local Ollama):
   - `qwen3`
   - `glm-4.7-flash`
   - `llama4`
-- Online, optional (requires OpenRouter API key) — not used in the evaluation:
-  - `openai/gpt-5.2`
-  - `anthropic/claude-opus-4.6`
 
 All models are routed through a single dispatcher (`get_verifier()._get_llm()`). You must select one explicitly in the web Settings page before running scans, unless the CLI request provides `--model`.
 
@@ -106,7 +102,7 @@ Current behavior differs between the web UI and external clients:
 - Python 3.12 recommended
 - Node.js 20+
 - Docker
-- Ollama for offline mode (used for the paper's results); an OpenRouter API key is only needed for the optional online mode
+- OpenRouter API key for online mode, or Ollama for offline mode
 - CodeQL optional but recommended
 - Joern optional
 
@@ -125,16 +121,15 @@ npm install
 cd ..
 ```
 
-Create `.env` from `.env.example`, then set at minimum. The default below runs in offline, self-hosted mode, which reproduces the paper's setup:
+Create `.env` from `.env.example`, then set at minimum:
 
 ```env
 ADMIN_API_KEY=change_me
-MODEL_MODE=offline
-MODEL_NAME=qwen3
+MODEL_MODE=online
+MODEL_NAME=openai/gpt-5.2
+OPENROUTER_API_KEY=sk-or-v1-...
 FRONTEND_URL=http://localhost:5173
 ```
-
-To use the optional online mode instead, set `MODEL_MODE=online`, choose an online model (for example `MODEL_NAME=openai/gpt-5.2`), and provide `OPENROUTER_API_KEY=sk-or-v1-...`. Online mode sends code to an external provider and was not used for any reported result.
 
 ### Docker Compose
 
@@ -160,7 +155,7 @@ The React app exposes these main pages:
 
 - Home: start scans from Git URL, ZIP, or pasted code
 - Scan Progress: live polling plus SSE logs, cancel and force-stop controls
-- Results: findings, proof artifacts, report download, model usage summary
+- Results: findings, proof artifacts, report download, OpenRouter usage summary
 - History / Scan Manager: inspect active and historical scans, cleanup and cache actions
 - Settings: model selection, API key management, webhook setup
 - Metrics, Docs, and Policy: telemetry and reference views
@@ -174,8 +169,8 @@ The CLI is implemented in `cli/autopov.py`.
 Examples:
 
 ```bash
-python cli/autopov.py scan https://github.com/user/repo.git --model qwen3
-python cli/autopov.py scan /path/to/code --model glm-4.7-flash
+python cli/autopov.py scan https://github.com/user/repo.git
+python cli/autopov.py scan /path/to/code --model anthropic/claude-opus-4.6
 python cli/autopov.py paste --language python < vulnerable.py
 python cli/autopov.py results <scan_id>
 python cli/autopov.py report <scan_id> --format pdf
@@ -248,7 +243,7 @@ python3 add_api_key.py
 docker restart autopov-backend
 ```
 
-To generate a batch scan with the offline model (this is the mode used for the paper's results):
+To generate a batch scan with the offline model:
 
 ```bash
 python3 add_api_key.py
